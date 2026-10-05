@@ -69,7 +69,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
         self.save(cfg)
         plan = transaction.preview(engine.Hub())
         self.assertEqual(plan["targets"], ["pi"])
-        self.assertTrue(all("/.pi/" in file["path"] for file in plan["files"]))
+        self.assertTrue(all(f"/.pi/".replace("/", os.sep) in file["path"] for file in plan["files"]))
 
     def test_disabled_selected_target_rejected_without_writes(self):
         before = self.native_files()
@@ -139,6 +139,31 @@ class SafeSyncTransactionTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(manifest_path.parent.stat().st_mode), 0o700)
+
+    def test_restore_rejects_a_readonly_flip_but_allows_plain_mode_bits(self):
+        """mode 比较：Windows 只有只读位可表达，POSIX 位上浮不算外部改动。
+
+        反向对照：真实改变只读位（Windows 上唯一能表达的权限差异）必须被拒绝，
+        否则放宽比较就等于关掉了"外部改动检测"。
+        """
+        plan = transaction.preview(engine.Hub(), ["pi"])
+        applied = transaction.apply(engine.Hub(), plan["planId"])
+        settings = self.settings
+
+        if os.name != "nt":
+            # 只改权限位（不碰内容、不碰只读位）→ 不构成外部改动
+            settings.chmod(0o640)
+            transaction.restore(engine.Hub(), applied["transactionId"])
+            self.assertEqual(settings.read_text(), self.original_settings or settings.read_text())
+            return
+
+        settings.chmod(stat.S_IREAD)
+        try:
+            with self.assertRaisesRegex(transaction.TransactionError, "changed after apply"):
+                transaction.restore(engine.Hub(), applied["transactionId"])
+        finally:
+            settings.chmod(stat.S_IWRITE | stat.S_IREAD)
+        transaction.restore(engine.Hub(), applied["transactionId"])
 
     def test_partial_failure_rolls_back_prior_files_and_new_files(self):
         plan = transaction.preview(engine.Hub(), ["pi"])

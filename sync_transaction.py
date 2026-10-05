@@ -104,6 +104,31 @@ def _safe_path(path: Path) -> None:
             raise TransactionError(f"Parent is not a directory: {path}")
 
 
+def _effective_mode(requested: int | None) -> int | None:
+    """写入完成后这个文件实际会有的 mode。
+
+    POSIX 上 chmod 如实生效；Windows 上只有只读位可表达，0o600 这类
+    "仅所有者可写" 会被压成 0o666，所以清单里不能记录请求值，否则
+    restore 拿"记录值"和"真实值"一比就永远判定配置被外部改动过。
+    """
+    if requested is None:
+        return None
+    if os.name != "nt":
+        return requested
+    return 0o444 if requested & 0o200 == 0 else 0o666
+
+
+def _mode_matches(current: int | None, recorded: int | None) -> bool:
+    """按平台语义比较 mode：Windows 只比只读位，POSIX 严格相等。"""
+    if os.name != "nt":
+        return current == recorded
+    if (current is None) != (recorded is None):
+        return False
+    if current is None:
+        return True
+    return bool(current & 0o200) == bool(recorded & 0o200)
+
+
 def _snapshot(path: Path) -> Snapshot:
     _safe_path(path)
     try:
@@ -458,7 +483,7 @@ def _atomic_write(path: Path, data: bytes | None, mode: int | None = None) -> No
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        temp_path.chmod(mode if mode is not None else 0o600)
+        temp_path.chmod(_effective_mode(mode) if mode is not None else 0o600)
         os.replace(temp_path, path)
         # Directory fsync is unavailable on Windows; data files are still fsynced.
         if os.name != "nt":
@@ -518,7 +543,9 @@ def _commit(home: Path, root: Path, targets: list[str], sources: dict[Path, Snap
         manifest["files"].append({"path": path.relative_to(home).as_posix(), "backup": filename,
                                   "beforeHash": _digest(before.data), "afterHash": _digest(data),
                                   "beforeMode": before.mode,
-                                  "afterMode": (before.mode if before.mode is not None else 0o600) if data is not None else None})
+                                  "afterMode": _effective_mode(
+                                      before.mode if before.mode is not None else 0o600)
+                                  if data is not None else None})
     manifest_path = folder / "manifest.json"
     _write_manifest(manifest_path, manifest)
     _assert_sources(sources)
@@ -618,7 +645,8 @@ def restore(hub, transaction_id: str) -> dict:
             if path in sources:
                 raise TransactionError("Transaction contains a duplicate native file")
             current = _snapshot(path)
-            if _digest(current.data) != entry.get("afterHash") or current.mode != entry.get("afterMode"):
+            if (_digest(current.data) != entry.get("afterHash")
+                    or not _mode_matches(current.mode, entry.get("afterMode"))):
                 raise TransactionError(f"Cannot restore because native configuration changed after apply: {path}")
             filename = entry.get("backup")
             if filename is not None and (not isinstance(filename, str) or re.fullmatch(r"\d{4}\.before", filename) is None):
