@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlparse
 HUB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HUB_DIR))
 from hub import (Hub, HUB_CONFIG, ModelLossError, assert_expected_model_changes, backup_file,
-                 configure_stdio, expand, file_hash, load_json, save_json, now_iso)  # noqa: E402
+                 configure_stdio, expand, file_hash, load_json, save_json, now_iso, target_files)  # noqa: E402
 from discover import discover_models  # noqa: E402
 
 # hub.py 是多客户端模型对齐的唯一实现，这里只调用、不复制。
@@ -76,9 +76,18 @@ def _provider(h: Hub, pid: str) -> dict:
 
 
 def _validate_provider(p: dict) -> None:
-    for field in ("name", "baseUrl", "apiKey"):
+    for field in ("name", "baseUrl"):
         if not isinstance(p.get(field), str) or not p[field].strip():
             raise ValueError(f"{field} 不能为空")
+    for field in ("apiKey", "openaiApiKey", "apiKeyEnv"):
+        if p.get(field) is not None and not isinstance(p[field], str):
+            raise ValueError(f"{field} 必须是字符串或 null")
+    if not any(p.get(field) for field in ("apiKey", "openaiApiKey", "apiKeyEnv")):
+        raise ValueError("请配置 API Key、Codex 专用 Key 或 API Key 环境变量名")
+    if p.get("apiKeyEnv") and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p["apiKeyEnv"]):
+        raise ValueError("apiKeyEnv 必须是有效的环境变量名")
+    if p.get("codexWireApi") not in (None, "", "responses"):
+        raise ValueError("Codex 仅支持明确声明的 responses 协议")
     for field in ("displayName", "api", "anthropicBaseUrl", "notes"):
         if field in p and not isinstance(p[field], str):
             raise ValueError(f"{field} 必须是字符串")
@@ -139,7 +148,7 @@ def _require_modelsync_api() -> None:
 def _modelsync_view(cfg: dict) -> tuple[dict, dict]:
     """每个客户端实际会写入的模型（resolved）与各档位明细（tiers）。
 
-    dsh-desktop 是 dsh 的别名，跟随 dsh；codex 只登记不写入，固定为 null。
+    dsh-desktop 是 dsh 的别名，跟随 dsh；Codex 模型只在显式第三方模式写入。
     档位用 hub.py 的界面视图 agent_model_tiers_public：不含内部 agent 档与历史
     fable 档。适配器读的是 agent_model_tiers 本体，fable 因此不会被解析层吞掉。
     hub.py 接口缺失时降级为空结果，让状态接口仍可用。
@@ -178,8 +187,9 @@ def _validate_modelsync_entry(h: Hub, entry: object, where: str, *, allow_tiers:
     if not isinstance(model, str) or not model.strip():
         raise ValueError(f"{where}.model 必须是非空字符串")
     effort = entry.get("reasoningEffort")
-    if effort is not None and effort not in REASONING_EFFORTS:
-        raise ValueError(f"{where}.reasoningEffort 只能是 {'/'.join(REASONING_EFFORTS)} 或 null")
+    efforts = ("none", "minimal", "low", "medium", "high", "xhigh") if where == "modelSync.overrides.codex" else REASONING_EFFORTS
+    if effort is not None and effort not in efforts:
+        raise ValueError(f"{where}.reasoningEffort 只能是 {'/'.join(efforts)} 或 null")
     checked = {"provider": pid, "model": model.strip(), "reasoningEffort": effort}
     if "tiers" in entry:
         tiers = entry["tiers"]
@@ -283,12 +293,12 @@ def api_status() -> dict:
     targets = {}
     for name, t in (h.cfg.get("sync", {}).get("targets") or {}).items():
         files = [{"path": str(expand(f)), "exists": expand(f).exists(),
-                  "changed": str(expand(f)) in changed} for f in t.get("files", [])]
+                  "changed": str(expand(f)) in changed} for f in target_files(name, t)]
         targets[name] = {
-            "enabled": t.get("enabled", True), "aliasOf": t.get("aliasOf"),
+            "enabled": t.get("enabled", False), "aliasOf": t.get("aliasOf"),
             "notes": t.get("notes"), "activeProvider": t.get("activeProvider"),
             "supported": name in SUPPORTED_TARGETS, "files": files,
-            # codex 这类目标只登记配置，Hub 不写它的登录态与模型文件。
+            "mode": t.get("mode", "official") if name == "codex" else None,
             "readonly": name not in SUPPORTED_TARGETS,
         }
     model_sync = _modelsync_block(h.cfg)
@@ -300,53 +310,105 @@ def api_status() -> dict:
                              if p.get("anthropicBaseUrl") and p.get("enabled", True)],
         "configPath": str(HUB_CONFIG), "updatedAt": h.cfg.get("updatedAt"),
         "lastSync": h.state.get("lastSync"), "lastResults": h.state.get("lastResults", []),
+        "lastTransaction": h.state.get("lastTransaction"),
         "pendingSync": h.state.get("configHash") != file_hash(HUB_CONFIG),
         "changedFiles": sorted(changed),
         "modelSync": model_sync, "modelSyncResolved": resolved,
     }
 
 
+def _selected_targets(h: Hub, body: dict) -> list[str]:
+    targets = h.cfg.get("sync", {}).get("targets", {})
+    enabled = {name for name, t in targets.items()
+               if name in SUPPORTED_TARGETS and t.get("enabled", False)}
+    requested = body.get("targets")
+    if requested is not None and (not isinstance(requested, list) or not requested
+                                  or any(not isinstance(n, str) for n in requested)):
+        raise ValueError("请至少选择一个同步平台")
+    names = set(requested) if requested is not None else enabled
+    if not names or not names <= enabled:
+        raise ValueError("同步目标为空、未启用或不受支持")
+    selected = sorted({targets[n].get("aliasOf") or n for n in names})
+    if any(n not in enabled for n in selected):
+        raise ValueError("关联的主平台未启用")
+    return selected
+
+
+def _record_sync(h: Hub, results: list[str], changed: list[str] | None = None,
+                 transaction_id: str | None = None) -> dict:
+    details = []
+    for result in results:
+        text = result.strip()
+        ok = text.startswith("✓")
+        name, _, message = text[1:].strip().partition(":")
+        details.append({"target": name.strip(), "ok": ok,
+                        "message": message.strip() or "配置已写入；重启对应客户端后生效"})
+    targets = h.cfg.get("sync", {}).get("targets", {})
+    canonical = lambda name: targets[name].get("aliasOf") or name
+    succeeded = {d["target"] for d in details if d["ok"]}
+    hashes = h.state.setdefault("hashes", {})
+    for name, target in targets.items():
+        if canonical(name) in succeeded:
+            for file in target_files(name, target):
+                hashes[str(expand(file))] = file_hash(expand(file))
+    all_enabled = {canonical(n) for n, t in targets.items()
+                   if n in SUPPORTED_TARGETS and t.get("enabled", False)}
+    if all_enabled <= succeeded:
+        h.state["configHash"] = file_hash(HUB_CONFIG)
+    h.state["lastResults"] = details
+    if transaction_id:
+        h.state["lastTransaction"] = transaction_id
+    h.save_state()
+    return {"ok": bool(details) and all(d["ok"] for d in details),
+            "results": results, "details": details, "changed": changed or [],
+            "transactionId": transaction_id}
+
+
 def _sync(body: dict, detect: bool = False) -> dict:
+    # Legacy API: the workbench uses explicit preview/apply below.
     with LOCK:
         h = hub()
-        targets = h.cfg.get("sync", {}).get("targets", {})
-        enabled = {name for name, t in targets.items()
-                   if name in SUPPORTED_TARGETS and t.get("enabled", True)}
-        requested = body.get("targets")
-        if requested is not None and (not isinstance(requested, list) or not requested
-                                      or any(not isinstance(n, str) for n in requested)):
-            raise ValueError("请至少选择一个同步平台")
-        names = set(requested) if requested is not None else enabled
-        if not names or not names <= enabled:
-            raise ValueError("同步目标为空、未启用或不受支持")
-        # dsh 桌面版与 CLI 共用配置，只执行一次适配器。
-        canonical = lambda name: targets[name].get("aliasOf") or name
-        selected = sorted({canonical(n) for n in names})
-        if any(n not in enabled for n in selected):
-            raise ValueError("关联的主平台未启用")
+        selected = _selected_targets(h, body)
         changed = h.changed_files() if detect else []
         results = h.push_all(only=selected)
-        details = []
-        for result in results:
-            text = result.strip()
-            ok = text.startswith("✓")
-            name, _, message = text[1:].strip().partition(":")
-            details.append({"target": name.strip(), "ok": ok,
-                            "message": message.strip() or "配置已写入；重启对应客户端后生效"})
-        succeeded = {d["target"] for d in details if d["ok"]}
-        # 定向同步不能把未同步平台的外部变更标记成已处理。
-        hashes = h.state.setdefault("hashes", {})
-        for name, t in targets.items():
-            if canonical(name) in succeeded:
-                for f in t.get("files", []):
-                    hashes[str(expand(f))] = file_hash(expand(f))
-        all_enabled = {canonical(n) for n in enabled}
-        if all_enabled <= succeeded:
-            h.state["configHash"] = file_hash(HUB_CONFIG)
-        h.state["lastResults"] = details
+        return _record_sync(h, results, changed)
+
+
+def api_preview(body: dict) -> dict:
+    with LOCK:
+        h = hub()
+        selected = _selected_targets(h, body)
+        plan = h.preview_push(only=selected)
+        # A preview is metadata only. Never expose generated config bytes or keys.
+        return {"planId": plan["planId"], "targets": plan["targets"],
+                "files": [{"path": f["path"], "action": f["action"]}
+                          for f in plan.get("files", [])],
+                "warnings": plan.get("warnings", [])}
+
+
+def api_apply(body: dict) -> dict:
+    plan_id = body.get("planId")
+    if not isinstance(plan_id, str) or not plan_id.strip():
+        raise ValueError("请先生成并确认同步预览，再提交 planId")
+    with LOCK:
+        result = hub().apply_preview(plan_id)
+        # Applying may update Hub configuration; reload before recording status.
+        return _record_sync(hub(), result["results"], transaction_id=result["transactionId"])
+
+
+def api_restore(body: dict) -> dict:
+    transaction_id = body.get("transactionId")
+    if not isinstance(transaction_id, str) or not transaction_id.strip():
+        raise ValueError("缺少需要恢复的 transactionId")
+    with LOCK:
+        result = hub().restore_transaction(transaction_id)
+        h = hub()
+        h.state["configHash"] = None
+        h.state["lastTransaction"] = None
+        h.state["lastResults"] = [{"target": "restore", "ok": True,
+                                  "message": "已恢复该次同步前的配置；请重新预览后再同步"}]
         h.save_state()
-    return {"ok": bool(details) and all(d["ok"] for d in details),
-            "results": results, "details": details, "changed": changed}
+        return {"ok": True, **result}
 
 
 def api_push(body: dict | None = None) -> dict:
@@ -374,6 +436,13 @@ def api_update_targets(body: dict) -> dict:
                 if not isinstance(update["enabled"], bool):
                     raise ValueError("enabled 必须是布尔值")
                 proposed[name]["enabled"] = update["enabled"]
+            unknown = set(update) - {"enabled", "activeProvider", "mode"}
+            if unknown:
+                raise ValueError("未知的平台设置字段")
+            if "mode" in update:
+                if name != "codex" or update["mode"] not in ("official", "third-party"):
+                    raise ValueError("Codex mode 必须是 official 或 third-party")
+                proposed[name]["mode"] = update["mode"]
             if "activeProvider" in update:
                 pid = update["activeProvider"]
                 p = h.providers.get(pid, {})
@@ -382,7 +451,7 @@ def api_update_targets(body: dict) -> dict:
                 proposed[name]["activeProvider"] = pid
         for name, t in proposed.items():
             if t.get("aliasOf"):
-                t["enabled"] = proposed[t["aliasOf"]].get("enabled", True)
+                t["enabled"] = proposed.get(t["aliasOf"], {}).get("enabled", False)
         h.cfg["sync"]["targets"] = proposed
         _save_config(h)
     return {"ok": True}
@@ -398,7 +467,7 @@ def api_add_provider(body: dict) -> dict:
          "displayName": body.get("displayName") or body.get("name") or pid,
          "baseUrl": body.get("baseUrl") or "", "apiKey": body.get("apiKey") or "",
          "api": body.get("api") or "openai-completions", "enabled": True, "models": []}
-    for field in ("anthropicBaseUrl", "notes", "agentModel", "openaiApiKey"):
+    for field in ("anthropicBaseUrl", "notes", "agentModel", "openaiApiKey", "apiKeyEnv", "codexWireApi"):
         if body.get(field):
             p[field] = body[field]
     for field in ("claudeEnv", "claudeSettings"):
@@ -422,9 +491,9 @@ def api_update_provider(pid: str, body: dict) -> dict:
         h = hub()
         p = dict(_provider(h, pid))
         for field in ("name", "displayName", "baseUrl", "apiKey", "api", "notes", "anthropicBaseUrl",
-                      "enabled", "agentModel", "openaiApiKey"):
+                      "enabled", "agentModel", "openaiApiKey", "apiKeyEnv", "codexWireApi"):
             if field in body:
-                p[field] = body[field]
+                p[field] = None if field == "codexWireApi" and body[field] == "" else body[field]
         if "claudeModels" in body and isinstance(body["claudeModels"], dict):
             p["claudeModels"] = body["claudeModels"]
         for field in ("claudeEnv", "claudeSettings"):
@@ -570,6 +639,9 @@ def api_import_models(pid: str, body: dict) -> dict:
 ROUTES = [
     ("GET", r"^/api/providers$", lambda m, b: api_providers()),
     ("GET", r"^/api/status$", lambda m, b: api_status()),
+    ("POST", r"^/api/preview$", lambda m, b: api_preview(b)),
+    ("POST", r"^/api/apply$", lambda m, b: api_apply(b)),
+    ("POST", r"^/api/restore$", lambda m, b: api_restore(b)),
     ("POST", r"^/api/push$", lambda m, b: api_push(b)),
     ("POST", r"^/api/sync$", lambda m, b: api_sync(b)),
     ("PUT", r"^/api/targets$", lambda m, b: api_update_targets(b)),

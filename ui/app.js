@@ -38,19 +38,20 @@ const TARGETS = {
   "dsh-desktop": ["dsh 桌面版", "ds", "随 dsh 一起同步，无需重复选择"],
   claude: ["Claude Code", "cc", "Anthropic 环境变量与模型别名"],
   "cc-switch": ["cc-switch", "cs", "多客户端供应商数据库"], omp: ["omp", "om", "Agent 模型配置"],
-  codex: ["Codex", "cx", "只写 model_provider 与模型，登录态不动"],
+  codex: ["Codex", "cx", "显式选择官方或第三方线路；登录态不动"],
 };
 const palette = [["#f0edff", "#9984cd"], ["#fff1e9", "#c99b7b"], ["#edf3ff", "#84a0cf"], ["#edf7f3", "#80af9b"]];
 // 供应商表单里的平台多选：顺序固定，便于用户按习惯找到目标平台。
-const PROVIDER_TARGETS = [["pi", "pi"], ["dsh", "dsh"], ["dsh-desktop", "dsh 桌面版"], ["claude", "Claude Code"], ["cc-switch", "cc-switch"], ["mcode", "mcode"], ["zcode", "zcode"], ["omp", "omp"]];
+const PROVIDER_TARGETS = [["pi", "pi"], ["dsh", "dsh"], ["dsh-desktop", "dsh 桌面版"], ["claude", "Claude Code"], ["cc-switch", "cc-switch"], ["mcode", "mcode"], ["zcode", "zcode"], ["omp", "omp"], ["codex", "Codex"]];
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 // 模型同步卡片里的客户端行；dsh-desktop 与 dsh 共用配置，不接受单独 override。
-const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["claude", "Claude Code"], ["codex", "Codex 官方"]];
+const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["claude", "Claude Code"], ["codex", "Codex"]];
 const CLAUDE_TIERS = [["opus", "opus 档位"], ["sonnet", "sonnet 档位"], ["haiku", "haiku 档位"], ["subagent", "subagent 档位"]];
 const state = {
   providers: {}, status: null, page: "models", busy: false, loaded: false,
   filters: { query: "", provider: "all", capability: "all" }, modelPage: 1, selection: new Set(),
-  providerQuery: "", targetDraft: {}, activeDraft: "", editor: null, editorSnapshot: "", discovered: [],
+  providerQuery: "", targetDraft: {}, activeDraft: "", codexMode: "official", codexOptIn: false, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [],
   modelDraft: "", modelOptions: [], modelLoading: false,
   modelSync: null, modelSyncError: "", modelSyncLoading: false, modelSyncDraft: null, modelSyncDraftKey: "", modelSyncCustom: {}, modelSyncOpen: new Set(),
 };
@@ -91,7 +92,7 @@ const parseJsonField = (raw, label) => {
 };
 const effectiveTargets = () => Object.entries(state.status?.targets || {}).filter(([, t]) => t.supported && !t.aliasOf);
 const enabledCount = () => effectiveTargets().filter(([, t]) => t.enabled).length;
-const targetDirty = () => effectiveTargets().some(([n, t]) => state.targetDraft[n] !== t.enabled) || state.activeDraft !== (state.status?.targets?.claude?.activeProvider || "") || modelDirty();
+const targetDirty = () => effectiveTargets().some(([n, t]) => state.targetDraft[n] !== t.enabled) || state.activeDraft !== (state.status?.targets?.claude?.activeProvider || "") || modelDirty() || state.codexMode !== (state.status?.targets?.codex?.mode || "official") || (state.loaded && modelSyncDirty());
 const formSnapshot = () => JSON.stringify([...new FormData($("#editor-form")).entries()]);
 const editorDirty = () => state.editor && state.editor.type !== "discover" && formSnapshot() !== state.editorSnapshot;
 const dateLabel = value => {
@@ -197,10 +198,13 @@ async function loadModelSync() {
     state.modelSyncLoading = false;
   }
 }
-function renderModelSyncCard() { $("#modelsync-card").innerHTML = modelSyncCard(); }
+function renderModelSyncCard() {
+  $("#modelsync-card").innerHTML = modelSyncCard();
+  if ($("#target-count")) updateTargetDraftUI();
+}
 async function saveModelSync() {
   const draft = ensureModelSyncDraft();
-  const scopes = [["clients", "pi", ""], ["clients", "dsh", ""], ["clients", "claude", ""], ["tiers", "claude", "opus"], ["tiers", "claude", "sonnet"], ["tiers", "claude", "haiku"], ["tiers", "claude", "subagent"]];
+  const scopes = [["clients", "codex", ""], ["clients", "pi", ""], ["clients", "dsh", ""], ["clients", "claude", ""], ["tiers", "claude", "opus"], ["tiers", "claude", "sonnet"], ["tiers", "claude", "haiku"], ["tiers", "claude", "subagent"]];
   // 界面上填了 provider 却没填模型（或反过来）的行无法写入，先拦下来。
   for (const [scope, target, tier] of scopes) {
     const entry = scope === "tiers" ? draft.overrides?.claude?.tiers?.[tier] : draft.overrides?.[target];
@@ -237,6 +241,7 @@ async function api(method, path, body) {
     const res = await fetch(path, { method, headers: { "Content-Type": "application/json" }, signal: controller.signal, body: body === undefined ? undefined : JSON.stringify(body) });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
+    if (method !== "GET" && !["/api/preview", "/api/apply"].includes(path)) invalidatePreview();
     return data;
   } catch (e) {
     if (e.name === "AbortError") throw new Error("请求超时。操作可能仍在后台执行，请稍后刷新确认，勿重复提交。");
@@ -250,7 +255,7 @@ async function busy(label, task) {
   state.busy = true;
   document.body.classList.add("busy");
   $("#content").setAttribute("aria-busy", "true");
-  const buttons = $$("button[data-write], #refresh, #editor-form input, #editor-form select, #editor-form textarea, #editor-form button");
+  const buttons = $$("button[data-write], #refresh, #content input, #content select, #content textarea, #editor-form input, #editor-form select, #editor-form textarea, #editor-form button");
   const disabled = buttons.map(b => b.disabled);
   buttons.forEach(b => { b.disabled = true; });
   $("#save-state").innerHTML = `<span class="spinner"></span>${esc(label)}`;
@@ -271,6 +276,7 @@ async function busy(label, task) {
 }
 
 async function reload() {
+  invalidatePreview();
   const keepDraft = state.loaded && targetDirty();
   const [providers, status] = await Promise.all([api("GET", "/api/providers"), api("GET", "/api/status"), loadModelSync()]);
   state.providers = providers.providers || {};
@@ -291,6 +297,9 @@ async function refreshAfterWrite(message) {
 function resetTargetDraft() {
   state.targetDraft = Object.fromEntries(effectiveTargets().map(([n, t]) => [n, t.enabled]));
   state.activeDraft = state.status?.targets?.claude?.activeProvider || "";
+  state.codexMode = state.status?.targets?.codex?.mode || "official";
+  state.codexOptIn = state.codexMode === "third-party";
+  invalidatePreview();
   state.modelDraft = "";
   state.modelOptions = [];
   state.modelLoading = false;
@@ -392,8 +401,9 @@ function renderProviderCards() {
 
 function renderSync() {
   const pending = state.status.pendingSync;
-  $("#content").innerHTML = heading(`<button data-action="detect-sync" data-write>${icon("refresh")}检测变更并同步</button><button class="primary" data-action="run-sync" data-write id="sync-primary">${icon("sync")}同步已选平台</button>`) + `
+  $("#content").innerHTML = heading(`<button data-action="detect-sync" data-write>${icon("refresh")}检测变更并预览</button><button class="primary" data-action="run-sync" data-write id="sync-primary">${icon("sync")}预览已选平台</button>`) + `
     <div class="notice ${pending ? "warn" : ""}">${icon(pending ? "clock" : "shield")}<div><strong>${pending ? "本地配置有更新，等待同步到平台" : "本地配置已同步到所有启用平台"}</strong><br />${pending ? "以 Hub 为准写入已选平台；未选平台保持不变。" : "你可以再次同步，或先检测客户端配置是否有变化。"} 写入前会备份原配置。</div></div>
+    <section id="sync-preview" class="card sync-preview" aria-live="polite" hidden></section>
     <section class="card modelsync-card" id="modelsync-card" aria-label="多 agent 使用的模型"></section>
     <div class="sync-layout"><section class="card"><div class="card-heading"><div><h2>同步到哪些平台？</h2><p>dsh 桌面版与 CLI 联动；官方授权不在管理范围内。</p></div><span class="tag" id="target-count"></span></div><div class="target-grid">${Object.entries(state.status.targets || {}).map(([name, t]) => {
       const [title, short, desc] = TARGETS[name] || [name, name.slice(0, 2), t.notes || "模型配置"];
@@ -409,13 +419,15 @@ function renderSync() {
       if (!pid) return "";
       return `<div class="target-config"><div><strong>Claude 模型</strong><p>从 ${esc(providerName(pid))} 拉取可用模型；切换后点「保存平台设置」并同步生效。<b>未在列表中的模型</b>可直接在供应商配置里手填。</p></div><div class="model-switch">${state.modelLoading ? `<span class="spinner"></span>` : `<select id="claude-model" aria-label="Claude 模型">${cur ? "" : `<option value="">从供应商检测模型</option>`}${opts.map(m => `<option value="${esc(m)}" ${draft === m ? "selected" : ""}>${esc(m)}</option>`).join("")}</select><button class="small ghost" type="button" data-action="load-claude-models" data-write data-pid="${esc(pid)}" title="向供应商查询可用模型">${icon("sparkles")}获取模型</button>`}</div></div>`;
     })() : ""}<div class="table-footer"><span id="target-draft-status"></span><div class="actions"><button class="small ghost" data-action="reset-targets" id="reset-targets">撤销更改</button><button class="small" data-action="save-targets" data-write id="save-targets">保存平台设置</button></div></div></section>
-    <section class="card"><div class="card-heading"><div><h2>最近同步结果</h2><p>${state.status.lastSync ? `执行于 ${esc(dateLabel(state.status.lastSync))}` : "同步后，这里会显示每个平台的执行结果。"}</p></div>${state.status.lastSync ? `<span class="tag">${icon("clock")}最近一次</span>` : ""}</div><div class="sync-results" id="sync-results">${renderResults(state.status.lastResults || [])}</div></section></div>
+    <section class="card"><div class="card-heading"><div><h2>最近同步结果</h2><p>${state.status.lastSync ? `执行于 ${esc(dateLabel(state.status.lastSync))}` : "同步后，这里会显示每个平台的执行结果。"}</p></div>${state.status.lastTransaction ? `<button class="small" data-action="restore-sync" data-write>恢复上次同步</button>` : state.status.lastSync ? `<span class="tag">${icon("clock")}最近一次</span>` : ""}</div><div class="sync-results" id="sync-results">${renderResults(state.status.lastResults || [])}</div></section></div>
     <details class="diagnostics"><summary>查看配置路径与诊断信息</summary><pre>${esc(state.status.configPath)}\n\n${esc(state.status.statusText)}${state.status.changedFiles?.length ? `\n\n检测到外部变更：\n${esc(state.status.changedFiles.join("\n"))}` : ""}</pre></details>`;
   updateTargetDraftUI();
   renderModelSyncCard();
+  renderPreview();
 }
 // 把某个作用域（default / clients / tiers）的模型设置写进草稿；空字符串表示删除该字段。
 function setModelEntry(scope, target, tier, patch) {
+  invalidatePreview();
   const draft = ensureModelSyncDraft();
   // 必须先落到草稿里的真实对象再改，不能对中间对象整体赋值，否则 tiers 下的修改会写丢。
   let entry = draft.default;
@@ -472,7 +484,7 @@ function modelRow(scope, target, tier, entry, resolvedEntry, provider, label = "
 }
 const effortLabel = value => {
   if (!value) return "";
-  if (value === "off") return "关闭推理";
+  if (value === "off" || value === "none") return "关闭推理";
   const found = { minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" }[value];
   return found ? `${value}（${found}）` : value;
 };
@@ -509,20 +521,19 @@ function clientRow(name, label) {
   const draft = ensureModelSyncDraft();
   const entry = draft.overrides?.[name] || {};
   const resolved = modelSyncResolved(name);
-  if (name === "codex") {
-    return `<div class="ms-client readonly" data-client="codex">
-      <div class="ms-client-head"><strong>${esc(label)}</strong><span class="tag">只登记</span></div>
-      <div class="ms-client-body"><span class="ms-resolved">只登记可用模型，登录态与写入由 Codex 自己维护。</span></div>
-    </div>`;
+  const codex = name === "codex";
+  const mode = codex ? `<div class="codex-mode"><label class="field"><span>Codex 请求线路</span><select id="codex-mode" aria-label="Codex 请求线路" ${state.status?.targets?.codex ? "" : "disabled"}><option value="official" ${state.codexMode === "official" ? "selected" : ""}>官方 · 恢复原模型与推理强度</option><option value="third-party" ${state.codexMode === "third-party" ? "selected" : ""}>第三方 · 使用 Hub 模型设置</option></select></label>${state.codexMode === "third-party" ? `<label class="check-label codex-optin"><input id="codex-optin" type="checkbox" ${state.codexOptIn ? "checked" : ""} />我明确选择第三方线路，Codex 请求将发送到所选供应商</label>` : `<p class="ms-client-note">同步时恢复 Hub 首次切换第三方前保存的官方 model、model_provider 和 reasoning effort；没有保存记录时仅接受现有官方配置；现有第三方线路会拒绝恢复，需先在 Codex 中恢复官方配置。不会更改 auth.json 登录态。</p>`}</div>` : "";
+  if (codex && state.codexMode !== "third-party") {
+    return `<div class="ms-client" data-client="codex"><div class="ms-client-head"><strong>Codex</strong><span class="tag green">官方线路</span></div>${mode}<p class="ms-client-note">第三方模型覆盖保留在 Hub 中，官方模式不会将这些模型写入 Codex。${state.status?.targets?.codex ? "勾选 Codex 平台后预览并应用，线路才会生效。" : "当前未配置 Codex 同步目标。"}</p></div>`;
   }
-  const overridden = !!entry.model;
+  const overridden = !!(entry.model || entry.provider || entry.reasoningEffort);
   const body = overridden
-    ? `<div class="ms-row">${providerSelect("clients", name, "", entry.provider || "")}${modelSelect("clients", name, "", entry.model, entry.provider || resolved?.provider || draft.default?.provider || "")}<button class="small ghost" type="button" data-action="ms-follow-global" data-scope="clients" data-target="${esc(name)}">跟随全局</button></div>`
+    ? `<div class="ms-row">${providerSelect("clients", name, "", entry.provider || "")}${modelSelect("clients", name, "", entry.model, entry.provider || resolved?.provider || draft.default?.provider || "")}${codex ? `<label class="ms-field"><span>推理强度</span><select data-ms-effort data-scope="clients" data-target="codex" aria-label="Codex 推理强度"><option value="">供应商默认（移除覆盖）</option>${CODEX_EFFORTS.map(v => `<option value="${v}" ${v === entry.reasoningEffort ? "selected" : ""}>${esc(effortLabel(v))}</option>`).join("")}</select></label>` : ""}<button class="small ghost" type="button" data-action="ms-follow-global" data-scope="clients" data-target="${esc(name)}">跟随全局</button></div>`
     : `<div class="ms-client-body"><span class="ms-resolved">当前：${esc(modelSummary(resolved) || "尚未确定；跟随全局主模型")}</span><button class="small ghost" type="button" data-action="ms-override" data-target="${esc(name)}">单独指定</button></div>`;
   const needModel = !!entry.provider && !entry.model;
   return `<div class="ms-client ${overridden ? "overridden" : ""}" data-client="${esc(name)}">
     <div class="ms-client-head"><strong>${esc(label)}</strong>${needModel ? `<span class="tag amber">请选择模型</span>` : overridden ? `<span class="tag amber">单独指定</span>` : `<span class="tag green">跟随全局</span>`}</div>
-    ${body}
+    ${mode}${body}
   </div>`;
 }
 function claudeRow() {
@@ -539,7 +550,7 @@ function claudeRow() {
   return `<div class="ms-client ${overridden ? "overridden" : ""}" data-client="claude">
     <div class="ms-client-head"><strong>Claude Code</strong>${overridden ? `<span class="tag amber">单独指定</span>` : follows ? `<span class="tag green">跟随全局</span>` : `<span class="tag">独立设置</span>`}${tierCount ? `<span class="tag purple">${tierCount} 个档位单独指定</span>` : ""}</div>
     ${body}
-    <p class="ms-client-note">${icon("info")}只有全局供应商具备 Anthropic 端点时，Claude Code 才跟随全局主模型；否则保持活跃供应商自己的 claudeModels / model。跟随发生时后端会把 claude 的 activeProvider 写成本次选中的供应商。</p>
+    <p class="ms-client-note">${icon("info")}只有全局供应商具备 Anthropic 端点时，Claude Code 才跟随全局主模型；否则保持活跃供应商自己的 claudeModels / model。预览与同步按这条解析规则选择实际供应商，不会改写 Hub 中的 activeProvider。</p>
     <details class="ms-tiers" data-ms-details="claude" ${state.modelSyncOpen.has("claude") || tierCount ? "open" : ""}>
       <summary>展开档位设置（model / opus / sonnet / haiku / subagent）</summary>
       <p class="ms-tier-note">${icon("info")}Claude Code 的档位分别对应 ANTHROPIC_MODEL 与 ANTHROPIC_DEFAULT_*_MODEL；保存后写入激活供应商的 claudeModels。点「使用默认档位」的档位会跟随 Claude 行的主模型。</p>
@@ -554,9 +565,9 @@ function modelSyncCard() {
   const defaultProvider = draft.default?.provider || "";
   const defaultModel = draft.default?.model || "";
   const dirty = modelSyncDirty();
-  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）与 Claude Code 的主模型、推理强度和 subagent 档位；改完先保存，再点「同步已选平台」。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
+  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）、Claude Code 与显式选择第三方线路的 Codex；改完保存，预览后再应用。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
   if (warn) {
-    return `${header}<div class="notice warn" id="modelsync-warning">${icon("alert")}<div><strong>模型设置接口不可用</strong><br />${esc(warn)}<br />下面的选择会先留在页面上，但无法保存或读取解析结果；确认服务已更新后点右侧按钮重试。</div><div class="actions"><button class="small" type="button" data-action="reload-modelsync">${icon("refresh")}重新读取</button></div></div><div class="ms-global"><div class="ms-global-note">${icon("info")}<div>接口 <span class="mono">GET /api/modelsync</span> 暂时不可用，解析状态无法展示；供应商与模型下拉仍可正常使用。</div></div></div><div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；客户端文件由「同步已选平台」负责。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write disabled>保存模型设置</button></div></div>`;
+    return `${header}<div class="notice warn" id="modelsync-warning">${icon("alert")}<div><strong>模型设置接口不可用</strong><br />${esc(warn)}<br />下面的选择会先留在页面上，但无法保存或读取解析结果；确认服务已更新后点右侧按钮重试。</div><div class="actions"><button class="small" type="button" data-action="reload-modelsync">${icon("refresh")}重新读取</button></div></div><div class="ms-global"><div class="ms-global-note">${icon("info")}<div>接口 <span class="mono">GET /api/modelsync</span> 暂时不可用，解析状态无法展示；供应商与模型下拉仍可正常使用。</div></div></div><div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；客户端文件需先预览并确认应用。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write disabled>保存模型设置</button></div></div>`;
   }
   const degraded = !state.modelSync;
   return `${header}
@@ -568,15 +579,15 @@ function modelSyncCard() {
         ${modelRow("default", "default", "", draft.default || {}, null, defaultProvider, "全局主模型 · 模型")}
         <label class="ms-field"><span>推理强度（可选）</span><select id="ms-default-effort" data-ms-effort data-scope="default" data-target="default" aria-label="推理强度"><option value="">不改客户端现有值</option>${EFFORTS.map(v => `<option value="${esc(v)}" ${v === draft.default?.reasoningEffort ? "selected" : ""}>${esc(effortLabel(v))}</option>`).join("")}</select></label>
       </div>
-      <p class="ms-hint">留空表示同步时不改动客户端现有的推理强度设置。</p>
+      <p class="ms-hint">留空时其他客户端保留现有强度；Codex 第三方模式会移除旧强度，官方模式恢复之前保存的值。</p>
     </div>
     <div class="ms-clients">
       ${clientRow("pi", "pi")}
       ${clientRow("dsh", "dsh（含桌面版）")}
       ${claudeRow()}
-      ${clientRow("codex", "Codex 官方")}
+      ${clientRow("codex", "Codex")}
     </div>
-    <div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；「保存平台设置」也会先落盘这里的改动，写入客户端仍由「同步已选平台」负责。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write ${dirty ? "" : "disabled"}>保存模型设置</button></div></div>`;
+    <div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；「保存平台设置」也会先落盘这里的改动，写入客户端需先预览并确认应用。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write ${dirty ? "" : "disabled"}>保存模型设置</button></div></div>`;
 }
 function renderResults(results) {
   return results.length ? results.map(r => `<div class="result-row ${r.ok ? "" : "error"}"><div class="result-symbol">${icon(r.ok ? "check" : "x")}</div><div><strong>${esc(TARGETS[r.target]?.[0] || r.target)}</strong><p>${esc(r.message)}</p></div><span class="tag ${r.ok ? "green" : "amber"}" style="margin-left:auto">${r.ok ? "成功" : "失败"}</span></div>`).join("") : empty("sync", "还没有同步记录", "选择平台，开始第一次同步。");
@@ -585,7 +596,7 @@ function updateTargetDraftUI() {
   const dirty = targetDirty();
   const selected = Object.values(state.targetDraft).filter(Boolean).length;
   $("#target-count").textContent = `已选 ${selected} 个独立目标`;
-  $("#target-draft-status").textContent = dirty ? "平台设置尚未保存；开始同步时会一并保存。" : "平台设置已保存，修改不会立即触发同步。";
+  $("#target-draft-status").textContent = dirty ? "平台设置尚未保存；生成预览时会先保存到 Hub。" : "平台设置已保存，修改不会立即触发同步。";
   $("#save-targets").disabled = !dirty;
   $("#reset-targets").disabled = !dirty;
   $("#sync-primary").disabled = !selected;
@@ -607,10 +618,12 @@ function updateModelSyncUI() {
   });
 }
 async function saveTargets() {
-  if (!targetDirty()) return;
+  if (!targetDirty() && !modelSyncDirty()) return;
+  if (state.codexMode === "third-party" && !state.codexOptIn) throw new Error("请先勾选 Codex 第三方线路确认，或改回官方线路。");
   // 平台设置与模型设置写在不同接口；这里顺手把未保存的模型设置一起落盘，避免随后的 reload 丢掉它。
   if (modelSyncDirty() && !state.modelSyncError) await saveModelSync();
   const updates = Object.fromEntries(effectiveTargets().map(([name]) => [name, { enabled: state.targetDraft[name] }]));
+  if (updates.codex) updates.codex.mode = state.codexMode;
   if (state.activeDraft && state.activeDraft !== state.status.targets?.claude?.activeProvider) updates.claude.activeProvider = state.activeDraft;
   await api("PUT", "/api/targets", { targets: updates });
   // 模型切换落在 provider 上（claudeModels / claudeSettings.model），不是平台配置里。
@@ -630,21 +643,74 @@ async function saveTargets() {
   state.modelDraft = "";
   state.modelOptions = [];
 }
+function invalidatePreview() {
+  state.preview = null;
+  state.previewError = "";
+  const card = $("#sync-preview");
+  if (card) { card.hidden = true; card.innerHTML = ""; }
+}
+function renderPreview() {
+  const card = $("#sync-preview");
+  if (!card) return;
+  const plan = state.preview;
+  card.hidden = !plan && !state.previewError;
+  if (card.hidden) return;
+  if (state.previewError) {
+    card.innerHTML = `<div class="notice warn"><div>${icon("alert")}<strong>同步未完成</strong><p>${esc(state.previewError)}</p><p>请检查设置后重新生成预览；没有有效预览时不会应用。</p></div></div>`;
+    return;
+  }
+  const actions = { create: "新建", update: "更新", delete: "删除", unchanged: "不变" };
+  card.innerHTML = `<div class="card-heading"><div><h2>同步预览 · 尚未写入客户端</h2><p>目标：${(plan.targets || []).map(name => esc(TARGETS[name]?.[0] || name)).join("、")}。确认后仅应用本次预览；文件变化时会拒绝过期预览。</p></div><span class="tag">${plan.files.length} 个文件</span></div><ul class="preview-files">${plan.files.map(f => `<li><span class="tag">${esc(actions[f.action] || f.action)}</span><span class="mono">${esc(f.path)}</span></li>`).join("") || "<li>没有需要修改的客户端文件</li>"}</ul>${plan.warnings?.length ? `<div class="preview-warnings">${plan.warnings.map(w => `<p>${icon("alert")}${esc(w)}</p>`).join("")}</div>` : ""}<div class="table-footer"><span>仅显示路径与操作；密钥和配置内容不在预览中展示</span><div class="actions"><button class="small" data-action="cancel-preview">取消</button><button class="primary small" data-action="apply-preview" data-write>确认应用预览</button></div></div>`;
+}
 async function runSync(detect = false) {
   const selected = Object.entries(state.targetDraft).filter(([, enabled]) => enabled).map(([name]) => name);
   if (!selected.length) { toast("请至少选择一个同步平台", "error"); return; }
   if (selected.includes("claude") && !(state.status.anthropicCapable || []).includes(state.activeDraft)) { toast("请先选择 Claude Code 的兼容供应商，或取消该平台", "error"); $("#claude-provider")?.focus(); return; }
-  if (detect && !await confirmDialog("检测并覆盖客户端变更？", "这不是从客户端导入配置。检测变更后，仍将以 Hub 配置为准写入已选平台。原文件会自动备份。", [], "检测并同步", false)) return;
-  await busy("正在同步平台…", async () => {
-    await saveTargets();
-    $("#sync-results").innerHTML = '<div class="load-state" style="padding:32px"><span class="spinner"></span><p>正在写入平台配置，请勿关闭服务…</p></div>';
-    const result = await api("POST", detect ? "/api/sync" : "/api/push", { targets: selected });
-    // 即使状态刷新失败，也保留实际返回的逐平台结果。
-    state.status.lastResults = result.details || [];
-    try { await reload(); }
-    catch (e) { $("#sync-results").innerHTML = renderResults(result.details || []); toast(`同步已执行，但状态刷新失败：${e.message}`, "error"); }
-    const failed = (result.details || []).filter(d => !d.ok).length;
-    toast(failed ? `${failed} 个平台同步失败，请查看结果并重试。` : `已同步 ${result.details?.length || 0} 个平台，重启客户端后生效。`, failed ? "error" : "ok");
+  if (state.codexMode === "third-party" && !state.codexOptIn) { toast("请先勾选 Codex 第三方线路确认，或改回官方线路。", "error"); $("#codex-optin")?.focus(); return; }
+  if (detect && !await confirmDialog("检测并预览客户端变更？", "这不是从客户端导入配置。仍将以 Hub 配置为准生成预览，确认应用后才会写入已选平台。", [], "生成预览", false)) return;
+  await busy("正在生成同步预览…", async () => {
+    invalidatePreview();
+    try {
+      await saveTargets();
+      await reload();
+      state.preview = await api("POST", "/api/preview", { targets: selected });
+      if (!state.preview.planId || !Array.isArray(state.preview.files)) throw new Error("服务返回的预览不完整，请更新服务后重试。");
+      renderPreview();
+      $("#sync-preview")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) {
+      state.preview = null;
+      state.previewError = e.message;
+      renderPreview();
+      throw e;
+    }
+  });
+}
+async function applyPreview() {
+  if (!state.preview?.planId) return;
+  const planId = state.preview.planId;
+  await busy("正在应用已确认的预览…", async () => {
+    try {
+      const result = await api("POST", "/api/apply", { planId });
+      invalidatePreview();
+      state.status.lastResults = result.details || [];
+      try { await reload(); }
+      catch (e) { $("#sync-results").innerHTML = renderResults(result.details || []); toast(`同步已执行，但状态刷新失败：${e.message}`, "error"); }
+      const failed = (result.details || []).filter(d => !d.ok).length;
+      toast(result.ok === false || failed ? "同步未全部完成，请查看结果后重新预览。" : `已同步 ${result.details?.length || 0} 个平台，重启客户端后生效。`, result.ok === false || failed ? "error" : "ok");
+    } catch (e) {
+      state.preview = null;
+      state.previewError = e.message;
+      renderPreview();
+      throw e;
+    }
+  });
+}
+async function restoreSync() {
+  const transactionId = state.status?.lastTransaction;
+  if (!transactionId || !await confirmDialog("恢复上次同步前的配置？", "恢复该次同步涉及的文件。若这些文件在同步后被其他程序修改，将拒绝恢复，避免覆盖新改动。", [], "恢复配置", false)) return;
+  await busy("正在恢复配置…", async () => {
+    await api("POST", "/api/restore", { transactionId });
+    await refreshAfterWrite("已恢复同步前的配置；再次同步前请重新预览。");
   });
 }
 
@@ -706,7 +772,7 @@ function openProvider(pid) {
   if (state.busy) return;
   const p = state.providers[pid] || {}, edit = !!pid;
   const protocols = ["openai-completions", "openai-responses", "openai-chat-completions", "anthropic-messages"];
-  showEditor("provider", edit ? "供应商连接配置" : "连接新的供应商", `<p class="form-intro">${edit ? "修改连接信息不会覆盖该供应商已有的模型列表。" : "先配置连接，再手动添加或检测模型。供应商 ID 用于各平台的配置映射。"}</p><div class="form-grid"><label class="field"><span>供应商 ID ${edit ? "" : '<b class="required">*</b>'}</span><input name="id" value="${esc(pid || "")}" placeholder="例如 deepseek" pattern="[a-zA-Z0-9][a-zA-Z0-9_\\-]*" required ${edit ? "readonly" : ""} /><small>字母、数字、下划线或连字符</small></label><label class="field"><span>显示名称 <b class="required">*</b></span><input name="displayName" value="${esc(p.displayName || p.name || "")}" placeholder="例如 DeepSeek" required /></label><label class="field full"><span>API 地址 · Base URL <b class="required">*</b></span><input name="baseUrl" type="url" value="${esc(p.baseUrl || "")}" placeholder="https://api.example.com/v1" required /></label><label class="field full"><span>API Key <b class="required">*</b></span><div class="password-wrap"><input name="apiKey" type="password" value="${esc(p.apiKey || "")}" placeholder="输入 API 密钥" autocomplete="off" required /><button class="icon-button" type="button" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">${icon("eye")}</button></div><small>保存在本机 providers.json 中，请勿共享配置文件。</small></label><label class="field full"><span>API 协议</span><select name="api">${protocols.map(v => `<option value="${v}" ${v === (p.api || protocols[0]) ? "selected" : ""}>${v}</option>`).join("")}</select></label>${edit ? `<label class="check-label full"><input name="enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""} />启用供应商，供平台同步使用</label>` : ""}</div><details class="form-section"><summary>高级设置 · Claude 兼容端点与备注</summary><div class="form-grid">${edit ? `<label class="field full"><span>内部名称</span><input name="name" value="${esc(p.name || pid)}" required /></label>` : ""}<label class="field full"><span>Anthropic Base URL</span><input name="anthropicBaseUrl" type="url" value="${esc(p.anthropicBaseUrl || "")}" placeholder="https://api.example.com/anthropic" /><small>配置后可在平台同步中供 Claude Code 选择。</small></label><label class="field full"><span>备注</span><input name="notes" value="${esc(p.notes || "")}" placeholder="可选，例如套餐或网关说明" /></label><label class="field full"><span>同步到哪些平台</span><div class="check-group">${PROVIDER_TARGETS.map(([name, label]) => `<label class="check-label"><input type="checkbox" name="targets" value="${esc(name)}" ${(p.targets || []).includes(name) ? "checked" : ""} />${esc(label)}</label>`).join("")}</div><small>全不勾选 = 同步到所有平台（默认）。只提供 Anthropic 端点的网关通常只勾 Claude Code，避免污染 pi / dsh 等其他客户端。</small></label><label class="field full"><span>agent 默认模型 · agentModel</span><select name="agentModel">${providerModelChoices(pid, p).map(id => `<option value="${esc(id)}" ${id === (p.agentModel || "") ? "selected" : ""}>${esc(id)}</option>`).join("")}</select><small>可选。作为该供应商在客户端没有单独指定模型时的回退值；留空表示不登记。</small></label></div></details><details class="form-section"><summary>自定义接入 · Claude 声明式透传与目标平台</summary><div class="form-grid"><label class="field full"><span>Claude 模型映射 · claudeModels</span><textarea name="claudeModels" rows="4" class="mono" spellcheck="false" placeholder='{"model":"claude-sonnet-4-6","opus":"...","sonnet":"...","haiku":"...","subagent":"..."}'>${esc(jsonText(p.claudeModels))}</textarea><small>JSON 对象；映射到 ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_SUBAGENT_MODEL。</small></label><label class="field full"><span>额外环境变量 · claudeEnv</span><textarea name="claudeEnv" rows="3" class="mono" spellcheck="false" placeholder='{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1","ENABLE_TOOL_SEARCH":"true"}'>${esc(jsonText(p.claudeEnv))}</textarea><small>JSON 对象；原样写入 settings.json 的 env。</small></label><label class="field full"><span>顶层 settings 字段 · claudeSettings</span><textarea name="claudeSettings" rows="5" class="mono" spellcheck="false" placeholder='{"model":"claude-sonnet-4-6","effortLevel":"high","permissions":{"allow":[]}}'>${esc(jsonText(p.claudeSettings))}</textarea><small>JSON 对象；原样写入 settings.json 顶层（model / effortLevel / permissions 等）。切换供应商时，hub 只收回自己写过的键，你手工配置的字段不受影响。</small></label></div></details>`, formFooter(edit ? "保存配置" : "添加供应商", edit ? `<button type="button" class="danger" data-action="delete-provider" data-pid="${esc(pid)}">${icon("trash")}删除</button>` : ""), { pid });
+  showEditor("provider", edit ? "供应商连接配置" : "连接新的供应商", `<p class="form-intro">${edit ? "修改连接信息不会覆盖该供应商已有的模型列表。" : "先配置连接，再手动添加或检测模型。供应商 ID 用于各平台的配置映射。"}</p><div class="form-grid"><label class="field"><span>供应商 ID ${edit ? "" : '<b class="required">*</b>'}</span><input name="id" value="${esc(pid || "")}" placeholder="例如 deepseek" pattern="[a-zA-Z0-9][a-zA-Z0-9_\\-]*" required ${edit ? "readonly" : ""} /><small>字母、数字、下划线或连字符</small></label><label class="field"><span>显示名称 <b class="required">*</b></span><input name="displayName" value="${esc(p.displayName || p.name || "")}" placeholder="例如 DeepSeek" required /></label><label class="field full"><span>API 地址 · Base URL <b class="required">*</b></span><input name="baseUrl" type="url" value="${esc(p.baseUrl || "")}" placeholder="https://api.example.com/v1" required /></label><label class="field full"><span>API Key</span><div class="password-wrap"><input name="apiKey" type="password" value="${esc(p.apiKey || "")}" placeholder="输入 API 密钥；或在下方配置环境变量" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">${icon("eye")}</button></div><small>保存在本机 providers.json 中，请勿共享配置文件。</small></label><label class="field full"><span>API 协议</span><select name="api">${protocols.map(v => `<option value="${v}" ${v === (p.api || protocols[0]) ? "selected" : ""}>${v}</option>`).join("")}</select></label>${edit ? `<label class="check-label full"><input name="enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""} />启用供应商，供平台同步使用</label>` : ""}</div><details class="form-section"><summary>高级设置 · Claude 兼容端点与备注</summary><div class="form-grid">${edit ? `<label class="field full"><span>内部名称</span><input name="name" value="${esc(p.name || pid)}" required /></label>` : ""}<label class="field full"><span>Anthropic Base URL</span><input name="anthropicBaseUrl" type="url" value="${esc(p.anthropicBaseUrl || "")}" placeholder="https://api.example.com/anthropic" /><small>配置后可在平台同步中供 Claude Code 选择。</small></label><label class="field full"><span>备注</span><input name="notes" value="${esc(p.notes || "")}" placeholder="可选，例如套餐或网关说明" /></label><label class="field full"><span>同步到哪些平台</span><div class="check-group">${PROVIDER_TARGETS.map(([name, label]) => `<label class="check-label"><input type="checkbox" name="targets" value="${esc(name)}" ${(p.targets || []).includes(name) ? "checked" : ""} />${esc(label)}</label>`).join("")}</div><small>全不勾选 = 同步到所有平台（默认）。只提供 Anthropic 端点的网关通常只勾 Claude Code，避免污染 pi / dsh 等其他客户端。</small></label><label class="field full"><span>agent 默认模型 · agentModel</span><select name="agentModel">${providerModelChoices(pid, p).map(id => `<option value="${esc(id)}" ${id === (p.agentModel || "") ? "selected" : ""}>${esc(id)}</option>`).join("")}</select><small>可选。作为该供应商在客户端没有单独指定模型时的回退值；留空表示不登记。</small></label></div></details><details class="form-section"><summary>Codex 第三方接入 · Responses 与授权</summary><div class="form-grid"><label class="field full"><span>Responses 兼容性确认</span><select name="codexWireApi"><option value="">尚未确认（API 协议为 openai-responses 时也可用）</option><option value="responses" ${p.codexWireApi === "responses" ? "selected" : ""}>已确认此供应商支持 Responses API</option></select><small>只有明确支持 Responses 的供应商才能写入 Codex；不会自动用 chat 协议替代。</small></label><label class="field full"><span>API Key 环境变量名 · apiKeyEnv</span><input name="apiKeyEnv" value="${esc(p.apiKeyEnv || "")}" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="例如 VENDOR_API_KEY" autocomplete="off" /><small>优先使用变量名引用；变量值由你在本机设置。这里只保存名称，不读取或展示变量值。</small></label><label class="field full"><span>Codex 专用 Key · openaiApiKey</span><input type="password" name="openaiApiKey" value="${esc(p.openaiApiKey || "")}" autocomplete="off" /><small>可选。未使用环境变量时，优先于通用 API Key；会保存在本机配置和备份中。</small></label></div></details><details class="form-section"><summary>自定义接入 · Claude 声明式透传与目标平台</summary><div class="form-grid"><label class="field full"><span>Claude 模型映射 · claudeModels</span><textarea name="claudeModels" rows="4" class="mono" spellcheck="false" placeholder='{"model":"claude-sonnet-4-6","opus":"...","sonnet":"...","haiku":"...","subagent":"..."}'>${esc(jsonText(p.claudeModels))}</textarea><small>JSON 对象；映射到 ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL / CLAUDE_CODE_SUBAGENT_MODEL。</small></label><label class="field full"><span>额外环境变量 · claudeEnv</span><textarea name="claudeEnv" rows="3" class="mono" spellcheck="false" placeholder='{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1","ENABLE_TOOL_SEARCH":"true"}'>${esc(jsonText(p.claudeEnv))}</textarea><small>JSON 对象；原样写入 settings.json 的 env。</small></label><label class="field full"><span>顶层 settings 字段 · claudeSettings</span><textarea name="claudeSettings" rows="5" class="mono" spellcheck="false" placeholder='{"model":"claude-sonnet-4-6","effortLevel":"high","permissions":{"allow":[]}}'>${esc(jsonText(p.claudeSettings))}</textarea><small>JSON 对象；原样写入 settings.json 顶层（model / effortLevel / permissions 等）。切换供应商时，hub 只收回自己写过的键，你手工配置的字段不受影响。</small></label></div></details>`, formFooter(edit ? "保存配置" : "添加供应商", edit ? `<button type="button" class="danger" data-action="delete-provider" data-pid="${esc(pid)}">${icon("trash")}删除</button>` : ""), { pid });
 }
 function openModel(pid, mid) {
   if (state.busy) return;
@@ -749,7 +815,7 @@ async function submitEditor(event) {
   const value = key => String(fd.get(key) || "").trim();
   let payload;
   if (editor.type === "provider") {
-    payload = { id: value("id"), name: editor.pid ? value("name") : value("displayName"), displayName: value("displayName"), baseUrl: value("baseUrl"), apiKey: value("apiKey"), api: value("api"), anthropicBaseUrl: value("anthropicBaseUrl"), notes: value("notes"), ...(editor.pid ? { enabled: fd.has("enabled") } : {}) };
+    payload = { id: value("id"), name: editor.pid ? value("name") : value("displayName"), displayName: value("displayName"), baseUrl: value("baseUrl"), apiKey: value("apiKey"), openaiApiKey: value("openaiApiKey"), apiKeyEnv: value("apiKeyEnv"), codexWireApi: value("codexWireApi") || null, api: value("api"), anthropicBaseUrl: value("anthropicBaseUrl"), notes: value("notes"), ...(editor.pid ? { enabled: fd.has("enabled") } : {}) };
     // 自定义供应商的三个声明式字段：空文本 = 清除，非法 JSON 在此拦截并提示
     for (const [key, label] of [["claudeModels", "Claude 模型映射"], ["claudeEnv", "额外环境变量"], ["claudeSettings", "顶层 settings 字段"]]) {
       let parsed = null;
@@ -758,7 +824,7 @@ async function submitEditor(event) {
       if (parsed) payload[key] = parsed;
       else if (editor.pid) payload[key] = {};
     }
-    if (fd.getAll("targets").length) payload.targets = fd.getAll("targets");
+    if (editor.pid || fd.getAll("targets").length) payload.targets = fd.getAll("targets");
     // 编辑时始终发送 agentModel，让「留空」表示清除；新增时留空就不写这个字段。
     if (editor.pid || value("agentModel")) payload.agentModel = value("agentModel");
   }
@@ -843,7 +909,7 @@ async function deleteProvider(pid) {
 async function navigate(page) {
   if (!PAGES[page]) page = "models";
   if (page === state.page) return;
-  if (state.busy || state.page === "sync" && targetDirty() && !await confirmDialog("平台设置尚未保存", "离开将放弃这次平台选择。你也可以取消，先保存设置。", [], "放弃并离开", false)) {
+  if (state.busy || state.page === "sync" && targetDirty() && !await confirmDialog("平台设置尚未保存", "离开将放弃未保存的平台选择与模型设置。你也可以取消，先保存设置。", [], "放弃并离开", false)) {
     history.replaceState(null, "", `#${state.page}`);
     return;
   }
@@ -885,6 +951,7 @@ document.addEventListener("click", async event => {
       renderModelSyncCard();
     }
     else if (action === "ms-follow-global") {
+      invalidatePreview();
       // 删除 override 键 = 这一行回到全局设置；档位则回到 Claude 行的主模型。
       const { scope, target, tier } = button.dataset;
       if (scope === "tiers") {
@@ -913,6 +980,9 @@ document.addEventListener("click", async event => {
       if (state.modelSyncError) { toast(`模型设置接口仍不可用：${state.modelSyncError}`, "error"); return; }
       toast("模型设置已重新读取。");
     });
+    else if (action === "apply-preview") await applyPreview();
+    else if (action === "cancel-preview") invalidatePreview();
+    else if (action === "restore-sync") await restoreSync();
     else if (action === "run-sync" || action === "detect-sync") await runSync(action === "detect-sync");
   } catch (e) { toast(e.message, "error"); }
 });
@@ -940,13 +1010,18 @@ document.addEventListener("change", event => {
   if (el.id === "capability-filter") { state.filters.capability = el.value; state.modelPage = 1; renderModelRows(); }
   if (el.classList.contains("model-check")) { if (el.checked) state.selection.add(el.dataset.key); else state.selection.delete(el.dataset.key); renderSelection(); }
   if (el.id === "select-page") { visibleModels().forEach(m => el.checked ? state.selection.add(m.key) : state.selection.delete(m.key)); renderModelRows(); }
-  if (el.classList.contains("target-check") && !el.disabled) { state.targetDraft[el.dataset.target] = el.checked; updateTargetDraftUI(); }
+  if (el.classList.contains("target-check") && !el.disabled) { invalidatePreview(); state.targetDraft[el.dataset.target] = el.checked; updateTargetDraftUI(); }
+  if (el.id === "codex-mode") {
+    invalidatePreview(); state.codexMode = el.value; state.codexOptIn = false; renderModelSyncCard(); updateTargetDraftUI();
+  }
+  if (el.id === "codex-optin") { invalidatePreview(); state.codexOptIn = el.checked; updateTargetDraftUI(); }
   if (el.id === "claude-provider") {
+    invalidatePreview();
     // 换供应商后，模型下拉要回到新供应商当前在用的模型，缓存的候选列表失效
     state.activeDraft = el.value; state.modelDraft = ""; state.modelOptions = [];
     renderSync(); updateTargetDraftUI();
   }
-  if (el.id === "claude-model") { state.modelDraft = el.value; updateTargetDraftUI(); }
+  if (el.id === "claude-model") { invalidatePreview(); state.modelDraft = el.value; updateTargetDraftUI(); }
   if (el.classList.contains("discover-check")) updateDiscoverSelection();
   if (el.id === "discover-all") { $$(".discover-row:not([hidden]) .discover-check:not(:disabled)").forEach(c => { c.checked = el.checked; }); updateDiscoverSelection(); }
   if (el.dataset.msProvider !== undefined || el.dataset.msSelect !== undefined || el.dataset.msEffort !== undefined) {

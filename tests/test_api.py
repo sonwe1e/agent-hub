@@ -12,6 +12,25 @@ from unittest.mock import patch
 from support import isolated, engine, server
 
 
+def fake_push_all(h, only=None):
+    results = []
+    seen = set()
+    for name, target in h.cfg.get("sync", {}).get("targets", {}).items():
+        if not target.get("enabled", False) or (only is not None and name not in only):
+            continue
+        canonical = target.get("aliasOf") or name
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        try:
+            getattr(h, "push_" + canonical.replace("-", "_"))()
+            results.append(f"✓ {canonical}: 配置已写入")
+        except Exception as exc:
+            results.append(f"✗ {canonical}: {exc}")
+    return results
+
+
+
 class APITests(unittest.TestCase):
     def setUp(self):
         self.context = isolated()
@@ -29,6 +48,7 @@ class APITests(unittest.TestCase):
         stack = ExitStack()
         for name in ("pi", "mcode", "zcode", "dsh", "claude", "cc_switch", "omp"):
             stack.enter_context(patch.object(engine.Hub, f"push_{name}"))
+        stack.enter_context(patch.object(engine.Hub, "push_all", autospec=True, side_effect=fake_push_all))
         self.addCleanup(stack.close)
         return stack
 
