@@ -299,10 +299,10 @@ def agent_connection(provider: dict, target: str) -> dict:
         if not override.get("settings") and isinstance(provider.get("claudeSettings"), dict):
             settings = provider["claudeSettings"]
     if canonical == "codex":
-        if not override.get("apiKey") and isinstance(provider.get("openaiApiKey"), str) \
+        if override.get("apiKey") is None and isinstance(provider.get("openaiApiKey"), str) \
                 and provider["openaiApiKey"].strip():
             api_key = provider["openaiApiKey"]
-        if not override.get("apiKeyEnv") and isinstance(provider.get("apiKeyEnv"), str) \
+        if override.get("apiKeyEnv") is None and isinstance(provider.get("apiKeyEnv"), str) \
                 and provider["apiKeyEnv"].strip():
             api_key_env = provider["apiKeyEnv"]
         if not override.get("api"):
@@ -1352,6 +1352,25 @@ def _dsh_ensure_block(items: list, block_id: str, name: str, config: dict) -> di
     return block
 
 
+def _pi_model_reference(provider: str, model: str) -> str:
+    """Canonical Pi scope reference, preserving literal bracket model IDs.
+
+    Pi's current resolver tries a canonical exact match before minimatch, even
+    for '[' IDs. Escaping brackets bypasses that exact match and can select a
+    different provider whose bare model ID equals this qualified reference.
+    The glob branch strips a valid thinking suffix *before* exact matching;
+    bracket IDs ending in that suffix cannot be represented safely here.
+    """
+    reference = f"{provider}/{model}"
+    if any(char in reference for char in "*?\\"):
+        raise ValueError("pi 模型 ID 含通配符或反斜杠，无法安全生成 enabledModels 精确范围")
+    if "[" in reference and reference.rsplit(":", 1)[-1] in {
+        "off", "minimal", "low", "medium", "high", "xhigh", "max"
+    }:
+        raise ValueError("pi 带方括号的模型 ID 以推理档位后缀结尾，原生范围解析有歧义；请先调整该模型配置")
+    return reference
+
+
 class Hub:
     def __init__(self) -> None:
         self.cfg = load_json(HUB_CONFIG)
@@ -1416,9 +1435,9 @@ class Hub:
         }
 
     # -- push adapters --
-    def preview_push(self, only: list[str] | None = None) -> dict:
+    def preview_push(self, only: list[str] | None = None, *, reconcile_codex=False) -> dict:
         from sync_transaction import preview
-        return preview(self, only)
+        return preview(self, only, reconcile_codex=reconcile_codex)
 
     def apply_preview(self, plan_id: str) -> dict:
         from sync_transaction import apply
@@ -1439,7 +1458,7 @@ class Hub:
             return [f"  ✗ sync: {exc}"]
 
     # ---- pi ----
-    def push_pi(self) -> None:
+    def push_pi(self, *, warnings=None) -> None:
         models_path = HOME / ".pi" / "agent" / "models.json"
         auth_path = HOME / ".pi" / "agent" / "auth.json"
         settings_path = HOME / ".pi" / "agent" / "settings.json"
@@ -1465,7 +1484,9 @@ class Hub:
             providers.pop(rid, None)
             auth.pop(rid, None)
 
-        for pid, p in self.providers_for("pi").items():
+        pi_providers = self.providers_for("pi")
+        scope = []
+        for pid, p in pi_providers.items():
             if not p.get("enabled", True):
                 continue
             conn = agent_connection(p, "pi")
@@ -1494,6 +1515,8 @@ class Hub:
             }
             entry["models"] = []
             for m in conn["models"]:
+                reference = _pi_model_reference(pid, m["id"])
+                scope.append(reference)
                 old = pi_models_by_id.get(m["id"]) or {}
                 item = dict(old)
                 item.update(
@@ -1524,6 +1547,42 @@ class Hub:
             settings["defaultModel"] = tier["model"]
             if tier.get("reasoningEffort"):
                 settings["defaultThinkingLevel"] = tier["reasoningEffort"]
+
+        # models.json augments Pi's built-in catalog; it does not whitelist it.
+        # Scope the picker/cycling to the Hub library without deleting catalogs,
+        # credentials, or user scopes for providers outside Hub's Pi ownership.
+        managed = {pid.casefold() for pid, p in self.providers.items()
+                   if provider_targets(p, "pi") and agent_connection_ready(p, "pi")}
+        managed.update(rid.casefold() for rid in legacy)
+        old_scope = settings.get("enabledModels", [])
+        if not isinstance(old_scope, list) or not all(isinstance(item, str) for item in old_scope):
+            raise ValueError("pi enabledModels 必须是字符串数组；请先修复原配置")
+        retained = [item for item in old_scope
+                    if item.strip().split("/", 1)[0].casefold() not in managed]
+        had_managed_scope = len(retained) != len(old_scope)
+        # A saved default outside Hub remains usable at startup, even when there
+        # was previously no explicit scope. Never add unselected managed models.
+        default_provider = settings.get("defaultProvider")
+        default_model = settings.get("defaultModel")
+        default_ref = None
+        if (pi_providers or had_managed_scope) and isinstance(default_provider, str) and isinstance(default_model, str):
+            default_ref = _pi_model_reference(default_provider, default_model)
+            if default_provider.casefold() not in managed:
+                retained.append(default_ref)
+        if pi_providers or had_managed_scope:
+            scope = list(dict.fromkeys(scope + retained))
+            if not scope:
+                # [] means ALL in Pi, not NONE. Do not silently widen access.
+                raise ValueError("pi 没有可同步的模型范围；enabledModels 空数组会启用全部模型，请先选择模型")
+            if default_ref in scope:
+                scope.remove(default_ref)
+                scope.insert(0, default_ref)
+            settings["enabledModels"] = scope
+            if any("/" not in item or any(char in item for char in "*?[") for item in retained):
+                message = ("pi 保留了用户原有的简写或通配模型范围；这些规则可能让 scoped 列表"
+                           "包含 Hub 模型库之外的模型。可在 /scoped-models 检查。")
+                if warnings is not None:
+                    warnings.append(message)
 
         save_json(models_path, models)
         save_json(auth_path, auth)
@@ -1908,7 +1967,7 @@ class Hub:
         save_json(settings_path, data)
 
     # ---- codex (Codex 桌面版 / CLI) ----
-    def push_codex(self) -> None:
+    def push_codex(self, *, reconcile=False, warnings=None) -> None:
         """Compile base config only; native auth and named profiles are never opened."""
         from codex_config import compile_config
         config_path = HOME / ".codex" / "config.toml"
@@ -1930,11 +1989,11 @@ class Hub:
                 raise ValueError("Codex 选定的模型不在该供应商的 Codex 连接模型列表中")
             # codex_config 只认归一化后的连接形状：端点、协议与授权三者缺一不可
             provider = dict(entry, baseUrl=conn["baseUrl"], api=conn["api"],
-                            apiKeyEnv=conn["apiKeyEnv"], openaiApiKey=conn["apiKey"],
+                            apiKeyEnv=conn["apiKeyEnv"], apiKey=conn["apiKey"], openaiApiKey=conn["apiKey"],
                             codexWireApi="responses")
         text = config_path.read_text(encoding="utf-8")
         saved = load_json(state_path)
-        rendered, next_state = compile_config(text, saved, mode, provider, tier)
+        rendered, next_state = compile_config(text, saved, mode, provider, tier, reconcile=reconcile, warnings=warnings)
         # All compilation and validation above is write-free. The transaction
         # runner calls this only inside its isolated staging directory.
         if rendered != text:

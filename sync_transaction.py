@@ -494,7 +494,7 @@ def _prune_plans() -> None:
         _PLANS.popitem(last=False)
 
 
-def _compile(engine: Path, root: Path, targets: list[str]) -> None:
+def _compile(engine: Path, root: Path, targets: list[str], *, reconcile_codex=False) -> list[str]:
     # Keep API tokens and other user environment credentials out of the child.
     env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP")
            if key in os.environ}
@@ -502,7 +502,7 @@ def _compile(engine: Path, root: Path, targets: list[str]) -> None:
                CODEX_HOME=str(root / "home" / ".codex"), PYTHONUTF8="1")
     try:
         result = subprocess.run([sys.executable, "-I", str(Path(__file__).absolute()), "--compile",
-                                 str(engine), str(root), json.dumps(targets)],
+                                 str(engine), str(root), json.dumps(targets), json.dumps(reconcile_codex)],
                                 env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TransactionError("Isolated native configuration compilation did not finish") from exc
@@ -512,9 +512,10 @@ def _compile(engine: Path, root: Path, targets: list[str]) -> None:
         raise TransactionError("Isolated native configuration compilation failed") from exc
     if result.returncode or not report.get("ok"):
         raise TransactionError(report.get("error") or "Isolated native configuration compilation failed")
+    return report.get("warnings", [])
 
 
-def preview(hub, only: list[str] | None = None) -> dict:
+def preview(hub, only: list[str] | None = None, *, reconcile_codex=False) -> dict:
     cfg = copy.deepcopy(hub.cfg)
     _validate_config(cfg)
     targets = _select(cfg, only)
@@ -549,7 +550,7 @@ def preview(hub, only: list[str] | None = None) -> dict:
             if original is not None:
                 dest.write_bytes(original)
                 dest.chmod(0o600)
-        _compile(engine, root, targets)
+        warnings.extend(_compile(engine, root, targets, reconcile_codex=reconcile_codex))
         allowed = set(relative_files)
         # This walk is confined to newly-created scratch files, never the user's HOME.
         for path in (root / "home").rglob("*"):
@@ -783,7 +784,7 @@ def restore(hub, transaction_id: str) -> dict:
         return result
 
 
-def _worker(engine: Path, root: Path, targets: list[str]) -> int:
+def _worker(engine: Path, root: Path, targets: list[str], *, reconcile_codex=False) -> int:
     """Child-only global path patching; never imported/executed by the web process."""
     # Defense in depth: existing adapters do not use the network or execute tools.
     def guard(event, args):
@@ -816,9 +817,15 @@ def _worker(engine: Path, root: Path, targets: list[str]) -> int:
     module.HUB_BACKUP = root / "backups"
     hub = module.Hub()
     target = "configuration"
+    warnings = []
     try:
         for target in targets:
-            getattr(hub, "push_" + target.replace("-", "_"))()
+            if target == "codex":
+                hub.push_codex(reconcile=reconcile_codex, warnings=warnings)
+            elif target == "pi":
+                hub.push_pi(warnings=warnings)
+            else:
+                getattr(hub, "push_" + target.replace("-", "_"))()
     except Exception as exc:
         message = str(exc)
         def redact(value):
@@ -835,9 +842,10 @@ def _worker(engine: Path, root: Path, targets: list[str]) -> int:
         redact(hub.cfg)
         print(json.dumps({"ok": False, "error": f"Cannot compile {target}: {type(exc).__name__}: {message[:400]}"}))
         return 1
-    print(json.dumps({"ok": True}))
+    print(json.dumps({"ok": True, "warnings": warnings}))
     return 0
 
 
-if __name__ == "__main__" and len(sys.argv) == 5 and sys.argv[1] == "--compile":
-    sys.exit(_worker(Path(sys.argv[2]), Path(sys.argv[3]), json.loads(sys.argv[4])))
+if __name__ == "__main__" and len(sys.argv) == 6 and sys.argv[1] == "--compile":
+    sys.exit(_worker(Path(sys.argv[2]), Path(sys.argv[3]), json.loads(sys.argv[4]),
+                     reconcile_codex=json.loads(sys.argv[5]) is True))

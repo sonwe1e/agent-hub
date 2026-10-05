@@ -221,6 +221,28 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
 
 ### pi 适配器写入内容
 
+- Pi 会把 `models.json` 与内置模型目录**合并**，不会把它当白名单：例如 OpenRouter
+  连接只填 spacebunny，提供密钥后仍可能看到大量内置模型。Hub 现在同时写
+  `settings.json.enabledModels`，使用启用的 Pi 连接模型库里的完整 `provider/modelId`，
+  `agents.pi.models` 优先于默认连接模型库；不是只留下 `modelSync` 当前主模型。
+- 新版 Pi 的 `/model` 有 `all/scoped` 两种范围，有 scope 时默认进入 `scoped`，Tab
+  可切回 `all`；`/scoped-models` 用于管理范围，Ctrl+P 在范围内轮换。
+  这是默认选择范围，不是删除内置目录或禁止手动选择其他模型。同步后重新启动 Pi；
+  旧版本、项目级 `enabledModels` 和 CLI `--models` 可能有不同表现或覆盖全局设置。
+- 同步替换 Hub 管理的 Pi provider 范围，保留其他 provider 的用户范围和未托管默认模型，
+  不为缩小列表删除用户的其他 provider 或登录态。原有跨 provider 通配符、简写也保留，
+  并在预览中提醒：它们仍可能扩大列表。需要严格范围时先在 `/scoped-models` 检查。
+  `[1m]` 等字面方括号保持原样，依赖当前 Pi 解析器先匹配完整 `provider/modelId` 的行为；
+  不转义成 glob，否则可能误匹配其他 provider 的同名字面 ID。用户安装的 Pi 版本仍需核对。
+  此行为已对 Pi `1.0.3` 源码提交 `98d2e1947aa9c75dff4c20474d541873dadc1d05` 验证，
+  并不代表已验证用户本机版本；旧版需先核对是否有完整 canonical reference 的优先匹配。
+  为避免意外扩大范围，Hub 模型 ID 含 `*`、`?`、反斜杠时拒绝同步；
+  方括号 ID 同时以 `:high` 等有效推理档位后缀结尾时，Pi 会先拆后缀，故明确报告歧义，
+  不自动改选模型；`:free` 和普通无方括号的 `:high` 字面 ID 不受影响。
+  也不会把已有范围清成 `[]`，因为 Pi 将空数组解释为全部可用模型。
+- Pi 原生行为依据：[模型配置](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md)、
+  [设置](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/settings.md)、
+  [选择器](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/interactive/components/model-selector.ts)。
 - `models.json` 中每个模型的 `input` 必须写成数组（如 `["text","image"]`），写成字符串会被 pi 判为 schema 错误。
 - provider 级 `compat`（`maxTokensField` / `supportsDeveloperRole` / `thinkingFormat` 等）会下发；
   pi 侧已有的 `cost` / `compat` / `headers` 等字段在 hub 未显式配置时原样保留。
@@ -353,9 +375,12 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 
 - 在同步页显式选择「官方订阅」或「第三方供应商」，先预览，再应用。没有 `mode` 的旧配置安全地按官方模式处理，不会隐式切换第三方。
 - 首次第三方切换前，请先在 Codex 中选择官方 provider、model、effort。Hub 只记录这三个字段的值及是否存在到 `~/.codex/.agent-hub-state.json`。恢复官方时一起恢复，缺省字段会恢复成缺省，第三方模型不会残留。
-- 使用独立 `[model_providers.agent_hub]`，保留已有 `custom` 和其他 provider。名称冲突或外部更改会报错，不覆盖。恢复官方会移除本轮 Hub 写入的 provider 表。
+- 使用独立 `[model_providers.agent_hub]`，保留已有 `custom` 和其他 provider。无托管记录的同名表冲突仍会拒绝。恢复官方会移除本轮 Hub 写入的 provider 表。
+- 在 Codex 中改过模型、推理强度或线路后，Web 同步页的新预览会以当前文件为基准，明确警告将按 Hub 选择重新设置托管字段；确认应用后才写入。预览后再发生外部更改，应用仍会拒绝，需重新预览。CLI push、watch 和旧 `/api/sync` 不会自动接管这些外部编辑。
+- 如果已在 Codex 中切回官方，新预览保留当前官方模型与推理强度，下一次第三方切换记录新的官方基线。损坏的恢复记录、无法安全改写的 TOML、外部 OpenAI 路由或 API 登录覆盖仍需先人工检查；不建议删除托管记录来绕过检查。
 - 第三方只接受 Responses。`agents.codex.api` 设为 `openai-responses`（或旧字段 `codexWireApi: "responses"`）；不能把 Chat Completions 当成兼容证明。
 - 优先用 `apiKeyEnv`（环境变量由用户在原生环境中设置，必要时重启客户端）。兼容现有配置时支持连接上的 `apiKey` / 顶层 `apiKey` 字面量，这些会落入配置和备份明文；官方建议优先环境变量引用。预览不显示凭据值。
+- 显式配置 `agents.codex.apiKey: ""` 或 `apiKeyEnv: ""` 会清空对应继承字段，不再偷偷回退到顶层/旧密钥；省略或 `null` 仍继承。界面留空仍按原设计省略字段。环境变量引用优先级不变。
 - 第三方表设置 `requires_openai_auth = false`，不借用 ChatGPT 凭据。Hub 从不读取、写入、复制或删除 Codex `auth.json`、系统钥匙串，也不执行 login/logout。现有登录失效时由 Codex 自己重新登录。
 - 推理强度接受 `none / minimal / low / medium / high / xhigh / max / ultra`；`max` / `ultra` 是否被具体模型接受由 Codex 自己判断。
 - **仅管理基础 `~/.codex/config.toml`**。Codex 0.134+ 命名配置是 `<name>.config.toml`，由 `--profile` 选择；Hub 不触碰它们。项目配置、环境变量、CLI 参数及运行中的会话可能覆盖基础配置，因此应用成功不是线路/登录/付费套餐验证。旧 `[profiles.*]` 检测到后先要求迁移。
