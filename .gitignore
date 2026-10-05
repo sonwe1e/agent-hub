@@ -1,0 +1,22 @@
+# 真实配置：含明文密钥与个人路径，永不提交
+providers.json
+providers.json.drop-*
+providers.json.truncated-bak
+state.json
+backups/
+
+# 测试与构建产物
+tests/node_modules/
+tests/artifacts/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 临时诊断脚本（本机一次性脚本，不属于项目）
+_tmp_*
+
+# 编辑器与系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,43 @@
+{
+  "protected": [
+    "Accessibility", "Accessories", "Administrative Tools", "Maintenance",
+    "Startup", "System Tools", "Windows PowerShell", "desktop.ini",
+    "Administrative Tools.lnk", "File Explorer.lnk"
+  ],
+  "categories": {
+    "AI 与模型": [
+      "Agent Hub.lnk", "豆包工作.lnk", "DeepSeek Harness.lnk", "WorkBuddy AI.lnk",
+      "Xiaomi MiMo.lnk", "ZCode.lnk", "CC Switch"
+    ],
+    "开发与终端": [
+      "Code.lnk", "Electron.lnk", "Tabby Terminal.lnk", "wmux.lnk", "XTerminal.lnk",
+      "Visual Studio Code - Insiders.lnk", "Visual Studio Code", "Visual Studio Code - Insiders",
+      "openwong2kim", "Ubuntu-26.04", "Visual Studio Installer.lnk", "WSL.lnk", "WSL Settings.lnk",
+      "CMake", "Embarcadero Dev-C++", "Git", "MATLAB R2025b", "PowerShell", "Visual Studio 2022", "Windows Kits"
+    ],
+    "办公与沟通": [
+      "OneDrive.lnk", "Excel.lnk", "PowerPoint.lnk", "Word.lnk", "Thunderbird.lnk",
+      "腾讯会议.lnk", "Microsoft Office 工具", "PDFgear", "微信", "腾讯会议"
+    ],
+    "网络与远程": [
+      "FlyingBird机场.lnk", "UU远程.lnk", "Clash Verge", "Clash Verge.lnk",
+      "Google Chrome 测试版.lnk", "Microsoft Edge.lnk", "Neat Download Manager.lnk",
+      "ToDesk", "向日葵远程控制"
+    ],
+    "媒体与设计": [
+      "爱奇艺.lnk", "爱奇艺", "像素蛋糕", "网易云音乐.lnk", "网易云音乐", "OBS Studio.lnk", "PotPlayer"
+    ],
+    "系统与工具": [
+      "Everything.lnk", "MCHOSE HUB.lnk", "7-Zip", "ASUS", "CPUID", "NVIDIA Corporation", "OneCommander", "微信输入法"
+    ],
+    "游戏与娱乐": [
+      "nrc_launcher.lnk", "wegame.lnk", "UU加速器.lnk", "Steam", "腾讯游戏", "Watt Toolkit", "异环", "暴雪战网", "游戏加加"
+    ]
+  },
+  "fallbackCategory": "其他应用",
+  "preserveToolGroups": ["Git", "Visual Studio 2022", "Windows Kits"],
+  "rename": {
+    "nrc_launcher.lnk": "洛克王国 世界.lnk",
+    "wegame.lnk": "WeGame.lnk"
+  }
+}
