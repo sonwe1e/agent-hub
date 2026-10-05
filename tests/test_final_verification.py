@@ -97,6 +97,12 @@ class CombinedAdapterVerificationTests(unittest.TestCase):
         self.assertFalse(transaction._PLANS)
 
     def test_compiler_source_change_after_preview_invalidates_apply(self):
+        """编译源在预览后被改动时，应用必须报 stale 且不写任何文件。
+
+        `compiler.read_text()` 不显式指定编码时会用系统默认编码（中文 Windows 是
+        GBK），而 hub.py / codex_config.py 里有中文注释，于是这项测试在本机会以
+        UnicodeDecodeError 报错。读写都显式用 UTF-8。
+        """
         copied = self.home / "copied-engine"
         copied.mkdir()
         original = Path(engine.__file__)
@@ -105,7 +111,9 @@ class CombinedAdapterVerificationTests(unittest.TestCase):
         with patch.object(engine, "__file__", str(copied / "hub.py")):
             plan = server.api_preview({"targets": ["codex"]})
             compiler = copied / "codex_config.py"
-            compiler.write_text(compiler.read_text() + "\n# Synthetic code change after preview.\n")
+            compiler.write_text(compiler.read_text(encoding="utf-8")
+                                + "\n# Synthetic code change after preview.\n",
+                                encoding="utf-8")
             before = self.native_bytes()
             with self.assertRaisesRegex(transaction.TransactionError, "stale"):
                 server.api_apply({"planId": plan["planId"]})
