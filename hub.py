@@ -92,6 +92,16 @@ def expand(p: str | Path) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(str(p))))
 
 
+def target_files(name: str, config: dict) -> list[str]:
+    """Never let legacy monitoring lists widen native adapter boundaries."""
+    if name == "codex":
+        return [str(HOME / ".codex" / "config.toml"),
+                str(HOME / ".codex" / ".agent-hub-state.json")]
+    if name == "claude":
+        return [str(HOME / ".claude" / "settings.json")]
+    return list(config.get("files", []))
+
+
 def file_hash(path: Path) -> str:
     if not path.exists():
         return "missing"
@@ -100,14 +110,43 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()[:16]
 
 
+def strip_json_comments(text: str) -> str:
+    """Remove JSONC comments without interpreting comment markers inside strings."""
+    out, index, quoted = [], 0, False
+    while index < len(text):
+        char = text[index]
+        if quoted:
+            out.append(char)
+            if char == "\\" and index + 1 < len(text):
+                index += 1
+                out.append(text[index])
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            out.append(char)
+        elif text.startswith("//", index):
+            end = text.find("\n", index + 2)
+            index = len(text) if end == -1 else end
+            out.append("\n")
+            continue
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            if end == -1:
+                raise ValueError("Unclosed JSON comment")
+            out.append(" ")
+            index = end + 2
+            continue
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
 def load_json(path: Path, default: Any = None) -> Any:
     if not path.exists():
         return default
-    text = path.read_text(encoding="utf-8")
-    # 容忍 JSONC 注释
-    text = re.sub(r"^\s*//.*$", "", text, flags=re.M)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return json.loads(text)
+    return json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
 
 
 def save_json(path: Path, data: Any, indent: int = 2) -> None:
@@ -238,7 +277,7 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
                 if parsed:
                     effort = candidate.get("reasoningEffort")
                     return {"provider": parsed[0], "model": parsed[1],
-                            "reasoningEffort": effort if effort in REASONING_EFFORTS else None}
+                            "reasoningEffort": effort if effort in REASONING_EFFORTS or (canonical == "codex" and effort == "none") else None}
         return None
 
     def provider_models(pid: str) -> list[str]:
@@ -853,9 +892,9 @@ class Hub:
         hashes = {}
         targets = self.cfg.get("sync", {}).get("targets", {})
         for tname, tcfg in targets.items():
-            if not tcfg.get("enabled", True):
+            if tcfg.get("enabled") is not True:
                 continue
-            for f in tcfg.get("files", []):
+            for f in target_files(tname, tcfg):
                 p = expand(f)
                 hashes[str(p)] = file_hash(p)
         self.state["hashes"] = hashes
@@ -867,9 +906,9 @@ class Hub:
         # SQLite 等二进制库打开即变，不参与外部变更检测 (它们是 hub 的写入目标)
         skip_names = {"cc-switch.db"}
         for tname, tcfg in targets.items():
-            if not tcfg.get("enabled", True):
+            if tcfg.get("enabled") is not True:
                 continue
-            for f in tcfg.get("files", []):
+            for f in target_files(tname, tcfg):
                 p = expand(f)
                 if p.name in skip_names:
                     continue
@@ -893,35 +932,27 @@ class Hub:
         }
 
     # -- push adapters --
+    def preview_push(self, only: list[str] | None = None) -> dict:
+        from sync_transaction import preview
+        return preview(self, only)
+
+    def apply_preview(self, plan_id: str) -> dict:
+        from sync_transaction import apply
+        return apply(self, plan_id)
+
+    def restore_transaction(self, transaction_id: str) -> dict:
+        from sync_transaction import restore
+        return restore(self, transaction_id)
+
     def push_all(self, only: list[str] | None = None) -> list[str]:
-        results = []
-        targets = self.cfg.get("sync", {}).get("targets", {})
-        dispatch = {
-            "pi": self.push_pi,
-            "mcode": self.push_mcode,
-            "zcode": self.push_zcode,
-            "dsh": self.push_dsh,
-            "dsh-desktop": self.push_dsh,
-            "claude": self.push_claude,
-            "cc-switch": self.push_cc_switch,
-            "omp": self.push_omp,
-            "codex": self.push_codex,
-        }
-        for name, fn in dispatch.items():
-            tcfg = targets.get(name, {})
-            if not tcfg.get("enabled", True):
-                continue
-            if only and name not in only:
-                continue
-            # 别名目标在全量 push 时不重复执行 (dsh-desktop → dsh)
-            if tcfg.get("aliasOf") and not only:
-                continue
-            try:
-                fn()
-                results.append(f"  ✓ {name}")
-            except Exception as e:  # noqa: BLE001
-                results.append(f"  ✗ {name}: {e}")
-        return results
+        """Validate every selected output before a recoverable grouped apply."""
+        try:
+            plan = self.preview_push(only)
+            result = self.apply_preview(plan["planId"])
+            self.last_transaction = result["transactionId"]
+            return result["results"]
+        except Exception as exc:
+            return [f"  ✗ sync: {exc}"]
 
     # ---- pi ----
     def push_pi(self) -> None:
@@ -953,6 +984,8 @@ class Hub:
         for pid, p in self.providers_for("pi").items():
             if not p.get("enabled", True):
                 continue
+            if not isinstance(p.get("apiKey"), str) or not p["apiKey"].strip():
+                raise ValueError(f"pi 供应商 {pid} 缺少 apiKey；此版本的 pi 适配器不解析 Codex 环境变量引用")
             # 以 pi 现有条目为底稿：hub 只覆盖自己管理的键，
             # pi 侧独有的 cost / headers / oauth 等字段与用户手工参数不会被抹掉。
             previous = providers.get(pid)
@@ -1265,7 +1298,7 @@ class Hub:
 
     # ---- claude (Claude Code) ----
     def push_claude(self) -> None:
-        """把具备 Anthropic 兼容端点的 provider 写入 Claude Code 与 cc-switch。"""
+        """直接配置 Claude Code；绝不隐式写入其他工具的数据库。"""
         settings_path = HOME / ".claude" / "settings.json"
         anthropic_providers = {
             pid: p
@@ -1283,17 +1316,10 @@ class Hub:
             active = next(iter(anthropic_providers))
         # modelSync 指向的供应商若具备 Anthropic 端点，就以它为准：跨客户端同步
         # 一次选定同一个模型，Claude Code 不应该还停在平台配置里的旧供应商。
-        # 这里也把 activeProvider 写回 providers.json（state 记录由调用方负责），
-        # 否则下次 push 又会退回旧供应商，反复漂移。
+        # 编译只读取 Hub 配置；每次按同样的 modelSync 优先级解析，不隐式回写。
         synced = resolve_agent_model(self.cfg, "claude")
         if synced and synced["provider"] in anthropic_providers and synced["provider"] != active:
             active = synced["provider"]
-        # 把最终选定的供应商写回 providers.json：否则下次 push 又按旧的
-        # activeProvider 走一遍，出现「每次同步都在两家之间来回切」的漂移。
-        if claude_cfg.get("activeProvider") != active:
-            self.cfg.setdefault("sync", {}).setdefault("targets", {}).setdefault("claude", {})[
-                "activeProvider"] = active
-            save_json(HUB_CONFIG, self.cfg)
         # 1) ~/.claude/settings.json — 只改 env 中的 ANTHROPIC_*，保留 hooks/permissions 等
         if settings_path.exists():
             backup_file(settings_path)
@@ -1302,6 +1328,8 @@ class Hub:
             data = {"$schema": "https://json.schemastore.org/claude-code-settings.json"}
         env = data.setdefault("env", {})
         p = anthropic_providers[active]
+        if not isinstance(p.get("apiKey"), str) or not p["apiKey"].strip():
+            raise ValueError(f"Claude 供应商 {active} 缺少 apiKey；Codex 环境变量引用不适用于此适配器")
         cm = p.get("claudeModels") or {}
         tiers = agent_model_tiers(self.cfg, "claude")
 
@@ -1382,181 +1410,36 @@ class Hub:
             data[k] = v
         save_json(settings_path, data)
 
-        # 2) cc-switch 注册全部 anthropic 可用 provider，便于 GUI 切换
-        db_path = HOME / ".cc-switch" / "cc-switch.db"
-        if db_path.exists():
-            backup_file(db_path)
-            con = sqlite3.connect(str(db_path))
-            try:
-                cur = con.cursor()
-                for pid, p in anthropic_providers.items():
-                    cm = p.get("claudeModels") or {}
-
-                    def registered(tier: str, fallback=None):
-                        """cc-switch 条目里该档位的模型：供应商声明优先，其次 modelSync 解析结果。"""
-                        value = (p.get("claudeModels") or {}).get(tier)
-                        if isinstance(value, str) and value.strip():
-                            return value.strip()
-                        resolved = tiers.get(tier)
-                        if resolved and resolved["provider"] == pid:
-                            return resolved["model"]
-                        return fallback
-
-                    display = p.get("displayName") or p.get("name")
-                    settings_config = {
-                        "$schema": "https://json.schemastore.org/claude-code-settings.json",
-                        "env": {
-                            "ANTHROPIC_AUTH_TOKEN": p["apiKey"],
-                            "ANTHROPIC_BASE_URL": p["anthropicBaseUrl"],
-                            **{k: v for k, v in {
-                                "ANTHROPIC_MODEL": registered("model", cm.get("model")),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL": registered("opus"),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": registered("opus"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL": registered("sonnet"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": registered("sonnet"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL": registered("haiku"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": registered("haiku"),
-                                "ANTHROPIC_DEFAULT_FABLE_MODEL": registered("fable"),
-                                "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": registered("fable"),
-                                "CLAUDE_CODE_SUBAGENT_MODEL": registered("subagent"),
-                                **{k: v for k, v in (p.get("claudeEnv") or {}).items()
-                                   if k not in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")},
-                            }.items() if v},
-                        },
-                        # 自定义供应商的顶层 settings 字段，随 cc-switch 条目一起切换
-                        **{k: v for k, v in (p.get("claudeSettings") or {}).items()
-                           if k not in ("env", "$schema")},
-                    }
-                    row_name = f"Hub {display}"
-                    cur.execute(
-                        "SELECT id FROM providers WHERE app_type=? AND name=?",
-                        ("claude", row_name),
-                    )
-                    row = cur.fetchone()
-                    payload = json.dumps(settings_config, ensure_ascii=False)
-                    if row:
-                        cur.execute(
-                            "UPDATE providers SET settings_config=? WHERE id=?",
-                            (payload, row[0]),
-                        )
-                    else:
-                        cur.execute(
-                            "INSERT INTO providers (id, app_type, name, settings_config, category, sort_index, is_current, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-                            (f"hub-claude-{pid}", "claude", row_name, payload, "custom", 200, now_epoch_ms()),
-                        )
-                # 清理已不属于当前 anthropic 集合的 hub 条目
-                expected_names = [
-                    f"Hub {(p.get('displayName') or p.get('name'))}" for p in anthropic_providers.values()
-                ]
-                placeholders = ",".join("?" for _ in expected_names) or "''"
-                cur.execute(
-                    f"DELETE FROM providers WHERE app_type='claude' AND id LIKE 'hub-claude-%' AND name NOT IN ({placeholders})",
-                    expected_names,
-                )
-                # 平台级特性开关注入全部 claude 预设：cc-switch 切换 provider 时
-                # 用预设的 settings_config 覆盖 settings.json，预设里没有这些键，
-                # Agent Teams 这类特性切过去就没了。
-                self._apply_cc_switch_feature_env(cur, feature_env)
-                con.commit()
-                self._verify_cc_switch_created_at(con)
-                self._verify_cc_switch_feature_env(cur, feature_env)
-            finally:
-                con.close()
-
     # ---- codex (Codex 桌面版 / CLI) ----
     def push_codex(self) -> None:
-        """把同步引擎选定的模型写进 Codex 的 ~/.codex/config.toml。
-
-        只动三样东西：顶层 `model_provider` / `model`，以及 `[model_providers.custom]`
-        段。ChatGPT 登录态（auth.json 的 tokens）与其它 [model_providers.*] 段一律不碰，
-        所以界面上的账号显示不受影响，请求线路由 model_provider 决定。
-
-        没有为 codex 配置任何模型时不写文件，保持用户当前选择。
-        """
+        """Compile base config only; native auth and named profiles are never opened."""
+        from codex_config import compile_config
         config_path = HOME / ".codex" / "config.toml"
-        providers = self.providers_for("codex")
-        tier = agent_model_tiers(self.cfg, "codex").get("agent")
-        if tier is None:
-            return
-        pid, model = tier["provider"], tier["model"]
-        p = providers.get(pid)
-        if not isinstance(p, dict) or p.get("enabled", True) is False:
-            raise ValueError(f"modelSync 指向的供应商 {pid} 未启用或未同步到 codex "
-                             f"（当前 codex 可用: {', '.join(sorted(providers)) or '无'}）")
-        base_url = p.get("baseUrl")
-        if not base_url:
-            raise ValueError(f"codex 需要 {pid} 的 baseUrl（Responses/Chat 兼容端点）")
-        # 同一个网关可能给 Claude 与 Codex 发不同的 key（模型集合不同）：
-        # openaiApiKey 是 Codex 专用 key，优先；其次才是通用 apiKey 或 env_key
-        # （env_key 需要重启客户端才能读到新设的环境变量）。
-        openai_key = p.get("openaiApiKey")
-        api_field = p.get("apiKeyEnv")
-        if isinstance(openai_key, str) and openai_key.strip():
-            # 两个都写会让 Codex 优先解析 env_key，未重启的客户端拿不到环境变量就报
-            # "Missing environment variable"，所以字面量优先时不再下发 env_key。
-            auth_keys: dict[str, Any] = {"experimental_bearer_token": openai_key.strip()}
-        elif isinstance(api_field, str) and api_field.strip():
-            auth_keys = {"env_key": api_field.strip()}
-        else:
-            api_key = p.get("apiKey")
-            if not isinstance(api_key, str) or not api_key.strip():
-                raise ValueError(f"codex 需要 {pid} 的 openaiApiKey / apiKeyEnv / apiKey")
-            auth_keys = {"experimental_bearer_token": api_key.strip()}
-
+        state_path = HOME / ".codex" / ".agent-hub-state.json"
+        target = self.cfg.get("sync", {}).get("targets", {}).get("codex") or {}
+        mode = target.get("mode", "official")
         if not config_path.exists():
-            raise FileNotFoundError(f"没有找到 Codex 配置: {config_path}（先跑一次 codex 让它生成）")
-        backup_file(config_path)
-        lines = config_path.read_text(encoding="utf-8").splitlines()
-
-        _toml_set_project_scalar(lines, "model_provider", self._codex_provider_id())
-        _toml_set_project_scalar(lines, "model", model)
-        if tier.get("reasoningEffort"):
-            _toml_set_project_scalar(lines, "model_reasoning_effort", tier["reasoningEffort"])
-        provider_keys = {
-            "name": p.get("displayName") or p.get("name") or pid,
-            "base_url": base_url,
-            "wire_api": self._codex_wire_api(p),
-            # 第三方网关不能用 ChatGPT 登录态当授权，否则 base_url 会被忽略。
-            "requires_openai_auth": False,
-            **auth_keys,
-        }
-        _toml_set_table_keys(lines, f"model_providers.{self._codex_provider_id()}", provider_keys)
-        self._codex_drop_stale_keys(lines, f"model_providers.{self._codex_provider_id()}",
-                                    set(provider_keys))
-        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    @staticmethod
-    def _codex_drop_stale_keys(lines: list[str], header: str, keep: set[str]) -> None:
-        """删掉上一次写入、这次不该再有的授权键（例如从 env_key 换成字面量 token）。"""
-        span = _toml_find_table(lines, header)
-        if span is None:
-            return
-        start, end = span
-        drop = {"env_key", "experimental_bearer_token", "requires_openai_auth"} - keep
-        kept: list[str] = []
-        for line in lines[start + 1:end]:
-            match = re.match(r"^\s*([A-Za-z0-9_\-\.]+)\s*=", line)
-            if match and match.group(1) in drop:
-                continue
-            kept.append(line)
-        lines[start + 1:end] = kept
-
-    def _codex_provider_id(self) -> str:
-        return (self.cfg.get("sync", {}).get("targets", {}).get("codex") or {}
-                ).get("providerId") or "custom"
-
-    def _codex_wire_api(self, provider: dict) -> str:
-        """Codex 只有 chat / responses 两种线协议。
-
-        默认 responses：Codex 的工具调用与推理项都按 Responses 语义发，
-        降级成 chat 会丢这些能力。确实只支持 chat 的网关用 codexWireApi 显式声明。
-        """
-        declared = provider.get("codexWireApi")
-        if isinstance(declared, str) and declared.strip() in ("chat", "responses"):
-            return declared.strip()
-        api = str(provider.get("api") or "")
-        return "chat" if api == "openai-chat-completions" else "responses"
+            raise FileNotFoundError(f"没有找到 Codex 配置: {config_path}（先在 Codex 中设置官方配置）")
+        tier = agent_model_tiers(self.cfg, "codex").get("agent") if mode == "third-party" else None
+        provider = None
+        if mode == "third-party":
+            if tier is None:
+                raise ValueError("Codex 第三方模式需要选择模型")
+            provider = self.providers_for("codex").get(tier["provider"])
+            if not isinstance(provider, dict) or provider.get("enabled", True) is False:
+                raise ValueError("Codex 选定的供应商未启用或不适用于此平台")
+            if not any(m.get("id") == tier["model"] for m in provider.get("models", [])):
+                raise ValueError("Codex 选定的模型不在供应商模型列表中")
+        text = config_path.read_text(encoding="utf-8")
+        saved = load_json(state_path)
+        rendered, next_state = compile_config(text, saved, mode, provider, tier)
+        # All compilation and validation above is write-free. The transaction
+        # runner calls this only inside its isolated staging directory.
+        if rendered != text:
+            backup_file(config_path)
+            config_path.write_text(rendered, encoding="utf-8")
+        if next_state != saved:
+            save_json(state_path, next_state)
 
     # ---- cc-switch (SQLite) ----
     # created_at 是 INTEGER（epoch 毫秒）列。cc-switch 启动时按整数读，遇到
@@ -1981,18 +1864,21 @@ class Hub:
             if tiers.get("subagent"):
                 sub = tiers["subagent"]
                 lines.append(f"  {'':18} └ 子代理: {sub['provider']} / {sub['model']}")
+        codex_mode = self.cfg.get("sync", {}).get("targets", {}).get("codex", {}).get("mode", "official")
         codex_tier = agent_model_tiers(self.cfg, "codex").get("agent")
-        if codex_tier:
+        if codex_mode == "official":
+            lines.append("  Codex 官方订阅：恢复已保存的官方配置；登录由原生客户端管理")
+        elif codex_tier:
             suffix = "" if codex_tier.get("known") else "  ⚠ 不在模型库中"
-            lines.append(f"  {'Codex 官方':18} {codex_tier['provider']} / {codex_tier['model']}{suffix}")
+            lines.append(f"  {'Codex 第三方':18} {codex_tier['provider']} / {codex_tier['model']}{suffix}")
         else:
             lines.append(f"  {'Codex 官方':18} 未配置（保留客户端当前模型与登录态）")
         lines.append("")
         lines.append("目标 agent 落地情况:")
         targets = self.cfg.get("sync", {}).get("targets", {})
         for tname, tcfg in targets.items():
-            en = tcfg.get("enabled", True)
-            files = tcfg.get("files", [])
+            en = tcfg.get("enabled") is True
+            files = target_files(tname, tcfg)
             status_parts = []
             for f in files:
                 p = expand(f)
@@ -2049,11 +1935,39 @@ def print_lines(lines: list[str]) -> None:
 def cmd_push(hub: Hub, args) -> int:
     only = args.targets if getattr(args, "targets", None) else None
     print("推送 providers.json → 各 agent ...")
-    print_lines(hub.push_all(only))
+    results = hub.push_all(only)
+    print_lines(results)
+    if not results or any("✗" in line for line in results):
+        return 1
     hub.record_hashes()
     hub.save_state()
+    if getattr(hub, "last_transaction", None):
+        print("事务:", hub.last_transaction)
     print("完成。")
     return 0
+
+
+def cmd_preview(hub: Hub, args) -> int:
+    try:
+        plan = hub.preview_push(args.targets or None)
+        # IDs are short-lived and process-local. CLI preview is informational;
+        # push recompiles and revalidates before writing.
+        print(json.dumps({k: v for k, v in plan.items() if k != "planId"}, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(console_safe(f"预览失败，未写入客户端: {exc}"), file=sys.stderr)
+        return 1
+
+
+def cmd_restore_transaction(hub: Hub, args) -> int:
+    try:
+        result = hub.restore_transaction(args.transaction_id)
+        print_lines(result["results"])
+        print("恢复事务:", result["transactionId"])
+        return 0
+    except Exception as exc:
+        print(console_safe(f"恢复失败: {exc}"), file=sys.stderr)
+        return 1
 
 
 def cmd_pull(hub: Hub, args) -> int:
@@ -2091,10 +2005,14 @@ def cmd_sync(hub: Hub, args) -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"  pull {agent} 失败: {e}")
         print("统一下推到所有目标 ...")
-        print_lines(hub.push_all())
+        results = hub.push_all()
+        print_lines(results)
     else:
         print("无外部变更，执行常规推送 ...")
-        print_lines(hub.push_all())
+        results = hub.push_all()
+        print_lines(results)
+    if not results or any("✗" in line for line in results):
+        return 1
     hub.record_hashes()
     hub.save_state()
     print("同步完成。")
@@ -2200,7 +2118,7 @@ def cmd_backup(hub: Hub, _args) -> int:
     print("备份目标配置 ...")
     targets = hub.cfg.get("sync", {}).get("targets", {})
     for tname, tcfg in targets.items():
-        for f in tcfg.get("files", []):
+        for f in target_files(tname, tcfg):
             p = expand(f)
             if p.exists():
                 backup_file(p)
@@ -2269,6 +2187,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="查看状态")
     p_push = sub.add_parser("push", help="推送统一配置到各 agent")
     p_push.add_argument("targets", nargs="*", help="仅推送指定 agent")
+    p_preview = sub.add_parser("preview", help="只预览和校验，不写入客户端")
+    p_preview.add_argument("targets", nargs="*")
+    p_restore = sub.add_parser("restore-transaction", help="恢复指定同步事务，保留可逆备份")
+    p_restore.add_argument("transaction_id")
     p_pull = sub.add_parser("pull", help="从 agent 拉取变更")
     p_pull.add_argument("agent", nargs="?", default="pi")
     sub.add_parser("sync", help="检测变更并对齐")
@@ -2291,6 +2213,8 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = {
         "status": cmd_status,
         "push": cmd_push,
+        "preview": cmd_preview,
+        "restore-transaction": cmd_restore_transaction,
         "pull": cmd_pull,
         "sync": cmd_sync,
         "watch": cmd_watch,

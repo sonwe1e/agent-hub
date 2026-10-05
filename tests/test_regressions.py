@@ -477,14 +477,11 @@ class CcSwitchDbTypeTests(unittest.TestCase):
         finally:
             con.close()
 
-    def test_claude_rows_use_integer_epoch_ms(self):
+    def test_claude_never_touches_cc_switch_database(self):
+        before = self.db_path.read_bytes()
         engine.Hub().push_claude()
-        rows = [r for r in self.types() if r[0].startswith("hub-claude-")]
-        self.assertTrue(rows)
-        for row_id, type_name, value in rows:
-            self.assertEqual(type_name, "integer", row_id)
-            self.assertIsInstance(value, int, row_id)
-            self.assertGreater(value, 1_600_000_000_000, row_id)  # 合理的毫秒量级
+        self.assertEqual(before, self.db_path.read_bytes())
+        self.assertFalse(self.types())
 
     def test_cc_switch_rows_use_integer_epoch_ms(self):
         engine.Hub().push_cc_switch()
@@ -516,7 +513,7 @@ class CcSwitchDbTypeTests(unittest.TestCase):
                 " VALUES ('legacy-text-1', 'claude', 'Legacy', '{}', datetime('now'))")
         con.close()
         with self.assertRaises(RuntimeError) as ctx:
-            engine.Hub().push_claude()
+            engine.Hub().push_cc_switch()
         self.assertIn("fix_cc_switch_created_at", str(ctx.exception))
 
 
@@ -570,19 +567,12 @@ class ClaudeFeatureEnvTests(unittest.TestCase):
         finally:
             con.close()
 
-    def test_feature_env_reaches_settings_and_every_preset(self):
+    def test_feature_env_reaches_settings_without_mutating_other_tools(self):
         self.feature()
+        before = self.db_path.read_bytes()
         engine.Hub().push_claude()
-        self.assertEqual(
-            self.claude_settings()["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
-        rows = self.presets()
-        self.assertTrue(rows)
-        for row_id, payload in rows:
-            env = json.loads(payload)["env"]
-            self.assertEqual(env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"), "1", row_id)
-            # 预设原有内容不被抹掉
-            if row_id in ("claude-official", "gui-made"):
-                self.assertIn("ANTHROPIC_BASE_URL", env, row_id)
+        self.assertEqual(self.claude_settings()["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
+        self.assertEqual(before, self.db_path.read_bytes())
 
     def test_feature_env_survives_provider_switch(self):
         # deepseek 自己声明了同名开关；切到不声明的 openrouter 后也必须保留
@@ -627,9 +617,9 @@ class ClaudeFeatureEnvTests(unittest.TestCase):
                 " VALUES ('broken-env', 'claude', 'Broken', '{\"env\": \"weird\"}', 1780000000000)")
         con.close()
         self.feature()
-        with self.assertRaises(RuntimeError) as ctx:
-            engine.Hub().push_claude()
-        self.assertIn("broken-env", str(ctx.exception))
+        before = self.db_path.read_bytes()
+        engine.Hub().push_claude()
+        self.assertEqual(before, self.db_path.read_bytes())
 
     def test_feature_env_values_are_strings(self):
         values = engine.Hub._feature_env_values(

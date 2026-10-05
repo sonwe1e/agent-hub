@@ -404,9 +404,9 @@ class MultiAgentPushTests(unittest.TestCase):
         data = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "deepseek/model-1")
         self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
-        # 平台配置里的 activeProvider 同时写回 providers.json，避免下次同步又切回去
+        # 编译不隐式回写 Hub；后续同步仍按相同的 modelSync 解析。
         on_disk = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        self.assertEqual(on_disk["sync"]["targets"]["claude"]["activeProvider"], "deepseek")
+        self.assertNotIn("activeProvider", on_disk["sync"]["targets"]["claude"])
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -447,7 +447,7 @@ class CodexAdapterTests(unittest.TestCase):
         (codex_dir / "config.toml").write_text(self.REALISH_CONFIG, encoding="utf-8")
         self.config_path = codex_dir / "config.toml"
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["sync"]["targets"]["codex"] = {"enabled": True, "providerId": "custom",
+        cfg["sync"]["targets"]["codex"] = {"enabled": True, "mode": "third-party",
                                            "files": ["~/.codex/config.toml"]}
         cfg["providers"]["deepseek"]["openaiApiKey"] = "sk-codex-literal"
         cfg["providers"]["deepseek"]["codexWireApi"] = "responses"
@@ -460,7 +460,7 @@ class CodexAdapterTests(unittest.TestCase):
     def test_writes_provider_model_and_custom_block(self):
         engine.Hub().push_codex()
         text = self.text()
-        self.assertIn('model_provider = "custom"', text)
+        self.assertIn('model_provider = "agent_hub"', text)
         self.assertIn('model = "deepseek/model-2"', text)
         self.assertIn('model_reasoning_effort = "high"', text)
         self.assertIn('base_url = "https://api.deepseek.com"', text)
@@ -495,9 +495,10 @@ class CodexAdapterTests(unittest.TestCase):
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_codex()
         self.assertIn('env_key = "DEEPSEEK_API_KEY"', self.text())
-        self.assertNotIn("experimental_bearer_token", self.text())
+        self.assertNotIn("experimental_bearer_token", self.text().split("[model_providers.agent_hub]")[1])
 
         cfg["providers"]["deepseek"]["openaiApiKey"] = "sk-codex-literal"
+        cfg["providers"]["deepseek"].pop("apiKeyEnv", None)
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_codex()
         self.assertNotIn("env_key", self.text())
@@ -506,21 +507,25 @@ class CodexAdapterTests(unittest.TestCase):
     def test_wire_api_defaults_to_responses(self):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         cfg["providers"]["deepseek"].pop("codexWireApi")
+        cfg["providers"]["deepseek"]["api"] = "openai-responses"
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_codex()
         self.assertIn('wire_api = "responses"', self.text())
 
         cfg["providers"]["deepseek"]["codexWireApi"] = "chat"
         engine.save_json(server.HUB_CONFIG, cfg)
-        engine.Hub().push_codex()
-        self.assertIn('wire_api = "chat"', self.text())
+        before = self.text()
+        with self.assertRaises(ValueError):
+            engine.Hub().push_codex()
+        self.assertEqual(before, self.text())
 
     def test_without_codex_modelsync_the_file_is_untouched(self):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         cfg.pop("modelSync", None)
         engine.save_json(server.HUB_CONFIG, cfg)
         before = self.text()
-        engine.Hub().push_codex()
+        with self.assertRaises(ValueError):
+            engine.Hub().push_codex()
         self.assertEqual(before, self.text())
 
     def test_targets_restricted_provider_is_rejected_without_writing(self):

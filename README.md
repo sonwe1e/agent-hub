@@ -89,14 +89,14 @@ G:\workspaces\agent-hub\hub.cmd backup
 ### 多 agent 模型同步
 
 「多 agent 使用的模型」卡片选一次模型，同步后 pi、dsh 桌面版、Claude Code、Codex 一起改到同一个模型。
-Codex 只写 `model_provider` / `model` 与 `[model_providers.custom]` 段，ChatGPT 登录态由 Codex 自己维护。
+Codex 只写 `model_provider` / `model` 与 `[model_providers.agent_hub]` 段，ChatGPT 登录态由 Codex 自己维护。
 
 | 客户端 | 主模型落到哪里 | 子 agent / 档位落到哪里 |
 |--------|----------------|--------------------------|
 | pi | `~/.pi/agent/settings.json` 的 `defaultProvider` + `defaultModel` | pi 没有子代理概念，只写主模型 |
 | dsh 桌面版 | `profiles/desktop/cordis.patch.yml` 的 `agent-default-model` | 同文件 `subagent-model-selection-settings.allowedModels`（子代理可选模型） |
 | Claude Code | `~/.claude/settings.json` 的 `env.ANTHROPIC_MODEL` | `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL` 与 `CLAUDE_CODE_SUBAGENT_MODEL` |
-| Codex 桌面版 / CLI | `~/.codex/config.toml` 的 `model_provider` + `model` | 同文件 `[model_providers.<providerId>]`（base_url / wire_api / 授权）；`auth.json` 的登录态不碰 |
+| Codex 桌面版 / CLI | `~/.codex/config.toml` 的 `model_provider` + `model` | 同文件 `[model_providers.agent_hub]`（base_url / wire_api / 授权）；`auth.json` 的登录态不碰 |
 
 `providers.json` 里的结构（也可以用命令行 `hub model` 改）：
 
@@ -128,7 +128,7 @@ Codex 只写 `model_provider` / `model` 与 `[model_providers.custom]` 段，Cha
 - **Claude Code 跟随全局有前置条件。** 全局选中的供应商必须具备 Anthropic 端点，
   否则 Claude Code 保持自己的 `claudeModels`（`baseURL` 与密钥必须和模型配套，
   跨供应商套用模型名只会写出一个对方不认的模型）。跟随发生时，同步会把
-  `sync.targets.claude.activeProvider` 一起写回 `providers.json`，避免每次同步来回切。
+  同步时按 modelSync 优先级解析实际 Claude 供应商，不隐式回写 Hub 配置。
 - **没配置 `modelSync` 时不动客户端。** pi 的 `defaultProvider` / `defaultModel`、
   dsh 的 `agent-default-model` 都保持原样，只有点同步并配置过才接管。
 - **手填的模型 ID 会被标记但照样写。** 不在供应商模型库里的 ID 在状态里带 ⚠，客户端可能拒绝。
@@ -296,8 +296,8 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 > `auth.json` 里的 ChatGPT 登录态一个字都不动，所以界面显示的账号不受影响。
 >
 > 同一个网关给 Claude 与 Codex 发不同 key 时（模型集合不同），用 `apiKey` 给 Claude Code、
-> `openaiApiKey` 给 Codex；hub 写 codex 时优先取 `openaiApiKey`，其次 `apiKeyEnv`，最后才是 `apiKey`。
-> 网关只支持 chat 协议时用 `codexWireApi: "chat"` 显式声明（默认 `responses`）。
+> `openaiApiKey` 给 Codex；hub 优先使用 `apiKeyEnv` 环境变量引用，其次 `openaiApiKey`，最后 `apiKey`。
+> 当前 Codex 只支持 Responses。必须确认后声明 `codexWireApi: "responses"`，或 `api: "openai-responses"`；Chat Completions 网关会被拒绝。
 
 ## 新增供应商
 
@@ -318,23 +318,23 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 
 ## Codex 桌面版 / CLI
 
-- `~/.codex/config.toml` 与桌面版、CLI 共用；hub 只改三样：顶层 `model_provider` / `model`，
-  以及 `[model_providers.<providerId>]`（默认 providerId 是 `custom`，可在 `sync.targets.codex.providerId` 改）。
-- **`requires_openai_auth` 的坑**：置 `true` 时 Codex 认为授权来自 `auth.json`。
-  里面是 ChatGPT OAuth 登录态 → 请求强制发往 `api.openai.com`，`base_url` 被忽略（401 的根因）；
-  里面是 OpenAI API key → 才会用这个 key 打 `base_url`。接第三方网关一律写 `false`。
-- 授权二选一：`env_key`（环境变量名，**改完要重启 Codex 才能读到新变量**）或
-  `experimental_bearer_token`（值直接写在配置里，重启前即可生效）。两个都写时 Codex 先解析
-  `env_key`，没重启就会报 `Missing environment variable`，所以 hub 只写其中一个。
-- 登录态与线路是两件事：界面显示哪个 ChatGPT 账号由 `auth.json` 决定，请求发给谁由
-  `model_provider` 决定。想让请求走第三方、账号显示保持登录，不用登出。
-- 自检：`codex doctor` 看 `default model provider` 与 `provider name`；某次会话实际用了谁
-  看 `~/.codex/sessions/**/*.jsonl` 第一行的 `payload.model_provider`。
+需要 Python 3.11+；使用标准库 `tomllib` 校验输入及生成结果，不增加运行依赖。
+
+- 在同步页显式选择「官方订阅」或「第三方供应商」，先预览，再应用。没有 `mode` 的旧配置安全地按官方模式处理，不会隐式切换第三方。
+- 首次第三方切换前，请先在 Codex 中选择官方 provider、model、effort。Hub 只记录这三个字段的值及是否存在到 `~/.codex/.agent-hub-state.json`。恢复官方时一起恢复，缺省字段会恢复成缺省，第三方模型不会残留。
+- 使用独立 `[model_providers.agent_hub]`，保留已有 `custom` 和其他 provider。名称冲突或外部更改会报错，不覆盖。恢复官方会移除本轮 Hub 写入的 provider 表。
+- 第三方只接受 Responses。显式声明 `codexWireApi: "responses"`，或 `api: "openai-responses"`；不能把 Chat Completions 当成兼容证明。
+- 优先用 `apiKeyEnv`（环境变量由用户在原生环境中设置，必要时重启客户端）。兼容现有配置时支持 `openaiApiKey` / `apiKey` 字面量，这些会落入配置和备份明文；官方建议优先环境变量引用。预览不显示凭据值。
+- 第三方表设置 `requires_openai_auth = false`，不借用 ChatGPT 凭据。Hub 从不读取、写入、复制或删除 Codex `auth.json`、系统钥匙串，也不执行 login/logout。现有登录失效时由 Codex 自己重新登录。
+- **仅管理基础 `~/.codex/config.toml`**。Codex 0.134+ 命名配置是 `<name>.config.toml`，由 `--profile` 选择；Hub 不触碰它们。项目配置、环境变量、CLI 参数及运行中的会话可能覆盖基础配置，因此应用成功不是线路/登录/付费套餐验证。旧 `[profiles.*]` 检测到后先要求迁移。
+- 不读取安装版本或运行真实 Codex。兼容目标依据 2026-10-05 官方文档；启用后请在自己的客户端检查当前配置和选中模型。
+
+官方参考：[配置字段](https://learn.chatgpt.com/docs/config-file/config-reference)、[profile 迁移](https://learn.chatgpt.com/docs/config-file/config-advanced)、[原生认证](https://learn.chatgpt.com/docs/auth)。
 
 ## Claude Code
 
 - 写入 `~/.claude/settings.json` 的 `env.ANTHROPIC_*`（只改 env，保留 hooks / permissions / statusLine）。
-- 在 cc-switch 注册 `Hub DeepSeek` / `Hub OpenRouter`，可在 GUI 里切换。
+- Claude 同步只写原生 settings.json，不打开或修改 cc-switch 数据库。
 - 当前激活由 `providers.json → sync.targets.claude.activeProvider` 控制（默认 `deepseek`）。
 - stepfun / firework 没有 Anthropic 兼容端点，不会写入 Claude Code。
 - 自定义网关可用 `claudeEnv` / `claudeSettings` 透传任意 env 与顶层字段，见上一节。
@@ -365,8 +365,7 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 
 ## 约定
 
-- **Codex 的 ChatGPT 登录态**不在本工具管理范围：`auth.json` 只读不写，hub 只写
-  `config.toml` 的 provider 与模型。要恢复官方线路就把 `model_provider` 删掉或改成 `openai`。
+- **Codex 的 ChatGPT 登录态**完全不在本工具管理范围：`auth.json` 不读不写，恢复官方模式会同时恢复 provider、model、effort。
 - pi / dsh / claude / codex 是主要目标；mcode / zcode / omp / cc-switch 适配器保留，
   不主动写入。
 - **qwen-token-plan-cn** 已过期并删除；qwen 系列模型仍可通过 firework（火山）使用。
@@ -410,3 +409,16 @@ $py = "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pytho
 
 - `qwen-token-plan-cn`（过期 plan）：已从 pi / models-store / 各 agent 移除。
 - 历史别名：`volcano`（pi）、`cc-switch-step-fun`、`provider-0b8770`（mcode）。
+
+## 安全预览与恢复（本次里程碑）
+
+- Web UI 的同步流程为「保存 Hub 选择 → 预览 → 应用」。预览只列目标、文件动作和警告，不回传配置正文或密钥。预览在内存中保留 15 分钟，重启服务后需要重新生成。
+- CLI 可先 `python hub.py preview codex`，确认后 `python hub.py push codex`。CLI push 会重新编译、校验并检查源文件；预览 ID 不跨 CLI 进程保存。
+- 只有 `enabled: true` 的目标参与同步；缺失的目标、缺失的 enabled、空的显式目标选择不会默认为全选。Claude 同步不会打开 cc-switch 数据库。示例关闭了 legacy mcode/zcode/omp/cc-switch。
+- 每次先在隔离临时目录编译全部选中目标；任何配置错误都会阻止整组原生文件写入。应用前核对源文件未变，再建立 `backups/transactions/<id>/manifest.json` 和逐文件原始备份，原子替换文件。可捕获的中途写入错误会回滚已经写入的文件；回滚本身失败会报出事务和未恢复文件。
+- Web UI 可恢复最近一次事务；CLI 用 `python hub.py restore-transaction <id>`。恢复也会建立反向事务。应用后被外部修改的文件不会被强行恢复，请先人工核对。
+- **不是跨进程数据库事务**：原生客户端可能在多文件替换之间读到中间状态；建议关闭相关客户端再应用。进程被强杀或断电后，`committing`/`prepared` 清单、`.write-lock` 和备份会保留，需要人工核对并恢复；不要直接删除仍在运行的进程的锁。
+- JSON/TOML 会先校验。DSH/旧 YAML 适配器仅支持能够独立验证和无歧义往返的严格 YAML 子集；锚点、复杂字符串、歧义标量等会安全拒绝，不会猜测性改写。DSH 仍限现有 desktop profile，任意 profile 的选择发现留待下一步。
+- cc-switch SQLite 不进入此文件事务，选中时会明确拒绝。它与本次直接配置 coding agent 的目标无关。
+- 新文件和备份尽量使用 0600/0700 权限；Windows 的 ACL 语义不同，请保持仓库/备份目录私有。现有明文 API key 仍可能出现在原生配置和备份中。
+- 测试只验证合成文件的配置变换、UI/API 契约与故障恢复。没有登录、真实供应商调用、模型权限或费用验证。

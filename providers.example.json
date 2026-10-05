@@ -274,13 +274,13 @@
         ]
       },
       "mcode": {
-        "enabled": true,
+        "enabled": false,
         "files": [
           "~/.minimax/config.yaml"
         ]
       },
       "zcode": {
-        "enabled": true,
+        "enabled": false,
         "files": [
           "~/.zcode/v2/provider_config.json"
         ]
@@ -312,29 +312,29 @@
           "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
         },
         "files": [
-          "~/.claude/settings.json",
-          "~/.cc-switch/cc-switch.db"
+          "~/.claude/settings.json"
         ]
       },
       "cc-switch": {
-        "enabled": true,
+        "enabled": false,
         "files": [
           "~/.cc-switch/cc-switch.db"
         ]
       },
       "omp": {
-        "enabled": true,
+        "enabled": false,
         "files": [
           "~/.omp/agent/config.yml"
         ]
       },
       "codex": {
         "enabled": true,
-        "notes": "Codex 桌面版/CLI：只写 config.toml 的 model_provider / model 与 [model_providers.custom]；ChatGPT 登录态由 Codex 自己维护",
-        "providerId": "custom",
+        "notes": "官方 / 第三方显式切换；仅基础 config.toml，不访问 auth.json、系统钥匙串或命名 profiles",
         "files": [
-          "~/.codex/config.toml"
-        ]
+          "~/.codex/config.toml",
+          "~/.codex/.agent-hub-state.json"
+        ],
+        "mode": "official"
       }
     },
     "watchIntervalSeconds": 5
