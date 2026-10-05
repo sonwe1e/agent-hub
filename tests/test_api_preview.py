@@ -87,7 +87,7 @@ class PreviewContractTests(unittest.TestCase):
         with patch.object(engine.Hub, 'preview_push', return_value=plan, create=True) as preview, \
              patch.object(engine.Hub, 'apply_preview', create=True) as apply:
             result = server.api_preview({'targets': ['dsh', 'dsh-desktop']})
-        preview.assert_called_once_with(only=['dsh'])
+        preview.assert_called_once_with(only=['dsh'], reconcile_codex=True)
         apply.assert_not_called()
         self.assertNotIn('secret-key', json.dumps(result))
         self.assertEqual(result['files'], [{'path': '/temporary/client.json', 'action': 'update'}])

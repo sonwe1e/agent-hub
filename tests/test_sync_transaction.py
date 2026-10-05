@@ -331,21 +331,20 @@ class SafeSyncTransactionTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(manifest_path.parent.stat().st_mode), 0o700)
 
-    def test_restore_rejects_a_readonly_flip_but_allows_plain_mode_bits(self):
-        """mode 比较：Windows 只有只读位可表达，POSIX 位上浮不算外部改动。
-
-        反向对照：真实改变只读位（Windows 上唯一能表达的权限差异）必须被拒绝，
-        否则放宽比较就等于关掉了"外部改动检测"。
-        """
+    def test_restore_respects_platform_permission_semantics(self):
+        """Windows 比较只读位；POSIX 的任何权限位变化仍拒绝恢复。"""
         plan = transaction.preview(engine.Hub(), ["pi"])
         applied = transaction.apply(engine.Hub(), plan["planId"])
         settings = self.settings
 
         if os.name != "nt":
-            # 只改权限位（不碰内容、不碰只读位）→ 不构成外部改动
+            original_mode = stat.S_IMODE(settings.stat().st_mode)
             settings.chmod(0o640)
+            with self.assertRaisesRegex(transaction.TransactionError, "changed after apply"):
+                transaction.restore(engine.Hub(), applied["transactionId"])
+            settings.chmod(original_mode)
             transaction.restore(engine.Hub(), applied["transactionId"])
-            self.assertEqual(settings.read_text(), self.original_settings or settings.read_text())
+            self.assertEqual(settings.read_bytes(), self.original_settings)
             return
 
         settings.chmod(stat.S_IREAD)

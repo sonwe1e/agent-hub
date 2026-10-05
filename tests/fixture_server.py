@@ -12,7 +12,7 @@ plans = {}
 sequence = 0
 
 
-def preview(h, only=None):
+def preview(h, only=None, *, reconcile_codex=False):
     global sequence
     sequence += 1
     plan_id = f"fixture-{sequence}"

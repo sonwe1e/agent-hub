@@ -478,7 +478,9 @@ def api_preview(body: dict) -> dict:
     with LOCK:
         h = hub()
         selected = _selected_targets(h, body)
-        plan = h.preview_push(only=selected)
+        # User-triggered preview is an explicit new intent. Reconcile only here;
+        # legacy /sync, CLI push, and watch must not silently take over edits.
+        plan = h.preview_push(only=selected, reconcile_codex=True)
         # A preview is metadata only. Never expose generated config bytes or keys.
         return {"planId": plan["planId"], "targets": plan["targets"],
                 "files": [{"path": f["path"], "action": f["action"]}

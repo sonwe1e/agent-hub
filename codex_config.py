@@ -46,8 +46,14 @@ def _remove_owned_table(lines):
     del lines[start:end]
 
 
-def compile_config(text, saved, mode, provider=None, selection=None):
-    """Return (new TOML, new Hub state or None), without filesystem side effects."""
+def compile_config(text, saved, mode, provider=None, selection=None, *,
+                   reconcile=False, warnings=None):
+    """Compile without writes; only an explicit preview may reconcile owned edits.
+
+    Reconciliation is not permission to apply: the transaction must still bind
+    the output to the exact live source snapshot and require explicit apply.
+    Automatic push/watch and direct adapter calls retain fail-closed defaults.
+    """
     try:
         before = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
@@ -71,8 +77,12 @@ def compile_config(text, saved, mode, provider=None, selection=None):
         raise ValueError("Codex model_providers 必须是表")
     existing = providers.get(PROVIDER_ID)
     if active:
-        if before.get("model_provider") != PROVIDER_ID or fingerprint(existing) != saved.get("providerHash"):
-            raise ValueError("Codex 托管 provider 已在外部更改；请检查后重新选择，未覆盖外部编辑")
+        if not isinstance(saved.get("providerHash"), str) or not re.fullmatch(r"[0-9a-f]{64}", saved["providerHash"]):
+            raise ValueError("Codex 托管 provider 记录无效，请先检查备份")
+        changed = []
+        provider_changed = fingerprint(existing) != saved["providerHash"]
+        if before.get("model_provider") != PROVIDER_ID:
+            changed.append("model_provider")
         if "managed" in saved:
             managed = saved["managed"]
             if (not isinstance(managed, dict) or set(managed) != set(FIELDS) or
@@ -80,16 +90,32 @@ def compile_config(text, saved, mode, provider=None, selection=None):
                         (entry["present"] and not isinstance(entry.get("value"), str))
                         for entry in managed.values())):
                 raise ValueError("Codex 托管字段记录无效，请先检查备份")
-            if any((key in before) != entry["present"] or
-                   (entry["present"] and before[key] != entry["value"])
-                   for key, entry in managed.items()):
-                raise ValueError("Codex 托管的 model/provider/effort 已在外部更改；未覆盖外部编辑")
+            changed.extend(key for key, entry in managed.items()
+                           if key not in changed and ((key in before) != entry["present"] or
+                           (entry["present"] and before[key] != entry["value"])))
         original = saved.get("official")
         if not isinstance(original, dict) or set(original) != set(FIELDS):
             raise ValueError("Codex 官方恢复快照不完整")
         for key, entry in original.items():
             if not isinstance(entry, dict) or not isinstance(entry.get("present"), bool) or (entry["present"] and not isinstance(entry.get("value"), str)):
                 raise ValueError("Codex 官方恢复快照无效")
+        if changed or provider_changed:
+            if not reconcile:
+                raise ValueError("Codex 托管字段已在外部更改；请在同步页生成新预览并确认应用，自动同步不会覆盖外部编辑")
+            # A native switch back to OpenAI is a newer official baseline. Keep
+            # its current model/effort instead of reviving the previous cycle.
+            if before.get("model_provider", "openai") == "openai":
+                if providers.get("openai") or before.get("forced_login_method") == "api":
+                    raise ValueError("官方基线包含外部 OpenAI 路由或 API 登录覆盖；请先在 Codex 中检查")
+                original = {key: {"present": key in before, "value": before.get(key)} for key in FIELDS}
+                if any(v["present"] and not isinstance(v["value"], str) for v in original.values()):
+                    raise ValueError("Codex model/provider/effort 必须是字符串")
+            if warnings is not None:
+                fields = changed + (["model_providers.agent_hub"] if provider_changed else [])
+                action = ("恢复官方配置；若已在 Codex 中切回官方则保留当前官方模型和推理强度"
+                          if mode == "official" else "按当前 Hub 选择重新设置供应商、模型和推理强度")
+                warnings.append("Codex: 检测到外部更改（" + "、".join(fields) + "）。本次预览将" + action +
+                                "，并更新 Hub 托管记录。确认应用前不会写入；之后的外部编辑会使预览失效。")
     else:
         if existing is not None:
             raise ValueError("model_providers.agent_hub 已存在但不属于本工具；为避免覆盖，请先重命名该表")
@@ -102,10 +128,14 @@ def compile_config(text, saved, mode, provider=None, selection=None):
             raise ValueError("Codex model/provider/effort 必须是字符串")
     expected = copy.deepcopy(before)
     lines = text.splitlines()
-    if active:
+    if active and existing is not None:
         _remove_owned_table(lines)
         del expected["model_providers"][PROVIDER_ID]
-        if not expected["model_providers"] and not saved.get("officialProviderTablePresent", False):
+    # Preserve the current untouched parent header, not its historical presence.
+    # Adding/removing an empty parent is harmless even while agent_hub is active.
+    official_provider_table_present = "model_providers" in tomllib.loads("\n".join(lines))
+    if active and existing is not None:
+        if not expected["model_providers"] and not official_provider_table_present:
             expected.pop("model_providers")
     if mode == "official":
         for key, entry in original.items():
@@ -163,7 +193,7 @@ def compile_config(text, saved, mode, provider=None, selection=None):
         expected.setdefault("model_providers", {})[PROVIDER_ID] = block
         next_state = {"version": 1, "active": True, "official": original, "providerHash": fingerprint(block),
                       "managed": {key: {"present": key in expected, "value": expected.get(key)} for key in FIELDS},
-                      "officialProviderTablePresent": saved.get("officialProviderTablePresent", False) if active else "model_providers" in before}
+                      "officialProviderTablePresent": official_provider_table_present}
     result = "\n".join(lines) + "\n"
     try:
         after = tomllib.loads(result)
