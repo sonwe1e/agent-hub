@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import json
 import ssl
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hub import agent_connection  # noqa: E402
 
 _BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -77,32 +82,51 @@ def _norm_model(item: Any) -> dict | None:
     return out
 
 
-def discover_models(provider: dict) -> list[dict]:
+def discover_models(provider: dict, agent: str | None = None) -> list[dict]:
     """根据 provider 配置探测模型列表。
 
+    ``agent`` 为空时探测默认连接；指定 Agent（claude / codex / pi / dsh…）时
+    探测该 Agent 的连接——同一供应商给不同 Agent 配不同 key 时，远端返回的
+    模型集合本来就可以不同。
+
     支持:
+      - Anthropic 风格 (claude 连接): GET {baseUrl}/v1/models  (x-api-key)
       - OpenAI 兼容: GET {baseUrl}/models  (Bearer token)
-      - OpenRouter:  GET https://openrouter.ai/api/v1/models
-      - Anthropic:   GET {anthropicBaseUrl 或 baseUrl}/v1/models (x-api-key)
     """
-    base = (provider.get("baseUrl") or "").rstrip("/")
-    key = provider.get("apiKey") or ""
+    if agent:
+        conn = agent_connection(provider, agent)
+        base = (conn.get("baseUrl") or "").rstrip("/")
+        key = conn.get("apiKey") or ""
+        anthropic = conn.get("api") == "anthropic-messages"
+    else:
+        base = (provider.get("baseUrl") or "").rstrip("/")
+        key = provider.get("apiKey") or ""
+        anthropic = provider.get("api") == "anthropic-messages"
+        if not base:
+            # 兼容旧配置：只声明了 Anthropic 端点（anthropicBaseUrl）的供应商
+            # 没有默认连接时，按 Claude 连接探测。
+            conn = agent_connection(provider, "claude")
+            if conn["baseUrl"]:
+                base, key = conn["baseUrl"].rstrip("/"), conn["apiKey"]
+                anthropic = True
     if not base:
-        raise ValueError("baseUrl 为空，无法检测")
+        raise ValueError("该连接没有配置 baseUrl，无法检测")
     if not key:
-        raise ValueError("apiKey 为空，无法检测")
+        raise ValueError("该连接没有配置 apiKey，无法检测（apiKeyEnv 只保存变量名，不能用于探测）")
 
     candidates: list[tuple[str, dict[str, str]]] = []
 
     # Anthropic 风格
-    a_base = (provider.get("anthropicBaseUrl") or "").rstrip("/")
-    if a_base:
-        candidates.append((f"{a_base}/v1/models", {"x-api-key": key, "anthropic-version": "2023-06-01"}))
+    if anthropic:
+        anthropic_models = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
+        candidates.append((anthropic_models, {"x-api-key": key, "anthropic-version": "2023-06-01"}))
     # OpenAI / OpenRouter 风格
     candidates.append((f"{base}/models", {"Authorization": f"Bearer {key}"}))
     # 有的网关挂在 /v1/models 且 base 已含 /v1 → 退化成 /models；再试裸 /v1/models
     if base.endswith("/v1"):
         candidates.append((f"{base[:-3].rstrip('/')}/v1/models", {"Authorization": f"Bearer {key}"}))
+    elif not base.endswith("/v1/models"):
+        candidates.append((f"{base}/v1/models", {"Authorization": f"Bearer {key}"}))
 
     errors: list[str] = []
     for url, headers in candidates:

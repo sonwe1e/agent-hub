@@ -208,50 +208,51 @@ class ConsoleOutputTests(unittest.TestCase):
 
 
 class CustomProviderTests(unittest.TestCase):
-    """自定义供应商接入：claudeEnv / claudeSettings / targets 的声明式透传。
+    """\u6309 Agent \u8986\u76d6\u7684\u8fde\u63a5\uff1aagents.<agent> \u7684\u7aef\u70b9 / \u5bc6\u94a5 / \u534f\u8bae / \u6a21\u578b\u4e0e\u900f\u4f20\u5b57\u6bb5\u3002
 
-    背景：只提供 Anthropic 兼容端点的第三方网关（无 OpenAI /v1）无法用
-    ANTHROPIC_* 那一组固定键表达完，因此 provider 支持按声明原样透传。
+    \u80cc\u666f\uff1a\u53ea\u63d0\u4f9b Anthropic \u517c\u5bb9\u7aef\u70b9\u7684\u7b2c\u4e09\u65b9\u7f51\u5173\uff08\u65e0 OpenAI /v1\uff09\u65e0\u6cd5\u7528
+    ANTHROPIC_* \u90a3\u4e00\u7ec4\u56fa\u5b9a\u952e\u8868\u8fbe\u5b8c\uff0c\u56e0\u6b64\u8fde\u63a5\u652f\u6301\u6309\u58f0\u660e\u539f\u6837\u900f\u4f20\u3002
+    \u540c\u4e00\u4f9b\u5e94\u5546\u8fd8\u53ef\u4ee5\u7ed9 Claude \u4e0e Codex \u914d\u4e0d\u540c\u7684 key \u4e0e\u6a21\u578b\u3002
     """
 
     def setUp(self):
         self.context = isolated()
         self.home = self.context.__enter__()
         self.addCleanup(self.context.__exit__, None, None, None)
-        # 本类验证「显式切换 Claude 供应商 / 模型」，而多 agent 全局模型（modelSync）
-        # 的既定语义是让 Claude 跟随全局选择，会盖掉这里要验证的切换动作。
-        self.without_modelsync()
 
-    def custom(self, pid="tokenfree", **over):
+    def custom(self, pid="tokenfree", model="claude-sonnet-4-6", **over):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         p = {
             "name": "TokenFree", "displayName": "TokenFree (Anthropic proxy)",
-            "baseUrl": "https://api.tokenfree.shop",
-            "anthropicBaseUrl": "https://api.tokenfree.shop",
-            "apiKey": "sk-test-not-a-real-key", "api": "openai-completions",
-            "enabled": True, "targets": ["claude"],
-            "claudeModels": {"model": "claude-sonnet-4-6", "sonnet": "claude-sonnet-4-6"},
-            "claudeEnv": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-                          "ENABLE_TOOL_SEARCH": "true"},
-            "claudeSettings": {"model": "claude-sonnet-4-6", "effortLevel": "high",
-                               "skipDangerousModePermissionPrompt": True},
+            "baseUrl": "https://api.tokenfree.shop/v1",
+            "apiKey": "sk-openai-key", "api": "openai-completions",
+            "enabled": True, "targets": ["claude", "codex"],
+            "agents": {
+                "claude": {
+                    "baseUrl": "https://api.tokenfree.shop/v1",
+                    "api": "anthropic-messages",
+                    "apiKey": "sk-test-not-a-real-key",
+                    "models": [{"id": "claude-sonnet-4-6", "name": "Sonnet"},
+                               {"id": "claude-opus-5-5", "name": "Opus"}],
+                    "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+                            "ENABLE_TOOL_SEARCH": "true"},
+                    "settings": {"model": "claude-sonnet-4-6", "effortLevel": "high",
+                                 "skipDangerousModePermissionPrompt": True},
+                },
+                "codex": {
+                    "baseUrl": "https://api.tokenfree.shop/v1",
+                    "api": "openai-responses",
+                    "apiKey": "sk-codex-key",
+                    "models": [{"id": "gpt-6-astra", "name": "Astra"}],
+                },
+            },
         }
         p.update(over)
         cfg["providers"][pid] = p
-        cfg["sync"]["targets"]["claude"]["activeProvider"] = pid
+        # Claude Code 与其它 Agent 一样只认 modelSync
+        cfg["modelSync"] = {"overrides": {"claude": {"provider": pid, "model": model}}}
         engine.save_json(server.HUB_CONFIG, cfg)
         return p
-
-    def without_modelsync(self):
-        """清掉多 agent 全局模型。
-
-        这些用例验证的是「显式切换 Claude 供应商」：全局主模型的供应商同样具备
-        Anthropic 端点时，同步会把 activeProvider 切回全局那家（多 agent 对齐的
-        既定语义），会盖掉本用例要验证的切换动作，所以先清掉。
-        """
-        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg.pop("modelSync", None)
-        engine.save_json(server.HUB_CONFIG, cfg)
 
     def claude_settings(self):
         return json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))
@@ -260,14 +261,14 @@ class CustomProviderTests(unittest.TestCase):
         self.custom()
         engine.Hub().push_claude()
         data = self.claude_settings()
-        # 固定管的键
-        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "https://api.tokenfree.shop")
+        # \u56fa\u5b9a\u7ba1\u7684\u952e
+        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "https://api.tokenfree.shop/v1")
         self.assertEqual(data["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test-not-a-real-key")
         self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "claude-sonnet-4-6")
-        # 声明式透传的 env
+        # \u58f0\u660e\u5f0f\u900f\u4f20\u7684 env
         self.assertEqual(data["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
         self.assertEqual(data["env"]["ENABLE_TOOL_SEARCH"], "true")
-        # 声明式透传的顶层 settings
+        # \u58f0\u660e\u5f0f\u900f\u4f20\u7684\u9876\u5c42 settings
         self.assertEqual(data["model"], "claude-sonnet-4-6")
         self.assertEqual(data["effortLevel"], "high")
         self.assertIs(data["skipDangerousModePermissionPrompt"], True)
@@ -286,27 +287,28 @@ class CustomProviderTests(unittest.TestCase):
         self.assertEqual(data["statusLine"], "mine")
         self.assertEqual(data["modelSettings"], {"a": 1})
         self.assertEqual(data["env"]["KEEP_ME"], "yes")
-        # provider 显式声明了 model，所以覆盖手工值；未声明的字段不动
+        # \u8fde\u63a5\u663e\u5f0f\u58f0\u660e\u4e86 model\uff0c\u6240\u4ee5\u8986\u76d6\u624b\u5de5\u503c\uff1b\u672a\u58f0\u660e\u7684\u5b57\u6bb5\u4e0d\u52a8
         self.assertEqual(data["model"], "claude-sonnet-4-6")
 
     def test_switching_provider_removes_only_hub_written_keys(self):
-        self.without_modelsync()
         self.custom()
         engine.Hub().push_claude()
         self.assertIn("effortLevel", self.claude_settings())
-        # 用户手工加的键必须活下来
+        # \u7528\u6237\u624b\u5de5\u52a0\u7684\u952e\u5fc5\u987b\u6d3b\u4e0b\u6765
         data = self.claude_settings()
         data["keepMine"] = 1
         (self.home / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
-        # 切回 deepseek（它不声明 claudeSettings）
+        # \u5207\u5230 deepseek\uff08\u5b83\u7684 Claude \u8fde\u63a5\u4e0d\u58f0\u660e claudeSettings\uff09
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
+        cfg["modelSync"] = {"overrides": {"claude": {"provider": "deepseek",
+                                                    "model": "deepseek/model-1"}}}
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_claude()
         after = self.claude_settings()
-        # 上一个 provider 写入的键被收回，避免残留别家的 model/effortLevel
+        # \u4e0a\u4e00\u4e2a\u8fde\u63a5\u5199\u5165\u7684\u952e\u88ab\u6536\u56de\uff0c\u907f\u514d\u6b8b\u7559\u522b\u5bb6\u7684 model / effortLevel
         self.assertNotIn("effortLevel", after)
         self.assertNotIn("skipDangerousModePermissionPrompt", after)
+        self.assertNotIn("ENABLE_TOOL_SEARCH", after["env"])
         self.assertEqual(after["keepMine"], 1)
         self.assertEqual(after["env"]["ANTHROPIC_BASE_URL"],
                          "https://api.deepseek.com/anthropic")
@@ -318,38 +320,38 @@ class CustomProviderTests(unittest.TestCase):
         data = self.claude_settings()
         self.assertEqual(data["model"], "claude-sonnet-4-6")
         self.assertEqual(data["effortLevel"], "high")
-        # 同一个 provider 重复 push 不会误删自己写过的键
+        # \u540c\u4e00\u4e2a\u8fde\u63a5\u91cd\u590d push \u4e0d\u4f1a\u8bef\u5220\u81ea\u5df1\u5199\u8fc7\u7684\u952e
         self.assertEqual(data["env"]["ENABLE_TOOL_SEARCH"], "true")
 
     def test_switching_provider_drops_stale_env_aliases(self):
-        """切到不声明 fable 的供应商，上一家的 ANTHROPIC_DEFAULT_FABLE_MODEL 必须消失。
+        """\u5207\u5230\u4e0d\u58f0\u660e fable \u7684\u4f9b\u5e94\u5546\uff0c\u4e0a\u4e00\u5bb6\u7684 ANTHROPIC_DEFAULT_FABLE_MODEL \u5fc5\u987b\u6d88\u5931\u3002
 
-        真实事故：deepseek 声明了 fable，切到 tokenfree（不声明）后
-        ANTHROPIC_DEFAULT_FABLE_MODEL 仍残留 deepseek-flash，指向一个
-        tokenfree 根本不提供的模型。
+        \u771f\u5b9e\u4e8b\u6545\uff1adeepseek \u58f0\u660e\u4e86 fable\uff0c\u5207\u5230 tokenfree\uff08\u4e0d\u58f0\u660e\uff09\u540e
+        ANTHROPIC_DEFAULT_FABLE_MODEL \u4ecd\u6b8b\u7559 deepseek \u7684\u6a21\u578b\uff0c\u6307\u5411\u4e00\u4e2a
+        tokenfree \u6839\u672c\u4e0d\u63d0\u4f9b\u7684\u6a21\u578b\u3002
         """
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        # 先以 deepseek 为激活方；fixture 里的 deepseek 没有 claudeModels，先补一个带 fable 的
-        cfg["providers"]["deepseek"]["claudeModels"] = {
-            "model": "deepseek-v4-flash", "sonnet": "deepseek-v4-flash",
-            "haiku": "deepseek-v4-flash", "fable": "deepseek-flash",
-        }
-        cfg.pop("modelSync", None)   # 见 without_modelsync 的说明
+        cfg["modelSync"] = {"overrides": {"claude": {
+            "provider": "deepseek", "model": "deepseek/model-1",
+            "tiers": {"fable": {"provider": "deepseek", "model": "deepseek/model-2"},
+                      "haiku": {"provider": "deepseek", "model": "deepseek/model-3"}}}}}
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_claude()
-        self.assertEqual(self.claude_settings()["env"]["ANTHROPIC_DEFAULT_FABLE_MODEL"], "deepseek-flash")
-        # 用户手工加的 env 键必须活下来
-        data = self.claude_settings()
-        data["env"]["MY_OWN_ENV"] = "keep"
-        (self.home / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
-        # 切到不声明 fable 的 tokenfree
+        env = self.claude_settings()["env"]
+        self.assertEqual(env["ANTHROPIC_DEFAULT_FABLE_MODEL"], "deepseek/model-2")
+        # \u7528\u6237\u624b\u5de5\u52a0\u7684 env \u952e\u5fc5\u987b\u6d3b\u4e0b\u6765
+        env["MY_OWN_ENV"] = "keep"
+        (self.home / ".claude" / "settings.json").write_text(json.dumps(
+            {"env": env, **{k: v for k, v in self.claude_settings().items() if k != "env"}},
+            ensure_ascii=False), encoding="utf-8")
+        # \u5207\u5230\u4e0d\u58f0\u660e fable \u7684 tokenfree
         self.custom()
         engine.Hub().push_claude()
         env = self.claude_settings()["env"]
         self.assertNotIn("ANTHROPIC_DEFAULT_FABLE_MODEL", env)
         self.assertNotIn("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", env)
-        self.assertEqual(env["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6")
-        self.assertEqual(env["MY_OWN_ENV"], "keep")  # hub 没写过，不收回
+        self.assertNotIn("ANTHROPIC_DEFAULT_HAIKU_MODEL", env)   # \u672a\u58f0\u660e\u7684\u6863\u4f4d\u4e00\u5e76\u6536\u56de
+        self.assertEqual(env["MY_OWN_ENV"], "keep")  # hub \u6ca1\u5199\u8fc7\uff0c\u4e0d\u6536\u56de
 
     def test_repeat_push_same_provider_keeps_env_aliases(self):
         self.custom()
@@ -360,28 +362,28 @@ class CustomProviderTests(unittest.TestCase):
         self.assertEqual(env["ENABLE_TOOL_SEARCH"], "true")
 
     def test_targets_restrict_provider_to_declared_platforms(self):
-        self.custom()
+        self.custom(targets=["claude"])
         (self.home / ".pi" / "agent").mkdir(parents=True, exist_ok=True)
         h = engine.Hub()
         self.assertIn("tokenfree", h.providers_for("claude"))
         self.assertNotIn("tokenfree", h.providers_for("pi"))
-        # 未声明 targets 的 provider 仍进入所有平台
+        self.assertNotIn("tokenfree", h.providers_for("codex"))
+        # \u672a\u58f0\u660e targets \u7684 provider \u4ecd\u8fdb\u5165\u6240\u6709\u5e73\u53f0
         self.assertIn("deepseek", h.providers_for("pi"))
         h.push_pi()
         pi = json.loads((self.home / ".pi" / "agent" / "models.json").read_text(encoding="utf-8"))
         self.assertNotIn("tokenfree", pi["providers"])
         self.assertIn("deepseek", pi["providers"])
 
-    def test_switch_claude_model_via_provider_update(self):
-        """界面上「保存平台设置」做的事：改 provider 的 claudeModels 再 push。
-
-        模型切换落在 provider 上而不是平台配置里，四个档位统一指向新模型。
-        """
+    def test_switch_claude_model_via_modelsync(self):
+        """\u754c\u9762\u4e0a\u6539\u6a21\u578b\u73b0\u5728\u843d\u5728 modelSync\uff08\u4e0e\u5176\u5b83 Agent \u540c\u4e00\u5957\u673a\u5236\uff09\u3002"""
         self.custom()
-        server.api_update_provider("tokenfree", {"claudeModels": {
-            "model": "claude-opus-5-5", "opus": "claude-opus-5-5",
-            "sonnet": "claude-opus-5-5", "haiku": "claude-opus-5-5",
-            "subagent": "claude-opus-5-5"}})
+        server.api_update_modelsync({"modelSync": {"overrides": {"claude": {
+            "provider": "tokenfree", "model": "claude-opus-5-5",
+            "tiers": {"opus": {"provider": "tokenfree", "model": "claude-opus-5-5"},
+                      "sonnet": {"provider": "tokenfree", "model": "claude-opus-5-5"},
+                      "haiku": {"provider": "tokenfree", "model": "claude-opus-5-5"},
+                      "subagent": {"provider": "tokenfree", "model": "claude-opus-5-5"}}}}}})
         engine.Hub().push_claude()
         data = self.claude_settings()
         self.assertEqual(data["model"], "claude-opus-5-5")
@@ -389,37 +391,44 @@ class CustomProviderTests(unittest.TestCase):
         self.assertEqual(data["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-opus-5-5")
         self.assertEqual(data["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5")
         self.assertEqual(data["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "claude-opus-5-5")
-        # claudeSettings.model 也声明过，一起跟上
-        self.assertEqual(data["model"], "claude-opus-5-5")
 
-    def test_switch_claude_model_drops_stale_alias_values(self):
-        """切换到没有 fable 档的模型后，上一档的 fable 别名不能残留。"""
-        self.custom()
-        server.api_update_provider("tokenfree", {"claudeModels": {
-            "model": "claude-sonnet-5", "sonnet": "claude-sonnet-5"}})
-        engine.Hub().push_claude()
-        env = self.claude_settings()["env"]
-        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-sonnet-5")
-        self.assertNotIn("ANTHROPIC_DEFAULT_FABLE_MODEL", env)
-        self.assertNotIn("ANTHROPIC_DEFAULT_HAIKU_MODEL", env)  # 未声明的档位一并收回
+    def test_model_must_exist_in_that_connection(self):
+        """Claude \u8fde\u63a5\u7684\u6a21\u578b\u5e93\u91cc\u6ca1\u6709\u7684\u6a21\u578b\u4f1a\u88ab\u6807\u8bb0\u4e3a\u624b\u586b\u503c\u3002"""
+        self.custom(model="gpt-6-astra")
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        # gpt-6-astra \u53ea\u5728\u9ed8\u8ba4 / Codex \u8fde\u63a5\u4e0a\uff0cClaude \u8fde\u63a5\u6ca1\u6709
+        cfg["providers"]["tokenfree"]["agents"]["codex"]["models"] = [
+            {"id": "gpt-6-astra", "name": "Astra"}]
+        cfg["providers"]["tokenfree"]["models"] = [{"id": "gpt-6-astra", "name": "Astra"}]
+        cfg["modelSync"]["overrides"]["codex"] = {"provider": "tokenfree", "model": "gpt-6-astra"}
+        engine.save_json(server.HUB_CONFIG, cfg)
+        resolved = engine.resolve_agent_model(cfg, "claude")
+        self.assertEqual(resolved["model"], "gpt-6-astra")
+        self.assertFalse(resolved["known"])
+        # Codex \u8fde\u63a5\u91cc\u6709\u8fd9\u4e2a\u6a21\u578b\uff0c\u6240\u4ee5\u5bf9\u5b83\u662f\u5df2\u77e5
+        self.assertTrue(engine.resolve_agent_model(cfg, "codex")["known"])
 
-    def test_validation_rejects_invalid_custom_fields(self):
+    def test_validation_rejects_invalid_agent_overrides(self):
         base = {"name": "x", "baseUrl": "https://a.example.com/v1", "apiKey": "k",
                 "api": "openai-completions"}
         with self.assertRaises(ValueError):
-            server._validate_provider({**base, "claudeEnv": "nope"})
+            server._validate_provider({**base, "agents": {"claude": {"api": "openai-completions"}}})
         with self.assertRaises(ValueError):
-            server._validate_provider({**base, "claudeSettings": []})
+            server._validate_provider({**base, "agents": {"codex": {"api": "openai-chat-completions"}}})
+        with self.assertRaises(ValueError):
+            server._validate_provider({**base, "agents": {"nope": {}}})
+        with self.assertRaises(ValueError):
+            server._validate_provider({**base, "agents": {"claude": "nope"}})
+        with self.assertRaises(ValueError):
+            server._validate_provider({**base, "agents": {"claude": {"models": "nope"}}})
         with self.assertRaises(ValueError):
             server._validate_provider({**base, "targets": "claude"})
-        with self.assertRaises(ValueError):
-            server._validate_provider({**base, "targets": ["no-such-target"]})
-        with self.assertRaises(ValueError):
-            server._validate_provider({**base, "claudeModels": {"model": 1}})
-        # 合法声明通过
-        server._validate_provider({**base, "targets": ["claude"], "claudeEnv": {"A": "1"},
-                                   "claudeSettings": {"model": "m"},
-                                   "claudeModels": {"model": "m"}})
+        # \u5408\u6cd5\u58f0\u660e\u901a\u8fc7
+        server._validate_provider({**base, "targets": ["claude"],
+                                   "agents": {"claude": {"baseUrl": "https://a.example/v1",
+                                                        "api": "anthropic-messages",
+                                                        "env": {"A": "1"},
+                                                        "settings": {"model": "m"}}}})
 
 
 class CcSwitchDbTypeTests(unittest.TestCase):
@@ -577,15 +586,18 @@ class ClaudeFeatureEnvTests(unittest.TestCase):
     def test_feature_env_survives_provider_switch(self):
         # deepseek 自己声明了同名开关；切到不声明的 openrouter 后也必须保留
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["providers"]["deepseek"]["claudeEnv"] = {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
-        cfg["providers"]["openrouter"]["anthropicBaseUrl"] = "https://openrouter.ai/api"
+        cfg["providers"]["deepseek"]["agents"]["claude"]["env"] = {
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+        cfg["providers"]["openrouter"]["agents"]["claude"] = {
+            "baseUrl": "https://openrouter.ai/api", "api": "anthropic-messages"}
         engine.save_json(server.HUB_CONFIG, cfg)
         self.feature()
         engine.Hub().push_claude()
         self.assertEqual(
             self.claude_settings()["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1")
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["sync"]["targets"]["claude"]["activeProvider"] = "openrouter"
+        cfg["modelSync"] = {"overrides": {"claude": {"provider": "openrouter",
+                                                     "model": "openrouter/model-1"}}}
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_claude()
         # 开关由平台配置兜底，不随 provider 声明与否消失

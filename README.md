@@ -6,12 +6,27 @@
 每个都有自己的 provider 配置格式。本目录提供**单一事实来源**与**同步引擎**，
 改一处即可同步到所有 agent。
 
+当前的个人使用主线是 **Claude Code、pi、dsh（含桌面版）和 Codex**：
+
+1. 在「供应商」中把每个 Coding Plan 建成一条连接。同一家服务的不同 Plan 若端点、密钥或可用模型不同，也分别建成不同供应商。
+2. 需要给某个 Agent 单独换端点 / 密钥 / 模型时，在「按 Agent 覆盖」里配一条连接：例如同一个网关给 Claude Code 与 Codex 发不同的 key，两边拉到的模型集合本就不同。
+3. 添加或检测该 Plan 的模型（检测时可选对哪条连接执行），在「平台同步」中选择全局主模型；需要差异时再为单个 Agent 单独指定。
+4. 选择要更新的 Agent，生成预览并确认应用。以后 Plan 的地址、密钥或模型变动，只改这一条供应商并再次同步。
+5. Codex 可选「官方线路」或支持 Responses 的第三方 Plan。首次切到第三方前，在 Codex 内准备好官方配置；Hub 会保存并在切回时恢复官方模型、provider 和推理强度，保留原生登录态。
+
+其他订阅在这里指提供兼容 API 地址与密钥的 Coding Plan。Claude Code、pi、dsh 的原生账号订阅登录态不由 Hub 复制或转换。cc-switch 数据库目标不参与工作台的安全预览同步。
+
+**连接模型**：每个供应商 = 一条顶层默认连接（`baseUrl` / `apiKey` / `api` / `models`）+ 可选的
+`agents.<agent>` 按 Agent 覆盖。未声明的 Agent 直接用默认连接，因此「所有供应商都能给所有
+Coding Agent 用」——能不能用只取决于该 Agent 的连接是否就绪：Claude Code 需要 Anthropic
+Messages 端点，Codex 第三方只接受 Responses，pi / dsh 用 OpenAI 兼容端点。
+
 ## 目录
 
 | 文件 | 作用 |
 |------|------|
 | `providers.json` | 统一配置，可通过工作台维护，无需手工编辑 |
-| `hub.py` | 同步引擎 |
+| `hub.py` | 同步引擎（含连接模型与旧配置迁移命令） |
 | `server.py` | 本地 HTTP API 与静态页面服务 |
 | `ui/` | 模型库 / 供应商 / 平台同步工作台，无前端构建依赖 |
 | `launch.py` | 本地服务复用与桌面窗口启动器 |
@@ -25,6 +40,11 @@
 > **`providers.json` 不进版本库。** 它含明文密钥，已在 `.gitignore` 里；
 > 备份目录 `backups/`、变更哈希 `state.json` 同样忽略。首次使用请复制
 > `providers.example.json` 为 `providers.json` 再填密钥。
+>
+> **旧配置迁移**：早期版本用扁平字段（`anthropicBaseUrl` / `claudeModels` /
+> `claudeEnv` / `claudeSettings` / `openaiApiKey` / `apiKeyEnv` / `codexWireApi`）
+> 与 `sync.targets.claude.activeProvider`。这些字段仍会被读取（兼容层），执行一次
+> `hub migrate-agents` 即可搬进 `agents.<agent>` 与 modelSync。
 
 ## 快速开始
 
@@ -51,6 +71,9 @@ G:\workspaces\agent-hub\hub.cmd status
 G:\workspaces\agent-hub\hub.cmd push
 G:\workspaces\agent-hub\hub.cmd sync
 G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-flash   # 多 agent 主模型
+G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-flash --target claude --reasoning-effort ultra
+G:\workspaces\agent-hub\hub.cmd model tokenfree gpt-6-astra --target codex
+G:\workspaces\agent-hub\hub.cmd migrate-agents  # 旧扁平字段 → agents.<agent>
 G:\workspaces\agent-hub\hub.cmd save-gold        # 备份当前模型列表为黄金模板
 G:\workspaces\agent-hub\hub.cmd restore-gold     # 从黄金模板恢复模型列表
 G:\workspaces\agent-hub\hub.cmd backup
@@ -63,17 +86,18 @@ G:\workspaces\agent-hub\hub.cmd backup
 
 ### 模型库
 
-- 汇总所有供应商的模型，支持名称 / ID 搜索、供应商筛选、推理 / 图片 / 纯文本能力筛选。
-- 添加与编辑通过独立表单完成，单次提交即保存；支持带 `/` 的模型 ID、ID 改名与重复检查。
+- 汇总所有供应商、所有连接的模型，支持名称 / ID 搜索、供应商筛选、**连接筛选**、推理 / 图片 / 纯文本能力筛选。
+- 「连接」列标明模型来自默认连接还是某个 Agent 的连接——同一供应商给不同 Agent 配不同 Key 时，模型库按连接分开存放。
+- 添加与编辑通过独立表单完成，单次提交即保存；新建时选择所属连接。支持带 `/` 的模型 ID、ID 改名与重复检查。
 - 编辑时保留 `cost`、`compat` 等高级字段，不再逐行重写整个模型列表。
 - 支持跨供应商、跨页勾选与批量删除；全选仅作用于当前页，筛选外的已选项会明确提示。
-- **删除模型仅影响本地配置，执行平台同步后才影响客户端。**
+- **删除模型仅影响对应连接的本地配置，执行平台同步后才影响客户端。**
 
 ### 供应商
 
-- 卡片展示连接地址、模型数量、密钥配置状态、启用状态与 Claude 兼容性。
-- 在配置弹窗中添加 / 编辑连接，密钥默认隐藏，可临时显示。
-- **检测模型**查询供应商远端列表：区分已添加与新模型，仅导入明确勾选的新项。
+- 卡片展示连接地址、各 Agent 连接就绪状态、模型数量、密钥配置状态与启用状态。
+- 在配置弹窗中维护**默认连接**与**按 Agent 覆盖**：端点、密钥、协议、模型与（Claude 的）透传字段都可以只为某个 Agent 配置。
+- **检测模型**先选连接（默认 / Claude / Codex / pi / dsh），再向该连接的端点与密钥查询：不同 Key 拉到的模型集合本来就可以不同。
 - 导入不删除已有模型，也不覆盖已有模型的手工参数。未勾选任何项时禁止导入。
 - **删除供应商沿用现有引擎的立即清理逻辑，会影响客户端配置**，弹窗会单独说明；删除后建议再同步，确保所有平台对齐。
 
@@ -81,15 +105,15 @@ G:\workspaces\agent-hub\hub.cmd backup
 
 - 勾选参与同步的平台，支持保存设置或保存后直接同步；未选择的平台不会写入。
 - dsh 桌面版跟随 dsh，适配器只执行一次；Codex 的 ChatGPT 登录态仍由客户端自行管理。
-- 可选择 Claude Code 激活的供应商，仅支持已启用且配置了 Anthropic 端点的供应商。
+- 每个 Agent 用哪个供应商、哪个模型，统一由「多 agent 使用的模型」卡片决定（见下一节），不再有 Claude 专属的选择器。
 - 展示待同步状态、最近同步时间和逐平台成功 / 失败信息；失败不会伪装成全局成功。
 - 「检测变更并同步」**不是从客户端导入**，仍以 Hub 为准覆盖已选客户端配置，执行前需要确认。
 - 定向同步只更新实际成功目标的变更哈希；只有所有启用目标成功写入后才标记本地配置已对齐。
 
 ### 多 agent 模型同步
 
-「多 agent 使用的模型」卡片选一次模型，同步后 pi、dsh 桌面版、Claude Code、Codex 一起改到同一个模型。
-Codex 只写 `model_provider` / `model` 与 `[model_providers.agent_hub]` 段，ChatGPT 登录态由 Codex 自己维护。
+「多 agent 使用的模型」卡片选一次主模型，同步后由兼容该供应商的平台各自采用；Codex 仅在明确选择第三方线路时跟随。
+Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reasoning_effort` 和 `[model_providers.agent_hub]` 段；切回官方线路会恢复首次切换前保存的值。ChatGPT 登录态由 Codex 自己维护。
 
 | 客户端 | 主模型落到哪里 | 子 agent / 档位落到哪里 |
 |--------|----------------|--------------------------|
@@ -98,47 +122,55 @@ Codex 只写 `model_provider` / `model` 与 `[model_providers.agent_hub]` 段，
 | Claude Code | `~/.claude/settings.json` 的 `env.ANTHROPIC_MODEL` | `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL` 与 `CLAUDE_CODE_SUBAGENT_MODEL` |
 | Codex 桌面版 / CLI | `~/.codex/config.toml` 的 `model_provider` + `model` | 同文件 `[model_providers.agent_hub]`（base_url / wire_api / 授权）；`auth.json` 的登录态不碰 |
 
+模型下拉只列出**该 Agent 连接上**的模型：`agents.claude` 与 `agents.codex` 各有自己的模型库。
+
 `providers.json` 里的结构（也可以用命令行 `hub model` 改）：
 
 ```jsonc
 "modelSync": {
-  "default": { "provider": "deepseek", "model": "deepseek-flash", "reasoningEffort": "medium" },
+  "default": { "provider": "tokenfree", "model": "gpt-6-astra" },
   "overrides": {
     "pi":  { "provider": "stepfun", "model": "step-5-preview" },   // 只改 pi
     "dsh": { "provider": "firework", "model": "glm-5.3" },
+    "codex": { "provider": "tokenfree", "model": "gpt-6-astra", "reasoningEffort": "ultra" },
     "claude": {
-      "provider": "deepseek", "model": "deepseek-v4-flash",
-      "tiers": { "opus": { "provider": "openrouter", "model": "anthropic/claude-opus-5" } }
+      "provider": "tokenfree", "model": "claude-opus-5-5",
+      "tiers": { "opus": { "provider": "tokenfree", "model": "claude-opus-5-5" } }
     }
   }
 }
 ```
 
-解析优先级（从高到低，`reasoningEffort` 只接受 `off/minimal/low/medium/high/xhigh/max`）：
+解析优先级（从高到低）：
 
-1. `overrides.<平台>.tiers.<档位>` —— 界面上单独指定的档位；
+1. `overrides.<平台>.tiers.<档位>` —— 界面上单独指定的档位（仅 Claude Code 有档位）；
 2. `overrides.<平台>` / `modelSync.default` —— 平台级或全局选择；
 3. 供应商自己声明的 `provider.agentModel`；
-4. 该供应商模型列表的第一项。
+4. 该供应商**该连接**模型列表的第一项。
+
+推理强度词表：全局 `off / minimal / low / medium / high / xhigh / max / ultra`；
+Codex 线路用 `none / minimal / low / medium / high / xhigh / max / ultra`（`none` 表示关闭推理）。
 
 几条刻意保留的语义：
 
 - **只有「主模型」会被全局选择改写。** Claude Code 的 opus / sonnet / haiku / subagent 档位
-  只在被显式指定、或供应商自己用 `claudeModels` 声明过时才会写；一个全局设置不会顺手把它们改掉。
-- **Claude Code 跟随全局有前置条件。** 全局选中的供应商必须具备 Anthropic 端点，
-  否则 Claude Code 保持自己的 `claudeModels`（`baseURL` 与密钥必须和模型配套，
-  跨供应商套用模型名只会写出一个对方不认的模型）。跟随发生时，同步会把
-  同步时按 modelSync 优先级解析实际 Claude 供应商，不隐式回写 Hub 配置。
+  只在 modelSync 里被显式指定时才会写；一个全局设置不会顺手把它们改掉。
+- **Claude Code 跟随全局有前置条件。** 全局选中的供应商必须具备 Claude 连接
+  （`agents.claude` 里配了 Anthropic 端点），否则 Claude Code 保持现状——
+  baseUrl 与 apiKey 必须和模型配套，跨连接套用模型名只会写出一个对方不认的模型。
+  同步时按 modelSync 优先级解析实际使用的连接，不隐式回写 Hub 配置。
 - **没配置 `modelSync` 时不动客户端。** pi 的 `defaultProvider` / `defaultModel`、
   dsh 的 `agent-default-model` 都保持原样，只有点同步并配置过才接管。
-- **手填的模型 ID 会被标记但照样写。** 不在供应商模型库里的 ID 在状态里带 ⚠，客户端可能拒绝。
+  （例外：`sync.targets.claude.featureEnv` 是平台级特性开关，配置了就会写入。）
+- **手填的模型 ID 会被标记但照样写。** 不在该连接模型库里的 ID 在状态里带 ⚠，客户端可能拒绝。
 
 命令行：
 
 ```powershell
 G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-flash                     # 全局主模型
 G:\workspaces\agent-hub\hub.cmd model firework glm-5.3 --target dsh              # 只改 dsh
-G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-v4-flash --target claude --reasoning-effort high
+G:\workspaces\agent-hub\hub.cmd model tokenfree gpt-6-astra --target codex --reasoning-effort ultra
+G:\workspaces\agent-hub\hub.cmd model tokenfree claude-opus-5-5 --target claude  # 只改 Claude Code
 G:\workspaces\agent-hub\hub.cmd push                                            # 再同步到各客户端
 ```
 
@@ -148,7 +180,7 @@ G:\workspaces\agent-hub\hub.cmd push                                            
 
 - 勾选跨页 / 跨筛选保留，但删除时只要选中项里有**当前屏幕上看不到**的模型，确认框会要求
   单独勾选「我确认删除当前筛选或页面上看不到的 N 个模型」，否则确认按钮不可用。
-- 服务端在写入 `providers.json` 前校验：除本次请求声明的删除外，任何模型的消失都会导致
+- 服务端在写入 `providers.json` 前校验：除本次请求声明的删除外，任何连接上的模型消失都会导致
   写入被拒绝（`ModelLossError`，HTTP 409），不会静默落盘。
 - 若某次写入仍让某个供应商的模型减少一半以上，会自动快照 `providers.json.drop-*` 留证。
 
@@ -209,7 +241,7 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
     "firework":  { /* 火山网关，dsh 路由名 firework */ },
     "deepseek":  { /* DeepSeek 官方 */ },
     "openrouter":{ /* 聚合网关 */ },
-    "tokenfree":  { /* 自定义 Anthropic 网关，见下 */ }
+    "tokenfree": { /* 一个供应商多条连接，见下 */ }
   },
   "modelSync": { /* 多 agent 模型选择，见上一节 */ },
   "removedProviders": { /* 已删除记录，防止复活 */ },
@@ -217,87 +249,86 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
 }
 ```
 
-## 自定义供应商接入
+## 按 Agent 覆盖连接（agents.\<agent\>）
 
-只提供 Anthropic 兼容端点、没有 OpenAI `/v1` 的第三方网关，用 `ANTHROPIC_*` 那组固定键表达不完。
-因此 provider 支持三个**声明式透传**字段（均为可选，缺省时行为与以前完全一致）：
+顶层字段是**默认连接**：`baseUrl` / `apiKey` / `api` / `models`。
+`agents.<agent>` 可以只为某个 Agent 覆盖其中的任意几项，未覆盖的继续用默认值：
 
 ```jsonc
 "tokenfree": {
   "name": "TokenFree",
-  "baseUrl": "https://api.tokenfree.shop",
-  "anthropicBaseUrl": "https://api.tokenfree.shop",   // 有它才会进入 Claude Code
-  "apiKey": "...",
-  "models": [],                                        // 可留空，纯 Claude 网关没有模型库
-  "targets": ["claude"],                               // 只同步到 Claude Code
-
-  "claudeModels": {                                    // 映射到 ANTHROPIC_MODEL / *_MODEL / SUBAGENT
-    "model": "claude-sonnet-4-6",
-    "opus": "claude-sonnet-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-sonnet-4-6",
-    "subagent": "claude-sonnet-4-6"
+  "baseUrl": "https://api.tokenfree.shop/v1",   // 默认连接（OpenAI 兼容）
+  "apiKey": "sk-openai-key",
+  "api": "openai-completions",
+  "agents": {
+    "claude": {
+      "baseUrl": "https://api.tokenfree.shop/v1",        // Anthropic Messages 端点
+      "api": "anthropic-messages",                       // 缺省即此值
+      "apiKey": "sk-anthropic-key",                      // 这个 key 拉出 claude-* 模型
+      "models": [ { "id": "claude-opus-5-5", ... } ],    // 该连接自己的模型库
+      "env": { "ENABLE_TOOL_SEARCH": "true" },           // 原样写入 settings.json 的 env
+      "settings": { "effortLevel": "high" }              // 原样写入 settings.json 顶层
+    },
+    "codex": {
+      "baseUrl": "https://api.tokenfree.shop/v1",
+      "api": "openai-responses",                          // Codex 第三方只接受 Responses
+      "apiKey": "sk-codex-key",                           // 这个 key 拉出 gpt-* 模型
+      "apiKeyEnv": "TOKENFREE_API_KEY",                   // 或用环境变量引用（优先）
+      "models": [ { "id": "gpt-6-astra", ... } ]
+    },
+    "pi":  { "apiKey": "sk-pi-key" },                     // 只换密钥，其余用默认
+    "dsh": { "baseUrl": "https://dsh.example/v1" }        // 只换端点
   },
-  "claudeEnv": {                                       // 原样写入 settings.json 的 env
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
-    "ENABLE_TOOL_SEARCH": "true"
-  },
-  "claudeSettings": {                                  // 原样写入 settings.json 顶层
-    "model": "claude-sonnet-4-6",
-    "effortLevel": "high",
-    "skipDangerousModePermissionPrompt": true,
-    "includeCoAuthoredBy": false,
-    "permissions": { "allow": [] }
-  }
+  "models": []                                            // 默认连接的模型库
 }
 ```
 
 | 字段 | 作用 |
 |------|------|
-| `targets` | 数组。声明后该 provider 只进入列出的平台，不污染 pi / mcode / zcode / dsh。留空 = 进入所有平台 |
-| `claudeModels` | `model` / `opus` / `sonnet` / `haiku` / `fable` / `subagent` → `ANTHROPIC_*` 环境变量 |
-| `claudeEnv` | 任意环境变量，原样追加进 `settings.json` 的 `env` |
-| `claudeSettings` | 任意顶层字段（`model` / `effortLevel` / `permissions` / …），原样写进 `settings.json` |
+| `baseUrl` / `apiKey` / `apiKeyEnv` / `api` | 覆盖该 Agent 的端点、密钥与协议 |
+| `models` | 该连接自己的模型库；**没有这一项就沿用默认连接的模型** |
+| `env` / `settings` | 仅 `claude`：原样写入 `~/.claude/settings.json` 的 env 与顶层字段 |
 
-**切换 provider 时的收回语义**：`claudeSettings` 中的键，在切到另一个 provider 时，
-只有上一个 provider 声明过、当前 provider 没声明的才会被删除——避免残留别家的 `model` / `effortLevel`。
+**连接是否就绪**决定供应商能否进入某个平台的同步：
+
+| Agent | 要求 |
+|-------|------|
+| pi / dsh / mcode / zcode / omp / cc-switch | 有 OpenAI 兼容端点（默认或该 Agent 覆盖） |
+| Claude Code | 有 Anthropic Messages 端点（`agents.claude.baseUrl`，或旧 `anthropicBaseUrl`，或整个 provider 就是 `anthropic-messages`） |
+| Codex 第三方 | 端点的协议是 `openai-responses` |
+
+`targets` 仍然可以限定供应商只进入列出的平台；未声明时进入所有平台。
+
+**不同 Key 不同模型**：模型按连接存放，「检测模型」时先选连接——同一网关给 Claude 与
+Codex 发不同 key，两边拉到的模型集合本来就可以不同。模型切换只在各自连接的模型库里选择。
+
+**切换连接时的收回语义**：`env` 与 `settings` 里的键，在切换到另一家时，只有上一个
+provider 声明过、当前 provider 没声明的才会被删除——避免残留别家的 `model` / `effortLevel`。
 你自己手工写进 `settings.json` 的键（`hooks` / `statusLine` / `modelSettings` 等）永远保留。
-`env` 同理：hub 只动自己声明的键，未声明的 `env` 键不会被清掉。
 
-web 界面在「供应商 → 配置」的「自定义接入」一节里可以编辑这三个字段（JSON 文本框，非法 JSON 会被拦截）。
-
-### 在界面上切换 Claude 模型
-
-「平台同步」页，选好 Claude 供应商后，下面会出现一个**模型选择器**：
-
-1. 点「获取模型」→ hub 向该供应商的 `{anthropicBaseUrl}/v1/models` 查询可用模型列表；
-2. 下拉里选一个模型（不在列表中的也可在供应商配置里手填）；
-3. 点「保存平台设置」→ hub 把 `claudeModels` 的各档位（`model` / `opus` / `sonnet` / `haiku` / `subagent`）统一指向新模型，
-   若该 provider 还声明了 `claudeSettings.model`，它会被一起改成同一个值，避免出现「切了模型但顶层 `model` 还指着旧型号」的漂移；
-4. 再点「开始同步」写入 `~/.claude/settings.json`。
-
-> `claudeModels.model` 与 `claudeSettings.model` 同时声明时，前者优先——它对应 `env.ANTHROPIC_MODEL`。
->
-> 注意：这一步只改 hub 的配置，**必须再同步一次**才写进 Claude Code 的 `settings.json`。
+web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑这些连接；「平台同步」页的模型
+下拉只列出对应连接上的模型。
 
 ## Provider ↔ Agent 映射
 
 | hub key | pi | mcode | zcode | dsh / dsh 桌面版 | claude | codex |
 |---------|----|-------|-------|----------------|--------|-------|
-| `stepfun` | stepfun | stepfun | StepFun | stepfun | — (无 Anthropic 端点) | 不写入 |
-| `firework` | firework | volcano | 火山 | firework | — (无 Anthropic 端点) | 不写入 |
-| `deepseek` | deepseek | deepseek | DeepSeek | deepseek | `/anthropic` + 模型别名 | 不写入 |
-| `openrouter` | openrouter | openrouter | OpenRouter | openrouter | `/api` + 模型别名 | 不写入 |
-| `tokenfree` | tokenfree（无模型，留空） | tokenfree | — | tokenfree | `/v1/messages` + `claudeEnv` / `claudeSettings` 透传 | `/v1/responses` + `openaiApiKey` |
+| `stepfun` | stepfun | stepfun | StepFun | stepfun | —（没有 Claude 连接） | 不写入 |
+| `firework` | firework | volcano | 火山 | firework | —（没有 Claude 连接） | 不写入 |
+| `deepseek` | deepseek | deepseek | DeepSeek | deepseek | `agents.claude` → `/anthropic` | —（协议不是 responses） |
+| `openrouter` | openrouter | openrouter | OpenRouter | openrouter | `agents.claude` → `/api` + 模型库 | `agents.codex` → responses |
+| `tokenfree` | tokenfree（默认连接模型库） | tokenfree | — | tokenfree | `agents.claude` → `/v1/messages` + `env` / `settings` 透传 | `agents.codex` → `/v1/responses` + 另一个 key |
 
 > 命名差异是各 agent 的历史习惯，同步引擎会自动映射。
 >
 > `codex` 是正式写入目标：只写 `model_provider` / `model` 与 `[model_providers.<providerId>]`，
 > `auth.json` 里的 ChatGPT 登录态一个字都不动，所以界面显示的账号不受影响。
 >
-> 同一个网关给 Claude 与 Codex 发不同 key 时（模型集合不同），用 `apiKey` 给 Claude Code、
-> `openaiApiKey` 给 Codex；hub 优先使用 `apiKeyEnv` 环境变量引用，其次 `openaiApiKey`，最后 `apiKey`。
-> 当前 Codex 只支持 Responses。必须确认后声明 `codexWireApi: "responses"`，或 `api: "openai-responses"`；Chat Completions 网关会被拒绝。
+> 同一个网关给 Claude 与 Codex 发不同 key 时（模型集合不同），分别配 `agents.claude` 与
+> `agents.codex`：各自的 `apiKey`（或 `apiKeyEnv`）与 `models` 都是独立的。hub 优先使用
+> `apiKeyEnv` 环境变量引用，其次连接上的 `apiKey`，最后顶层默认 `apiKey`。
+> Codex 只支持 Responses：`agents.codex.api` 必须是 `openai-responses`（或旧字段
+> `codexWireApi: "responses"`），Chat Completions 网关会被拒绝。
 
 ## 新增供应商
 
@@ -306,15 +337,15 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 | 字段 | 说明 |
 |------|------|
 | 供应商 ID | 各平台配置里的路由名（字母、数字、`_`、`-`） |
-| Base URL / API Key / API 协议 | OpenAI 兼容端点；只提供 Anthropic 兼容端点时填「Claude 兼容端点」 |
+| 默认连接 Base URL / API Key / API 协议 | OpenAI 兼容端点；只给 Claude Code 用时可留空，改在「按 Agent 覆盖」里配 Anthropic 端点 |
 | 启用 | 关闭后不进入任何平台的同步 |
-| **同步到哪些平台** | 勾选目标平台；**一个都不勾 = 同步到所有平台**。例如只有 Anthropic 端点的网关只勾 Claude Code |
+| **同步到哪些平台** | 勾选目标平台；**一个都不勾 = 同步到所有平台**。连接不就绪的平台不会写入 |
 | **agent 默认模型** | 该供应商给 agent 用的默认模型 ID；「多 agent 模型」没有显式选择时用它兜底 |
-| **Codex 专用 Key** | 同一个网关给 Codex 发另一个 key 时用（写进 `config.toml` 的 `experimental_bearer_token`） |
+| **按 Agent 覆盖** | 为 pi / dsh / Claude Code / Codex 单独配端点、密钥、协议与模型；Claude 连接还可透传 `env` / `settings` |
 
 新增供应商进入 dsh 时，hub 会按 `<供应商ID>_API_KEY` 推导凭据引用名，并把密钥写进
-`~/.dsh/.credentials.yaml` 的 `refs`；进入 Claude Code 需要配置 Claude 兼容端点；
-进入 Codex 需要 `baseUrl`（Responses 兼容端点），hub 会把它写进 `[model_providers.<providerId>]`。
+`~/.dsh/.credentials.yaml` 的 `refs`；进入 Claude Code 需要 Anthropic Messages 端点；
+进入 Codex 需要 Responses 端点，hub 会把它写进 `[model_providers.<providerId>]`。
 
 ## Codex 桌面版 / CLI
 
@@ -323,9 +354,10 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 - 在同步页显式选择「官方订阅」或「第三方供应商」，先预览，再应用。没有 `mode` 的旧配置安全地按官方模式处理，不会隐式切换第三方。
 - 首次第三方切换前，请先在 Codex 中选择官方 provider、model、effort。Hub 只记录这三个字段的值及是否存在到 `~/.codex/.agent-hub-state.json`。恢复官方时一起恢复，缺省字段会恢复成缺省，第三方模型不会残留。
 - 使用独立 `[model_providers.agent_hub]`，保留已有 `custom` 和其他 provider。名称冲突或外部更改会报错，不覆盖。恢复官方会移除本轮 Hub 写入的 provider 表。
-- 第三方只接受 Responses。显式声明 `codexWireApi: "responses"`，或 `api: "openai-responses"`；不能把 Chat Completions 当成兼容证明。
-- 优先用 `apiKeyEnv`（环境变量由用户在原生环境中设置，必要时重启客户端）。兼容现有配置时支持 `openaiApiKey` / `apiKey` 字面量，这些会落入配置和备份明文；官方建议优先环境变量引用。预览不显示凭据值。
+- 第三方只接受 Responses。`agents.codex.api` 设为 `openai-responses`（或旧字段 `codexWireApi: "responses"`）；不能把 Chat Completions 当成兼容证明。
+- 优先用 `apiKeyEnv`（环境变量由用户在原生环境中设置，必要时重启客户端）。兼容现有配置时支持连接上的 `apiKey` / 顶层 `apiKey` 字面量，这些会落入配置和备份明文；官方建议优先环境变量引用。预览不显示凭据值。
 - 第三方表设置 `requires_openai_auth = false`，不借用 ChatGPT 凭据。Hub 从不读取、写入、复制或删除 Codex `auth.json`、系统钥匙串，也不执行 login/logout。现有登录失效时由 Codex 自己重新登录。
+- 推理强度接受 `none / minimal / low / medium / high / xhigh / max / ultra`；`max` / `ultra` 是否被具体模型接受由 Codex 自己判断。
 - **仅管理基础 `~/.codex/config.toml`**。Codex 0.134+ 命名配置是 `<name>.config.toml`，由 `--profile` 选择；Hub 不触碰它们。项目配置、环境变量、CLI 参数及运行中的会话可能覆盖基础配置，因此应用成功不是线路/登录/付费套餐验证。旧 `[profiles.*]` 检测到后先要求迁移。
 - 不读取安装版本或运行真实 Codex。兼容目标依据 2026-10-05 官方文档；启用后请在自己的客户端检查当前配置和选中模型。
 
@@ -335,9 +367,9 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 
 - 写入 `~/.claude/settings.json` 的 `env.ANTHROPIC_*`（只改 env，保留 hooks / permissions / statusLine）。
 - Claude 同步只写原生 settings.json，不打开或修改 cc-switch 数据库。
-- 当前激活由 `providers.json → sync.targets.claude.activeProvider` 控制（默认 `deepseek`）。
-- stepfun / firework 没有 Anthropic 兼容端点，不会写入 Claude Code。
-- 自定义网关可用 `claudeEnv` / `claudeSettings` 透传任意 env 与顶层字段，见上一节。
+- **用哪个供应商、哪个模型由 `modelSync` 决定**（见「多 agent 模型同步」）：没有为 Claude 解析出主模型时，一个键都不会动；平台级特性开关 `sync.targets.claude.featureEnv` 例外，配置了就会写入。
+- 端点与密钥来自 `agents.claude` 连接；没有该连接的供应商不会进入 Claude Code。
+- `agents.claude.env` / `agents.claude.settings` 可透传任意 env 与顶层字段，见「按 Agent 覆盖连接」。
 
 ## dsh 桌面版
 
@@ -366,14 +398,15 @@ web 界面在「供应商 → 配置」的「自定义接入」一节里可以�
 ## 约定
 
 - **Codex 的 ChatGPT 登录态**完全不在本工具管理范围：`auth.json` 不读不写，恢复官方模式会同时恢复 provider、model、effort。
-- pi / dsh / claude / codex 是主要目标；mcode / zcode / omp / cc-switch 适配器保留，
-  不主动写入。
+- pi / dsh / claude / codex 是主要目标；mcode / zcode / omp / cc-switch 适配器保留，不主动写入。
 - **qwen-token-plan-cn** 已过期并删除；qwen 系列模型仍可通过 firework（火山）使用。
 - 每次写入前会把原文件备份到 `backups/`，可随时回滚。
-- 修改 `providers.json` 的 `apiKey` / `baseUrl` / `models` 后，运行 `hub push` 即可全局生效。
+- 修改 `providers.json` 的连接或模型后，运行 `hub push` 即可全局生效。
 - 需要自动同步时运行 `hub watch`，它会轮询各 agent 配置哈希，变更后重新对齐。
-- 切换 Claude Code 激活 provider：改 `sync.targets.claude.activeProvider` 后 `hub push claude`。
-- 多 agent 模型：`hub model <provider> <model>` 改配置，`hub push` 落到客户端。
+- 多 agent 模型：`hub model <provider> <model>` 改配置（`--target pi/dsh/claude/codex`），`hub push` 落到客户端。
+- 旧版扁平字段（`anthropicBaseUrl` / `claudeModels` / `claudeEnv` / `claudeSettings` /
+  `openaiApiKey` / `apiKeyEnv` / `codexWireApi` / `sync.targets.claude.activeProvider`）仍可读取，
+  `hub migrate-agents` 会搬进 `agents.<agent>` 与 modelSync（可重复执行）。
 
 ## 测试
 
@@ -385,11 +418,17 @@ python -m unittest discover -s tests -p "test_*.py"
 python -m unittest discover -s tests -p "test_modelsync.py"
 python -m unittest discover -s tests -p "test_api_modelsync.py"
 
+# 连接模型与旧配置迁移
+python -m unittest discover -s tests -p "test_agent_connections.py"
+
 # 浏览器回归（可选，Playwright 仅作为测试依赖）
 npm install --prefix tests --no-save playwright
 # 可使用已安装的 Edge，无需下载 Chromium
 $env:BROWSER_EXECUTABLE = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
 node tests/browser.cjs
+
+# 界面逻辑契约（无需浏览器）
+node tests/ui_contract.cjs
 ```
 
 浏览器用例自动启动临时配置服务，模型检测与平台适配器均为桩，不接触真实密钥或客户端配置。

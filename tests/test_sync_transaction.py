@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from support import isolated, engine
+from hub import dump_yaml as hub_dump_yaml
 import sync_transaction as transaction
 
 
@@ -45,8 +46,8 @@ class SafeSyncTransactionTests(unittest.TestCase):
     def codex_fixture(self):
         cfg = self.config(["pi", "codex"])
         cfg["sync"]["targets"]["codex"].update(mode="third-party")
-        cfg["providers"]["deepseek"]["codexWireApi"] = "responses"
-        cfg["providers"]["deepseek"]["apiKeyEnv"] = "TEST_CODEX_API_KEY"
+        cfg["providers"]["deepseek"]["agents"]["codex"] = {
+            "api": "openai-responses", "apiKeyEnv": "TEST_CODEX_API_KEY"}
         self.save(cfg)
         root = self.home / ".codex"
         root.mkdir(exist_ok=True)
@@ -112,13 +113,203 @@ class SafeSyncTransactionTests(unittest.TestCase):
     def test_late_adapter_failure_discards_all_staged_outputs(self):
         self.codex_fixture()
         cfg = self.config()
-        cfg["providers"]["deepseek"]["codexWireApi"] = "unsupported"
+        cfg["providers"]["deepseek"]["agents"]["codex"]["api"] = "openai-chat-completions"
         self.save(cfg)
         before = self.native_files()
         with self.assertRaisesRegex(transaction.TransactionError, "Cannot compile codex"):
             transaction.preview(engine.Hub(), ["pi", "codex"])
         self.assertEqual(before, self.native_files())
         self.assertFalse(engine.HUB_BACKUP.exists())
+
+    def test_digit_leading_strings_are_not_treated_as_numbers(self):
+        """UUID 形态的密钥（3fa85f64-...）按 YAML 规范就是字符串。
+
+        真实事故：Firework 的 API Key 以数字开头，保守校验把它判成“歧义标量”，
+        导致含该密钥的 dsh 同步整组被拒绝。真正必须加引号的是进制、科学计数法
+        与六十进制这类会被读成数值的形态。
+        """
+        subset = transaction._yaml_subset
+        self.assertEqual(subset("key: 3fa85f64-5717-4562-b3fc-2c963f66afa6")["key"],
+                         "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        self.assertEqual(subset("key: 1")["key"], 1)
+        self.assertEqual(subset("key: 1.5")["key"], 1.5)
+        for ambiguous in ("007", "0x1F", "1e5", "1:2:3", "-1", "yes"):
+            with self.subTest(ambiguous=ambiguous), self.assertRaises(ValueError):
+                subset(f"key: {ambiguous}")
+
+    def test_mapping_keys_hub_and_clients_actually_use(self):
+        """真实客户端配置里出现过的键形必须能读。
+
+        - 带引号的键（MiniMax 写的 '1000000': hint）；
+        - 含 [ ] / 的模型 ID 键（openrouter 的 anthropic/xxx[1m]）；
+        - off 这类词作为键（hub 自己写的 reasoningEfforts）。
+        两个解析器必须得到同一个字符串键，否则安全校验会误判配置不受支持。
+        """
+        subset = transaction._yaml_subset
+        self.assertEqual(subset("'1000000': higher_usage")["1000000"], "higher_usage")
+        self.assertEqual(subset('"1000000": higher_usage')["1000000"], "higher_usage")
+        model_key = "anthropic/stealth/space-bunny-alpha[1m]"
+        self.assertEqual(subset(f"{model_key}:\n  name: x")[model_key]["name"], "x")
+        self.assertEqual(subset("off: null")["off"], None)
+        # 数字键加引号写出：两个读取端都读成同一个字符串键，且手写的
+        # `'1000000':` / `"1000000":` 两种形态都必须能读
+        for key in ("1000000", "-1", "1e5"):
+            with self.subTest(key=key):
+                dumped = hub_dump_yaml({key: "higher_usage"})
+                self.assertEqual(subset(dumped), {key: "higher_usage"})
+                self.assertEqual(engine.parse_yaml(dumped), {key: "higher_usage"})
+        # 含 ": " 或以指示符开头的键仍然要求引号
+        for bad in (r'"a\qb"', '"unterminated', "'it''s'"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                subset(bad)
+        # 写入的引号键能被读回
+        self.assertEqual(subset(hub_dump_yaml({"a: b": 1})), {"a: b": 1})
+
+    def test_quoted_scalars_round_trip_windows_paths_and_escapes(self):
+        """写入端用 json.dumps 写双引号字符串，读取端必须认这些转义。
+
+        真实故障：omp 的 shellPath 是 Windows 路径，hub 写出双引号带反斐极转义的字符串，
+        而保守校验拒绝任何含反斐极的引号字符串，整个同步被阾止。
+        """
+        subset = transaction._yaml_subset
+        self.assertEqual(subset(r'k: "C:\\Program Files\\Git\\bash.exe"')["k"],
+                         r"C:\Program Files\Git\bash.exe")
+        self.assertEqual(subset(r"k: 'C:\Program Files'")["k"], r"C:\Program Files")
+        self.assertEqual(subset(r'k: "a\"b"')["k"], 'a"b')
+        self.assertEqual(subset(r'k: "line\nbreak"')["k"], "line\nbreak")
+        self.assertEqual(subset(r'k: "\u4e2d"')["k"], "中")
+        # 两个解析器对引号内容必须得到同一个值
+        for raw in (r'"C:\\Program Files"', r"'C:\Program Files'", r'"a\"b"'):
+            with self.subTest(raw=raw):
+                self.assertEqual(subset(f"k: {raw}")["k"], engine.parse_yaml(f"k: {raw}")["k"])
+        # 写出来的内容能被安全读回（否则 omp 这类配置永远同步不了）
+        value = {"shellPath": r"C:\Program Files\Git\bin\bash.exe", "note": 'has "quotes"', "flag": "true", "num": "123"}
+        rendered = engine.dump_yaml(value)
+        self.assertEqual(subset(rendered), value)
+        self.assertEqual(engine.parse_yaml(rendered), value)
+        # 无法确定的转义依然拒绝
+        for bad in ('"a\qb"', '"unterminated', "'it''s'"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                subset(f"k: {bad}")
+
+    def test_flow_indicator_scalars_are_quoted_and_read_back(self):
+        """问题 C：模型 ID 里的 [ ] 必须触发引号，否则自己的输出读不回来。
+
+        openrouter 的模型 ID 是 anthropic/stealth/space-bunny-alpha[1m]。
+        加强「必须加引号」规则时漏掉 [ ] , 等字符，就会裸写出去，安全校验读回来
+        变成一个坏标量（或被 _yaml_subset 直接拒绝），dsh 的 cordis.patch.yml 同步
+        因此失败。这里把「写入 → 读回」整条链路钉死。
+        """
+        subset = transaction._yaml_subset
+        for value in ("anthropic/stealth/space-bunny-alpha[1m]", "a,b", "m[1m]",
+                      "has #comment", "a: b", "C:\\path\\to\\x", "1000000", "off"):
+            with self.subTest(value=value):
+                rendered = engine.dump_yaml({"id": value})
+                self.assertEqual(subset(rendered)["id"], value)
+                self.assertEqual(engine.parse_yaml(rendered)["id"], value)
+        # 含流式指示符的值必须真的带引号（不是靠运气读回）
+        for value in ("model[1m]", "a,b", 'has "quotes"', "has #comment"):
+            with self.subTest(value=value):
+                rendered = engine.dump_yaml({"id": value})
+                self.assertTrue(rendered.strip().endswith('"') or "'" in rendered,
+                                f"{value!r} 被裸写: {rendered!r}")
+
+    def test_hash_inside_quotes_is_content_not_a_comment(self):
+        """引号内的 # 是内容：旧实现按「空格+#」一刀切，会把 "has #comment" 截成 "has。"""
+        subset = transaction._yaml_subset
+        value = "has #comment"
+        rendered = engine.dump_yaml({"id": value})
+        self.assertEqual(engine.parse_yaml(rendered)["id"], value)
+        self.assertEqual(subset(rendered)["id"], value)
+        # 真正的注释仍然被剥掉
+        self.assertEqual(engine.parse_yaml("k: v  # real comment"), {"k": "v"})
+        self.assertEqual(engine.parse_yaml("# whole line comment"), None)
+        # 引号键里的冒号/盘符不再被 partition(":") 从中间切断
+        self.assertEqual(engine.parse_yaml('"a:b": 1'), {"a:b": 1})
+        self.assertEqual(engine.parse_yaml('"C:\\\\path": 1'), {r"C:\path": 1})
+        self.assertEqual(engine.parse_yaml('"a:b": 1')["a:b"], subset('"a:b": 1')["a:b"])
+
+    def test_multiline_and_special_scalars_survive_a_round_trip(self):
+        """多行字符串必须加引号：裸写会被下一行当成新语句，读回来只剩第一行。"""
+        subset = transaction._yaml_subset
+        value = "line one\nline two"
+        rendered = engine.dump_yaml({"k": value})
+        self.assertNotIn("\n", rendered.strip())
+        self.assertEqual(engine.parse_yaml(rendered)["k"], value)
+        self.assertEqual(subset(rendered)["k"], value)
+        # 指示符 / YAML 词开头的值必须加引号，读回来仍是字符串
+        for value in ("-dash", "?q", ":c", "#leading", " leading", "trailing ",
+                      "true", "false", "null", "~", "12", "1.5", "yes", "on", "off"):
+            with self.subTest(value=value):
+                rendered = engine.dump_yaml({"k": value})
+                self.assertEqual(engine.parse_yaml(rendered)["k"], value)
+                self.assertEqual(subset(rendered)["k"], value)
+        # 数字本身（不是字符串）必须是数字，包括裸写会被校验器拒绝的负数
+        for number in (-3, -3.25, 0, 12, 128000, 1e30, 1e-7):
+            with self.subTest(number=number):
+                rendered = engine.dump_yaml({"k": number})
+                self.assertEqual(engine.parse_yaml(rendered)["k"], number)
+                self.assertEqual(subset(rendered)["k"], number)
+
+    def test_parser_and_subset_agree_on_every_target_shaped_document(self):
+        """两个解析器必须同进同退：安全校验靠它们比对，分歧就是误判。"""
+        subset = transaction._yaml_subset
+        documents = [
+            "models:\n  - id: \"anthropic/stealth/space-bunny-alpha[1m]\"\n    name: Space Bunny\n",
+            "reasoningEfforts:\n  off: null\n  max: null\n",
+            "provider:\n  minimax:\n    models:\n      MiniMax-M3:\n        contextWindowOptionHints:\n          '1000000': higher_usage\n",
+            'shellPath: "C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe"\n',
+            "items:\n  - a\n  - b\n",
+            "empty: {}\nlist: []\n",
+        ]
+        for text in documents:
+            with self.subTest(text=text):
+                self.assertEqual(engine.parse_yaml(text), subset(text))
+                parsed = subset(text)
+                rendered = engine.dump_yaml(parsed)
+                self.assertEqual(subset(rendered), parsed)
+                self.assertEqual(engine.parse_yaml(rendered), parsed)
+
+    def test_keys_are_quoted_whenever_they_would_read_back_wrong(self):
+        """写入端产出的每个键都必须能被两个读取端读回同一个字符串。
+
+        对抗性 fuzz 暴露的三类键，写入端曾经裸写、读取端读出坏结果：
+        - 列表项映射里键含冒号：`- a:b: {k: v}` 会被切成 a -> "b: {k: v}"；
+        - 键以 `#` 开头：`#lead: x` 整行被当成注释，键直接消失；
+        - 键含换行 / 制表：裸写会把一行拆成两行。
+        另外半截引号的键必须报错，而不是静默读出一个坏键。
+        """
+        subset = transaction._yaml_subset
+        cases = [
+            [{"a:b": {"k": "v"}}],
+            {"#lead": "- x"},
+            {"a": {"#": "v"}},
+            {"a\nb": "v"},
+            {"a\tb": "v"},
+            {"a:b": [], "#lead": "- x"},
+            {"#": {"#": "#"}},
+        ]
+        for value in cases:
+            with self.subTest(value=value):
+                rendered = engine.dump_yaml(value)
+                self.assertEqual(engine.parse_yaml(rendered), value, rendered)
+                self.assertEqual(subset(rendered), value, rendered)
+        # 半截引号的键：两个读取端都必须拒绝，不能各自读出一个坏键
+        for text in ('"a: b', "a\": 1", '"unterminated: 1'):
+            with self.subTest(text=text):
+                raised = []
+                for reader in (engine.parse_yaml, subset):
+                    try:
+                        reader(text)
+                    except ValueError:
+                        raised.append(True)
+                self.assertTrue(raised, f"{text!r} 两个读取端都接受了半截引号的键")
+        # 键里含引号但不是引号开头的（a"）是合法裸键：必须能原样往返，不能被误拒
+        odd = {'a"': 1}
+        rendered = engine.dump_yaml(odd)
+        self.assertEqual(engine.parse_yaml(rendered), odd)
+        self.assertEqual(subset(rendered), odd)
+
 
     def test_apply_writes_only_selected_allowlist_and_saves_private_backups(self):
         cfg = self.config()

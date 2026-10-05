@@ -11,13 +11,15 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 # Hub 自身目录不再绑定用户主目录：按本文件位置定位，
 # 整个目录可以任意搬迁（例如从 ~/.agent-hub 移到 G:\workspaces\agent-hub）。
 HUB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HUB_DIR))
 from hub import (Hub, HUB_CONFIG, ModelLossError, assert_expected_model_changes, backup_file,
+                 agent_connection, agent_connection_ready, agent_connections,
+                 canonical_target, provider_targets,
                  configure_stdio, expand, file_hash, load_json, save_json, now_iso, target_files)  # noqa: E402
 from discover import discover_models  # noqa: E402
 
@@ -28,13 +30,18 @@ try:  # pragma: no cover - 正常仓库里始终走 try 分支
     from hub import (REASONING_EFFORTS, agent_model_options, agent_model_tiers_public,
                      resolve_agent_model)  # noqa: E402
 except ImportError:  # pragma: no cover
-    REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+    REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
     agent_model_options = agent_model_tiers_public = resolve_agent_model = None
 
 UI_DIR = HUB_DIR / "ui"
 LOCK = threading.Lock()
 SUPPORTED_TARGETS = {"pi", "mcode", "zcode", "dsh", "dsh-desktop", "claude", "cc-switch", "omp", "codex"}
+PREVIEW_TARGETS = SUPPORTED_TARGETS - {"cc-switch"}
 PROTOCOLS = {"openai-completions", "openai-responses", "openai-chat-completions", "anthropic-messages"}
+# 每个 Agent 连接允许的协议：Claude Code 只走 Anthropic Messages，Codex 第三方只走 Responses。
+AGENT_APIS = {"claude": {"anthropic-messages"}, "codex": {"openai-responses"}}
+# providers.json 里可以按 Agent 覆盖连接的目标名（dsh-desktop 归一化成 dsh）。
+AGENT_CONNECTION_KEYS = ("pi", "dsh", "claude", "codex")
 
 # modelSync 可写的目标 -> 落盘时使用的键。dsh 桌面版与 CLI 共用同一份配置，
 # 写入时归一化成 dsh，避免出现两份互相漂移的覆盖。
@@ -76,14 +83,31 @@ def _provider(h: Hub, pid: str) -> dict:
 
 
 def _validate_provider(p: dict) -> None:
-    for field in ("name", "baseUrl"):
-        if not isinstance(p.get(field), str) or not p[field].strip():
-            raise ValueError(f"{field} 不能为空")
+    if not isinstance(p.get("name"), str) or not p["name"].strip():
+        raise ValueError("name 不能为空")
+    # agents 先校验：后面的判定都建立在「每条覆盖都是对象」之上
+    _validate_agents(p.get("agents"))
+    agents = p.get("agents") if isinstance(p.get("agents"), dict) else {}
+    claude_override = agents.get("claude")
+    claude_override = claude_override if isinstance(claude_override, dict) else {}
+    targets = p.get("targets")
+    claude_only = (isinstance(targets, list) and bool(targets)
+                   and all(canonical_target(target) == "claude" for target in targets))
+    has_claude_connection = bool(str(claude_override.get("baseUrl") or "").strip())
+    if not isinstance(p.get("baseUrl"), str):
+        raise ValueError("baseUrl 必须是字符串")
+    if not p["baseUrl"].strip() and not (has_claude_connection or (claude_only and p.get("anthropicBaseUrl"))):
+        raise ValueError("baseUrl 不能为空；只给 Claude Code 用的供应商可只配置 Claude 连接或 anthropicBaseUrl")
     for field in ("apiKey", "openaiApiKey", "apiKeyEnv"):
         if p.get(field) is not None and not isinstance(p[field], str):
             raise ValueError(f"{field} 必须是字符串或 null")
-    if not any(p.get(field) for field in ("apiKey", "openaiApiKey", "apiKeyEnv")):
-        raise ValueError("请配置 API Key、Codex 专用 Key 或 API Key 环境变量名")
+    # 密钥可以只配在某个 Agent 连接上（同一网关给不同 Agent 发不同 key）
+    agents_block = p.get("agents") if isinstance(p.get("agents"), dict) else {}
+    agent_has_key = any((block or {}).get("apiKey") or (block or {}).get("apiKeyEnv")
+                        for block in agents_block.values()
+                        if isinstance(block, dict))
+    if not any(p.get(field) for field in ("apiKey", "openaiApiKey", "apiKeyEnv")) and not agent_has_key:
+        raise ValueError("请配置 API Key、Codex 专用 Key、API Key 环境变量名，或在某个 Agent 连接上配置密钥")
     if p.get("apiKeyEnv") and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p["apiKeyEnv"]):
         raise ValueError("apiKeyEnv 必须是有效的环境变量名")
     if p.get("codexWireApi") not in (None, "", "responses"):
@@ -106,7 +130,7 @@ def _validate_provider(p: dict) -> None:
         raise ValueError("不支持的 API 协议")
     if "enabled" in p and not isinstance(p["enabled"], bool):
         raise ValueError("enabled 必须是布尔值")
-    # 自定义 Claude 供应商：声明式透传
+    # 旧 Claude 专属字段：迁移命令会搬进 agents.claude，这里只做兼容校验。
     for field in ("claudeEnv", "claudeSettings", "claudeModels"):
         if field in p and not isinstance(p[field], dict):
             raise ValueError(f"{field} 必须是对象")
@@ -127,6 +151,53 @@ def _validate_provider(p: dict) -> None:
         unknown = [x for x in t if x not in SUPPORTED_TARGETS]
         if unknown:
             raise ValueError(f"未知的目标平台: {', '.join(sorted(unknown))}")
+    _validate_agents(p.get("agents"))
+
+
+def _validate_agents(agents: object) -> None:
+    """校验 agents.<agent> 按 Agent 覆盖：端点、密钥、协议与模型列表。"""
+    if agents is None:
+        return
+    if not isinstance(agents, dict):
+        raise ValueError("agents 必须是对象")
+    for name, block in agents.items():
+        if name not in AGENT_CONNECTION_KEYS:
+            raise ValueError(f"未知的 Agent 覆盖: {name}（可用: {', '.join(AGENT_CONNECTION_KEYS)}）")
+        if not isinstance(block, dict):
+            raise ValueError(f"agents.{name} 必须是对象")
+        unknown = sorted(set(block) - {"baseUrl", "apiKey", "apiKeyEnv", "api", "models",
+                                       "compat", "env", "settings"})
+        if unknown:
+            raise ValueError(f"agents.{name} 包含未知字段: {', '.join(unknown)}")
+        for field in ("baseUrl", "apiKey", "apiKeyEnv", "api"):
+            if field in block and block[field] is not None and not isinstance(block[field], str):
+                raise ValueError(f"agents.{name}.{field} 必须是字符串或 null")
+        for field in ("baseUrl",):
+            if block.get(field):
+                u = urlparse(block[field])
+                if u.scheme not in ("http", "https") or not u.netloc:
+                    raise ValueError(f"agents.{name}.{field} 必须是有效的 HTTP / HTTPS 地址")
+        if "api" in block and block["api"]:
+            allowed = AGENT_APIS.get(name)
+            if allowed and block["api"] not in allowed:
+                raise ValueError(f"agents.{name}.api 只支持 {'/'.join(sorted(allowed))}")
+        if block.get("apiKeyEnv") and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", block["apiKeyEnv"]):
+            raise ValueError(f"agents.{name}.apiKeyEnv 必须是有效的环境变量名")
+        if "models" in block and block["models"] is not None:
+            if not isinstance(block["models"], list):
+                raise ValueError(f"agents.{name}.models 必须是数组")
+            for m in block["models"]:
+                if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m["id"].strip():
+                    raise ValueError(f"agents.{name}.models 的条目必须带非空 id")
+        for field in ("env", "settings"):
+            if field in block and block[field] is not None:
+                if not isinstance(block[field], dict):
+                    raise ValueError(f"agents.{name}.{field} 必须是对象")
+                for k, v in block[field].items():
+                    if not isinstance(k, str) or not k or k in ("env", "$schema"):
+                        raise ValueError(f"agents.{name}.{field} 的键名无效")
+                    if not isinstance(v, (str, int, float, bool, dict, list)):
+                        raise ValueError(f"agents.{name}.{field}[{k}] 的值类型不受支持")
 
 
 def _modelsync_block(cfg: dict) -> dict:
@@ -187,7 +258,8 @@ def _validate_modelsync_entry(h: Hub, entry: object, where: str, *, allow_tiers:
     if not isinstance(model, str) or not model.strip():
         raise ValueError(f"{where}.model 必须是非空字符串")
     effort = entry.get("reasoningEffort")
-    efforts = ("none", "minimal", "low", "medium", "high", "xhigh") if where == "modelSync.overrides.codex" else REASONING_EFFORTS
+    efforts = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra") \
+        if where == "modelSync.overrides.codex" else REASONING_EFFORTS
     if effort is not None and effort not in efforts:
         raise ValueError(f"{where}.reasoningEffort 只能是 {'/'.join(efforts)} 或 null")
     checked = {"provider": pid, "model": model.strip(), "reasoningEffort": effort}
@@ -245,12 +317,23 @@ def _modelsync_models(block: dict) -> list[tuple[str, str, str]]:
 
 
 def _modelsync_warnings(h: Hub, block: dict) -> list[str]:
-    """手填模型不在供应商模型库里时给出提示；这是放行的手填值，不阻止写入。"""
+    """手填模型不在对应连接的模型库里时给出提示；这是放行的手填值，不阻止写入。
+
+    全局主模型按该供应商所有连接的并集判断；平台 / 档位只按目标 Agent 自己的
+    连接判断——同一供应商给 Claude 与 Codex 配不同 key 时，模型集合本就不同。
+    """
     warnings = []
+    every = {pid: {m["id"] for m in models}
+             for pid, models in agent_model_options(h.cfg).items()}
+    per_target = {target: {pid: {m["id"] for m in models}
+                           for pid, models in agent_model_options(h.cfg, target).items()}
+                  for target in set(MODELSYNC_TARGETS.values())}
     for where, pid, model in _modelsync_models(block):
-        known = {m.get("id") for m in (h.providers.get(pid) or {}).get("models") or []
-                 if isinstance(m, dict)}
-        if model not in known:
+        parts = where.split(".")
+        catalog = every.get(pid, set())
+        if ".overrides." in where:
+            catalog = per_target.get(parts[2], {}).get(pid, every.get(pid, set()))
+        if model not in catalog:
             warnings.append(f"{where} 的模型 {model} 不在供应商 {pid} 的模型库中，按手填值写入")
     return warnings
 
@@ -261,8 +344,13 @@ def api_modelsync() -> dict:
     h = hub()
     block = _modelsync_block(h.cfg)
     resolved, tiers = _modelsync_view(h.cfg)
+    options = agent_model_options(h.cfg)
+    # 每个 Agent 连接各自可见的模型：同一供应商给不同 Agent 配不同 key 时，
+    # 模型下拉只应出现这条连接真正提供的模型。
+    per_target = {target: agent_model_options(h.cfg, target)
+                  for target in MODELSYNC_RESOLVED_TARGETS if target != "dsh-desktop"}
     return {"modelSync": block, "resolved": resolved, "tiers": tiers,
-            "options": agent_model_options(h.cfg),
+            "options": options, "optionsByTarget": per_target,
             "configured": bool(block.get("default") or block.get("overrides"))}
 
 
@@ -296,18 +384,23 @@ def api_status() -> dict:
                   "changed": str(expand(f)) in changed} for f in target_files(name, t)]
         targets[name] = {
             "enabled": t.get("enabled", False), "aliasOf": t.get("aliasOf"),
-            "notes": t.get("notes"), "activeProvider": t.get("activeProvider"),
-            "supported": name in SUPPORTED_TARGETS, "files": files,
+            "notes": t.get("notes"),
+            "supported": name in PREVIEW_TARGETS, "files": files,
             "mode": t.get("mode", "official") if name == "codex" else None,
-            "readonly": name not in SUPPORTED_TARGETS,
+            "readonly": name not in PREVIEW_TARGETS,
         }
     model_sync = _modelsync_block(h.cfg)
     resolved, _tiers = _modelsync_view(h.cfg)
+    # 每个 Agent 各自可用的供应商（连接就绪：端点 + 协议匹配，且 targets 允许）。
+    capable = {name: [pid for pid, p in h.providers.items()
+                      if p.get("enabled", True) and provider_targets(p, name)
+                      and agent_connection_ready(p, name)]
+               for name in AGENT_CONNECTION_KEYS}
     return {
         "app": "agent-hub", "uiVersion": 2,
         "statusText": h.status(), "providerCount": len(h.providers), "targets": targets,
-        "anthropicCapable": [pid for pid, p in h.providers.items()
-                             if p.get("anthropicBaseUrl") and p.get("enabled", True)],
+        "anthropicCapable": capable["claude"], "agentCapable": capable,
+        "connections": agent_connections(h.cfg),
         "configPath": str(HUB_CONFIG), "updatedAt": h.cfg.get("updatedAt"),
         "lastSync": h.state.get("lastSync"), "lastResults": h.state.get("lastResults", []),
         "lastTransaction": h.state.get("lastTransaction"),
@@ -317,10 +410,17 @@ def api_status() -> dict:
     }
 
 
+def _query_agent(query: dict | None) -> str | None:
+    """从查询串里取 ?agent=<name>：模型按连接（key）组织时的连接选择。"""
+    values = (query or {}).get("agent") or []
+    value = values[0].strip() if values and isinstance(values[0], str) else ""
+    return value or None
+
+
 def _selected_targets(h: Hub, body: dict) -> list[str]:
     targets = h.cfg.get("sync", {}).get("targets", {})
     enabled = {name for name, t in targets.items()
-               if name in SUPPORTED_TARGETS and t.get("enabled", False)}
+               if name in PREVIEW_TARGETS and t.get("enabled", False)}
     requested = body.get("targets")
     if requested is not None and (not isinstance(requested, list) or not requested
                                   or any(not isinstance(n, str) for n in requested)):
@@ -352,7 +452,7 @@ def _record_sync(h: Hub, results: list[str], changed: list[str] | None = None,
             for file in target_files(name, target):
                 hashes[str(expand(file))] = file_hash(expand(file))
     all_enabled = {canonical(n) for n, t in targets.items()
-                   if n in SUPPORTED_TARGETS and t.get("enabled", False)}
+                   if n in PREVIEW_TARGETS and t.get("enabled", False)}
     if all_enabled <= succeeded:
         h.state["configHash"] = file_hash(HUB_CONFIG)
     h.state["lastResults"] = details
@@ -428,7 +528,7 @@ def api_update_targets(body: dict) -> dict:
         targets = h.cfg.get("sync", {}).get("targets", {})
         proposed = {name: dict(t) for name, t in targets.items()}
         for name, update in updates.items():
-            if name not in targets or name not in SUPPORTED_TARGETS or targets[name].get("aliasOf"):
+            if name not in targets or name not in PREVIEW_TARGETS or targets[name].get("aliasOf"):
                 raise ValueError(f"无法单独设置此平台: {name}")
             if not isinstance(update, dict):
                 raise ValueError("平台设置必须是对象")
@@ -436,19 +536,13 @@ def api_update_targets(body: dict) -> dict:
                 if not isinstance(update["enabled"], bool):
                     raise ValueError("enabled 必须是布尔值")
                 proposed[name]["enabled"] = update["enabled"]
-            unknown = set(update) - {"enabled", "activeProvider", "mode"}
+            unknown = set(update) - {"enabled", "mode"}
             if unknown:
                 raise ValueError("未知的平台设置字段")
             if "mode" in update:
                 if name != "codex" or update["mode"] not in ("official", "third-party"):
                     raise ValueError("Codex mode 必须是 official 或 third-party")
                 proposed[name]["mode"] = update["mode"]
-            if "activeProvider" in update:
-                pid = update["activeProvider"]
-                p = h.providers.get(pid, {})
-                if name != "claude" or not p.get("anthropicBaseUrl") or not p.get("enabled", True):
-                    raise ValueError("Claude Code 需要已启用且有 Anthropic 端点的供应商")
-                proposed[name]["activeProvider"] = pid
         for name, t in proposed.items():
             if t.get("aliasOf"):
                 t["enabled"] = proposed.get(t["aliasOf"], {}).get("enabled", False)
@@ -470,9 +564,11 @@ def api_add_provider(body: dict) -> dict:
     for field in ("anthropicBaseUrl", "notes", "agentModel", "openaiApiKey", "apiKeyEnv", "codexWireApi"):
         if body.get(field):
             p[field] = body[field]
-    for field in ("claudeEnv", "claudeSettings"):
+    for field in ("claudeModels", "claudeEnv", "claudeSettings"):
         if field in body:
             p[field] = body[field]
+    if body.get("agents"):
+        p["agents"] = body["agents"]
     if "targets" in body:
         p["targets"] = body["targets"]
     _validate_provider(p)
@@ -499,6 +595,8 @@ def api_update_provider(pid: str, body: dict) -> dict:
         for field in ("claudeEnv", "claudeSettings"):
             if field in body:
                 p[field] = body[field]
+        if "agents" in body:
+            p["agents"] = body["agents"]
         if "targets" in body:
             p["targets"] = body["targets"]
         _validate_provider(p)
@@ -539,26 +637,55 @@ def _normalize_model(body: dict) -> dict:
     if not isinstance(body.get("reasoning", True), bool):
         raise ValueError("reasoning 必须是布尔值")
     # 编辑时保留 cost / compat 等非 UI 字段，不悄悄丢弃高级配置。
-    return {**body, "id": body["id"].strip(), "name": body.get("name") or body["id"].strip(),
+    # agent 是「这条模型属于哪个连接」的路由参数，不是模型字段，不能落进配置。
+    fields = {k: v for k, v in body.items() if k != "agent"}
+    return {**fields, "id": body["id"].strip(), "name": body.get("name") or body["id"].strip(),
             **numbers, "input": list(dict.fromkeys(inp)), "reasoning": body.get("reasoning", True)}
+
+
+def _connection_models(h: Hub, pid: str, agent: str | None) -> list[dict]:
+    """某个连接上的模型列表：agent 为空表示默认连接。"""
+    p = _provider(h, pid)
+    if agent:
+        name = canonical_target(agent)
+        if name not in AGENT_CONNECTION_KEYS:
+            raise ValueError(f"未知的连接: {agent}")
+        return agent_connection(p, name)["models"]
+    return p.get("models") or []
+
+
+def _set_connection_models(h: Hub, pid: str, agent: str | None, models: list[dict]) -> None:
+    """写回某个连接上的模型列表（agents.<agent>.models 或顶层 models）。"""
+    p = _provider(h, pid)
+    if agent:
+        name = canonical_target(agent)
+        if name not in AGENT_CONNECTION_KEYS:
+            raise ValueError(f"未知的连接: {agent}")
+        override = p.setdefault("agents", {}).setdefault(name, {})
+        override["models"] = models
+    else:
+        p["models"] = models
 
 
 def api_add_model(pid: str, body: dict) -> dict:
     new = _normalize_model(body)
+    agent = body.get("agent") or None
     with LOCK:
         h = hub()
-        models = _provider(h, pid).setdefault("models", [])
+        models = _connection_models(h, pid, agent)
         if any(m.get("id") == new["id"] for m in models):
             raise ValueError(f"模型已存在: {new['id']}")
         models.append(new)
+        _set_connection_models(h, pid, agent, models)
         _save_config(h)
     return {"ok": True, "id": new["id"]}
 
 
 def api_update_model(pid: str, mid: str, body: dict) -> dict:
+    agent = body.get("agent") or None
     with LOCK:
         h = hub()
-        models = _provider(h, pid).get("models", [])
+        models = _connection_models(h, pid, agent)
         old = next((m for m in models if m.get("id") == mid), None)
         if old is None:
             raise ValueError(f"模型不存在: {mid}")
@@ -571,13 +698,13 @@ def api_update_model(pid: str, mid: str, body: dict) -> dict:
     return {"ok": True}
 
 
-def api_delete_model(pid: str, mid: str) -> dict:
+def api_delete_model(pid: str, mid: str, agent: str | None = None) -> dict:
     with LOCK:
         h = hub()
-        p = _provider(h, pid)
-        if not any(m.get("id") == mid for m in p.get("models", [])):
+        models = _connection_models(h, pid, agent)
+        if not any(m.get("id") == mid for m in models):
             raise ValueError(f"模型不存在: {mid}")
-        p["models"] = [m for m in p.get("models", []) if m.get("id") != mid]
+        _set_connection_models(h, pid, agent, [m for m in models if m.get("id") != mid])
         _save_config(h, allowed_removed={pid: {mid}})
     return {"ok": True}
 
@@ -586,20 +713,20 @@ def api_batch_delete_models(pid: str, body: dict) -> dict:
     ids = body.get("ids")
     if not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids):
         raise ValueError("请提供要删除的模型 ID 列表")
+    agent = body.get("agent") or None
     with LOCK:
         h = hub()
-        p = _provider(h, pid)
-        models = p.get("models", [])
+        models = _connection_models(h, pid, agent)
         remaining = [m for m in models if m.get("id") not in set(ids)]
         removed = len(models) - len(remaining)
-        p["models"] = remaining
+        _set_connection_models(h, pid, agent, remaining)
         _save_config(h, allowed_removed={pid: set(ids)})
     return {"ok": True, "removed": removed}
 
 
-def api_discover_models(pid: str) -> dict:
+def api_discover_models(pid: str, agent: str | None = None) -> dict:
     h = hub()
-    models = discover_models(_provider(h, pid))
+    models = discover_models(_provider(h, pid), agent)
     return {"ok": True, "count": len(models), "models": models}
 
 
@@ -610,52 +737,53 @@ def api_import_models(pid: str, body: dict) -> dict:
         raise ValueError("请至少选择一个模型")
     if mode not in ("merge", "replace"):
         raise ValueError("导入模式必须为 merge 或 replace")
+    agent = body.get("agent") or None
     normalized = [_normalize_model(m) for m in models]
     if len({m["id"] for m in normalized}) != len(normalized):
         raise ValueError("导入列表包含重复模型 ID")
     with LOCK:
         h = hub()
-        p = _provider(h, pid)
-        existing = p.get("models", [])
+        existing = _connection_models(h, pid, agent)
         if mode == "replace" and len(existing) >= 5 and len(normalized) < len(existing) * 0.5 and not body.get("confirm"):
             raise ValueError("模型数量将减少一半以上；确认无误后传 confirm=true")
         by_id = {m["id"]: m for m in existing}
         added = sum(m["id"] not in by_id for m in normalized)
         if mode == "replace":
-            p["models"] = normalized
+            merged = normalized
         else:
             for m in normalized:
                 if m["id"] not in by_id:
                     by_id[m["id"]] = m
                 elif body.get("updateExisting"):
                     by_id[m["id"]] = {**by_id[m["id"]], **m}
-            p["models"] = list(by_id.values())
+            merged = list(by_id.values())
+        _set_connection_models(h, pid, agent, merged)
         allowed = {pid: {m.get("id") for m in existing}} if mode == "replace" else None
         _save_config(h, allowed_removed=allowed)
-    return {"ok": True, "count": len(p["models"]), "added": added}
+    return {"ok": True, "count": len(merged), "added": added}
 
 
 # URL 编码必须在路由匹配之后解码：openrouter 等模型 ID 自带 /。
 ROUTES = [
-    ("GET", r"^/api/providers$", lambda m, b: api_providers()),
-    ("GET", r"^/api/status$", lambda m, b: api_status()),
-    ("POST", r"^/api/preview$", lambda m, b: api_preview(b)),
-    ("POST", r"^/api/apply$", lambda m, b: api_apply(b)),
-    ("POST", r"^/api/restore$", lambda m, b: api_restore(b)),
-    ("POST", r"^/api/push$", lambda m, b: api_push(b)),
-    ("POST", r"^/api/sync$", lambda m, b: api_sync(b)),
-    ("PUT", r"^/api/targets$", lambda m, b: api_update_targets(b)),
-    ("GET", r"^/api/modelsync$", lambda m, b: api_modelsync()),
-    ("PUT", r"^/api/modelsync$", lambda m, b: api_update_modelsync(b)),
-    ("POST", r"^/api/providers$", lambda m, b: api_add_provider(b)),
-    ("PUT", r"^/api/providers/([^/]+)$", lambda m, b: api_update_provider(unquote(m[1]), b)),
-    ("DELETE", r"^/api/providers/([^/]+)$", lambda m, b: api_delete_provider(unquote(m[1]))),
-    ("POST", r"^/api/providers/([^/]+)/models$", lambda m, b: api_add_model(unquote(m[1]), b)),
-    ("PUT", r"^/api/providers/([^/]+)/models/([^/]+)$", lambda m, b: api_update_model(unquote(m[1]), unquote(m[2]), b)),
-    ("DELETE", r"^/api/providers/([^/]+)/models/([^/]+)$", lambda m, b: api_delete_model(unquote(m[1]), unquote(m[2]))),
-    ("GET", r"^/api/providers/([^/]+)/discover$", lambda m, b: api_discover_models(unquote(m[1]))),
-    ("POST", r"^/api/providers/([^/]+)/models/batch-delete$", lambda m, b: api_batch_delete_models(unquote(m[1]), b)),
-    ("POST", r"^/api/providers/([^/]+)/models/import$", lambda m, b: api_import_models(unquote(m[1]), b)),
+    ("GET", r"^/api/providers$", lambda m, b, q=None: api_providers()),
+    ("GET", r"^/api/status$", lambda m, b, q=None: api_status()),
+    ("POST", r"^/api/preview$", lambda m, b, q=None: api_preview(b)),
+    ("POST", r"^/api/apply$", lambda m, b, q=None: api_apply(b)),
+    ("POST", r"^/api/restore$", lambda m, b, q=None: api_restore(b)),
+    ("POST", r"^/api/push$", lambda m, b, q=None: api_push(b)),
+    ("POST", r"^/api/sync$", lambda m, b, q=None: api_sync(b)),
+    ("PUT", r"^/api/targets$", lambda m, b, q=None: api_update_targets(b)),
+    ("GET", r"^/api/modelsync$", lambda m, b, q=None: api_modelsync()),
+    ("PUT", r"^/api/modelsync$", lambda m, b, q=None: api_update_modelsync(b)),
+    ("POST", r"^/api/providers$", lambda m, b, q=None: api_add_provider(b)),
+    ("PUT", r"^/api/providers/([^/]+)$", lambda m, b, q=None: api_update_provider(unquote(m[1]), b)),
+    ("DELETE", r"^/api/providers/([^/]+)$", lambda m, b, q=None: api_delete_provider(unquote(m[1]))),
+    ("POST", r"^/api/providers/([^/]+)/models$", lambda m, b, q=None: api_add_model(unquote(m[1]), b)),
+    ("PUT", r"^/api/providers/([^/]+)/models/([^/]+)$", lambda m, b, q=None: api_update_model(unquote(m[1]), unquote(m[2]), b)),
+    ("DELETE", r"^/api/providers/([^/]+)/models/([^/]+)$", lambda m, b, q=None: api_delete_model(unquote(m[1]), unquote(m[2]), _query_agent(q))),
+    ("GET", r"^/api/providers/([^/]+)/discover$", lambda m, b, q=None: api_discover_models(unquote(m[1]), _query_agent(q))),
+    ("POST", r"^/api/providers/([^/]+)/models/batch-delete$", lambda m, b, q=None: api_batch_delete_models(unquote(m[1]), b)),
+    ("POST", r"^/api/providers/([^/]+)/models/import$", lambda m, b, q=None: api_import_models(unquote(m[1]), b)),
 ]
 
 
@@ -692,13 +820,15 @@ class Handler(BaseHTTPRequestHandler):
         if origin and origin != f"http://{self.headers.get('Host')}":
             self._send_json(403, {"error": "拒绝跨站请求"})
             return
-        path = urlparse(self.path).path
+        split = urlparse(self.path)
+        path = split.path
         try:
             body = self._read_body() if method in ("POST", "PUT", "PATCH") else {}
+            query = parse_qs(split.query)
             for verb, pattern, fn in ROUTES:
                 match = re.match(pattern, path) if verb == method else None
                 if match:
-                    self._send_json(200, fn(match, body))
+                    self._send_json(200, fn(match, body, query))
                     return
             self._send_json(404, {"error": f"unknown api: {method} {path}"})
         except ValueError as e:

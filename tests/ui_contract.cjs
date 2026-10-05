@@ -20,13 +20,25 @@ source = source.slice(0, source.lastIndexOf('state.page = PAGES[location.hash.sl
 vm.runInContext(source, context);
 const run = text => vm.runInContext(text, context);
 run(`state.providers = {gateway: {name: 'Gateway', enabled: true, models: [{id:'gpt-test'}]}};
-state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:[],lastResults:[]};
+state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:['gateway'],agentCapable:{pi:['gateway'],dsh:['gateway'],claude:['gateway'],codex:['gateway']},connections:{gateway:{pi:{ready:true,overridden:false,modelCount:1},dsh:{ready:true,overridden:false,modelCount:1},claude:{ready:true,overridden:false,modelCount:1},codex:{ready:true,overridden:false,modelCount:1}}},lastResults:[]};
 state.targetDraft={codex:true,pi:true};
-state.modelSync={modelSync:{default:{provider:'gateway',model:'gpt-test'}},resolved:{codex:{provider:'gateway',model:'gpt-test'}},options:{}};
+state.modelSync={modelSync:{default:{provider:'gateway',model:'gpt-test'}},resolved:{codex:{provider:'gateway',model:'gpt-test'}},options:{},optionsByTarget:{}};
 ensureModelSyncDraft();`);
 let passed = 0;
 const test = async (name, task) => { await task(); passed++; console.log(`PASS ${name}`); };
 (async () => {
+  await test('new supplier targets are explicit and focus on core agents', () => {
+    assert.equal(run('DEFAULT_PROVIDER_TARGETS.join(",")'), 'pi,dsh,claude,codex');
+    const selected = { has: () => false, getAll: () => ['pi', 'dsh', 'claude', 'codex'] };
+    context.selected = selected;
+    assert.equal(run('providerTargetsFromForm(selected).join(",")'), 'pi,dsh,claude,codex');
+    const all = { has: () => true, getAll: () => [] };
+    context.all = all;
+    assert.equal(run('providerTargetsFromForm(all).length'), 0);
+    const empty = { has: () => false, getAll: () => [] };
+    context.empty = empty;
+    assert.throws(() => run('providerTargetsFromForm(empty)'), /至少选择一个同步平台/);
+  });
   await test('official Codex is writable and restoration is explained', () => {
     const html = run(`clientRow('codex','Codex')`);
     assert.match(html, /恢复.*官方 model/);
@@ -44,7 +56,10 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.match(html, /id="ms-provider-clients-codex"/);
     assert.match(html, /value="none"/);
     assert.match(html, /供应商默认（移除覆盖）/);
-    assert.doesNotMatch(html, /value="off"|value="max"/);
+    assert.doesNotMatch(html, /value="off"/);
+    // Codex 线路放开 max / ultra
+    assert.match(html, /value="max"/);
+    assert.match(html, /value="ultra"/);
   });
   await test('preview escapes paths and has distinct confirmation', () => {
     run(`state.preview={planId:'plan',targets:['codex'],files:[{path:'<script>bad</script>',action:'update'}],warnings:['<img>']};renderPreview()`);
@@ -107,6 +122,30 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.equal(run('state.preview'), null);
     assert.match(node('#sync-preview').innerHTML, /预览已过期/);
     assert.doesNotMatch(node('#sync-preview').innerHTML, /data-action="apply-preview"/);
+  });
+  await test('supplier choices only list providers whose connection is ready', () => {
+    run(`state.providers = {
+      gateway: {name:'Gateway',enabled:true,baseUrl:'https://example.com/v1',models:[{id:'gpt-test'}],
+        agents:{claude:{baseUrl:'https://example.com/anthropic',api:'anthropic-messages',models:[{id:'claude-test'}]},
+                codex:{baseUrl:'https://example.com/v1',api:'openai-responses',models:[{id:'gpt-test'}]}}},
+      claudeOnly: {name:'Claude Plan',enabled:true,baseUrl:'',anthropicBaseUrl:'https://example.com/anthropic',targets:['claude'],models:[{id:'claude-test'}]},
+      chatOnly: {name:'Chat Plan',enabled:true,baseUrl:'https://example.com/v1',api:'openai-completions',models:[{id:'chat-test'}]}
+    };
+    state.status.agentCapable = {pi:['gateway','chatOnly'],dsh:['gateway','chatOnly'],claude:['gateway','claudeOnly'],codex:['gateway']};`);
+    const claude = run(`providerSelect('clients','claude','','')`);
+    assert.match(claude, /value="claudeOnly"/);
+    assert.doesNotMatch(claude, /value="chatOnly"/);
+    const codex = run(`providerSelect('clients','codex','','')`);
+    assert.match(codex, /value="gateway"/);
+    assert.doesNotMatch(codex, /value="claudeOnly"|value="chatOnly"/);
+  });
+  await test('switching global supplier clears a model absent from the new supplier', () => {
+    run(`state.modelSync={modelSync:{default:{provider:'gateway',model:'gpt-test'}},resolved:{},options:{},optionsByTarget:{}};
+      state.modelSyncDraft=null;state.modelSyncDraftKey='';ensureModelSyncDraft()`);
+    listeners.get('change')({target:{id:'ms-default-provider',value:'chatOnly',dataset:{msProvider:'',scope:'default',target:'default'},classList:{contains:()=>false}}});
+    assert.equal(run('state.modelSyncDraft.default.provider'), 'chatOnly');
+    assert.equal(run('state.modelSyncDraft.default.model'), undefined);
+    assert.equal(run(`modelChoices('chatOnly').includes('gpt-test')`), false);
   });
   console.log(`PASS ${passed} UI contract checks (DOM stub; no browser layout assertion)`);
 })().catch(error => { console.error(error); process.exitCode=1; });

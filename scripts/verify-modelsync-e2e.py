@@ -25,6 +25,7 @@ CLONE = [
     ".dsh/settings.yaml.imported",
     ".dsh/profiles/desktop/cordis.patch.yml",
     ".claude/settings.json",
+    ".codex/config.toml",
 ]
 failures: list[str] = []
 notes: list[str] = []
@@ -51,6 +52,16 @@ def clone_home(root: Path) -> None:
 def main() -> int:
     cfg = json.loads((ROOT / "providers.json").read_text(encoding="utf-8"))
     providers = cfg["providers"]
+    # cc-switch 的 SQLite 库不能原子替换，安全预览会整组拒绝；这里显式排除它，
+    # 只验证 pi / dsh / claude / codex 这些文件型目标。
+    # mcode / zcode / omp 是保留的旧版目标：本机没装对应客户端时适配器会因找不到
+    # 配置文件而失败，同样先排除，避免掩盖真正要验证的目标。
+    for legacy in ("cc-switch", "mcode", "zcode", "omp"):
+        entry = (cfg.get("sync", {}).get("targets", {}).get(legacy) or {})
+        if entry.get("enabled"):
+            cfg["sync"]["targets"][legacy] = dict(entry, enabled=False)
+            print(f"已排除 {legacy}（旧版目标，不参与本次端到端验证）")
+    print()
     enabled = [pid for pid, p in providers.items()
                if p.get("enabled", True) and p.get("models") and not p.get("targets")]
     if not enabled:
@@ -61,9 +72,50 @@ def main() -> int:
     cfg["modelSync"] = {"default": {"provider": pid, "model": model, "reasoningEffort": "high"}}
     print(f"验证用模型: {pid} / {model}\n")
 
+    # Codex 首次第三方切换前必须处于官方 provider（Hub 不覆盖外部线路）；
+    # 本机可能已是第三方线路，所以整体同步先用官方模式，第三方切换在下面单独验证。
+    codex_target = cfg["sync"]["targets"].setdefault("codex", {})
+    if codex_target.get("mode") == "third-party":
+        codex_target["mode"] = "official"
+        print("Codex 先用官方模式参与整体同步（首次第三方切换需官方基线）\n")
+
+    def first_model(source) -> str | None:
+        return next((m["id"] for m in (source or []) if isinstance(m, dict) and m.get("id")), None)
+
+    # 按 Agent 覆盖：Codex 第三方只接受 Responses 连接，Claude Code 只接受
+    # Anthropic 连接。默认供应商不满足时，给这两个平台各配一个就绪的连接，
+    # 让一次 push_all 同时覆盖四种客户端。
+    codex_pid = next((name for name, p in providers.items()
+                      if p.get("enabled", True) and engine.agent_connection_ready(p, "codex")
+                      and first_model(engine.agent_connection(p, "codex")["models"])), None)
+    claude_pid = next((name for name, p in providers.items()
+                       if p.get("enabled", True) and name != pid
+                       and engine.agent_connection_ready(p, "claude")
+                       and (first_model(engine.agent_connection(p, "claude")["models"])
+                            or first_model(p.get("models")))), None)
+    overrides = {}
+    if codex_pid:
+        overrides["codex"] = {"provider": codex_pid,
+                              "model": first_model(engine.agent_connection(providers[codex_pid], "codex")["models"]),
+                              "reasoningEffort": "high"}
+    if claude_pid:
+        overrides["claude"] = {"provider": claude_pid,
+                               "model": first_model(engine.agent_connection(providers[claude_pid], "claude")["models"])
+                               or first_model(providers[claude_pid].get("models"))}
+    if overrides:
+        cfg["modelSync"]["overrides"] = overrides
+        print(f"按 Agent 覆盖: {', '.join(f'{k}={v['provider']}/{v['model']}' for k, v in overrides.items())}\n")
+
     with tempfile.TemporaryDirectory(prefix="agent-hub-e2e-") as tmp:
         root = Path(tmp)
         clone_home(root)
+        # 首次切换 / 恢复官方都要求 Codex 处于官方基线；本机可能已是第三方线路，
+        # 这时用一份合成的官方配置继续验证（真实配置一个字节都不会被改动）。
+        codex_cfg = root / ".codex" / "config.toml"
+        if codex_cfg.exists() and "model_provider" in codex_cfg.read_text(encoding="utf-8"):
+            codex_cfg.write_text('model = "official-model"\nmodel_reasoning_effort = "high"\n',
+                                 encoding="utf-8")
+            print("Codex 现有配置不是官方基线，已替换为合成官方配置（仅临时副本）\n")
         hub_dir = root / ".agent-hub"
         hub_dir.mkdir()
         hub_config = hub_dir / "providers.json"
@@ -136,6 +188,48 @@ def main() -> int:
         else:
             notes.append(f"  --   Claude ANTHROPIC_MODEL = {claude['env'].get('ANTHROPIC_MODEL')}"
                          f"（全局是 {pid}/{model}，供应商不匹配时保持原样，符合设计）")
+        # 按 Agent 覆盖：Claude 连接自带端点与密钥，切到另一家时整套换掉
+        claude_pid = next((name for name, p in providers.items()
+                           if p.get("enabled", True) and engine.agent_connection_ready(p, "claude")
+                           and name != pid), None)
+        if claude_pid:
+            conn = engine.agent_connection(providers[claude_pid], "claude")
+            claude_model = next((m["id"] for m in conn["models"]), None) or \
+                next((m["id"] for m in providers[claude_pid].get("models", [])), None)
+            cfg["modelSync"]["overrides"] = {"claude": {"provider": claude_pid, "model": claude_model}}
+            hub_config.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            hub = engine.Hub()
+            hub.push_claude()
+            claude = json.loads((root / ".claude/settings.json").read_text(encoding="utf-8"))
+            check(claude["env"].get("ANTHROPIC_BASE_URL") == conn["baseUrl"],
+                  f"Claude 连接使用 {claude_pid} 自己的 Anthropic 端点")
+            check(claude["env"].get("ANTHROPIC_AUTH_TOKEN") == conn["apiKey"],
+                  f"Claude 连接使用 {claude_pid} 自己的密钥")
+            check(claude["env"].get("ANTHROPIC_MODEL") == claude_model,
+                  f"Claude 主模型跟随 modelSync 覆盖（{claude_pid}/{claude_model}）")
+            # 同一供应商给 Codex 的另一个 key：Codex 连接单独生效
+            codex_pid = next((name for name, p in providers.items()
+                              if engine.agent_connection_ready(p, "codex")
+                              and any(m["id"] for m in engine.agent_connection(p, "codex")["models"])), None)
+            if codex_pid:
+                codex_conn = engine.agent_connection(providers[codex_pid], "codex")
+                codex_model = next(m["id"] for m in codex_conn["models"])
+                cfg["modelSync"]["overrides"]["codex"] = {"provider": codex_pid, "model": codex_model,
+                                                          "reasoningEffort": "high"}
+                hub_config.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                codex_cfg = root / ".codex" / "config.toml"
+                codex_cfg.parent.mkdir(parents=True, exist_ok=True)
+                codex_cfg.write_text('model = "official-model"\n', encoding="utf-8")
+                cfg["sync"]["targets"]["codex"] = {"enabled": True, "mode": "third-party"}
+                hub_config.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                hub = engine.Hub()
+                hub.push_codex()
+                text = codex_cfg.read_text(encoding="utf-8")
+                check(f'model = "{codex_model}"' in text, f"Codex 第三方写入 {codex_pid} 连接上的模型")
+                check(f'base_url = "{codex_conn["baseUrl"]}"' in text, "Codex 第三方使用该连接的端点")
+                check("requires_openai_auth = false" in text, "Codex 第三方不借用 ChatGPT 凭据")
+        else:
+            notes.append("  --   没有第二个可用的 Claude 连接，跳过按 Agent 覆盖验证")
 
     print("检查项:")
     print("\n".join(notes))

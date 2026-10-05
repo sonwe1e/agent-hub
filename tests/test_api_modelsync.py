@@ -10,7 +10,7 @@ from http.server import ThreadingHTTPServer
 
 from support import isolated, engine, server
 
-EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 
 def entry(pid="deepseek", model="deepseek/model-3", effort="high"):
@@ -256,10 +256,10 @@ class ModelSyncAPITests(unittest.TestCase):
     def test_warning_also_covers_override_and_tier(self):
         result = self.put({"default": entry(),
                            "overrides": {"claude": {"provider": "deepseek", "model": "deepseek/model-1",
-                                                    "tiers": {"opus": entry("openrouter", "openrouter/custom")}}}})
+                                                    "tiers": {"opus": entry("deepseek", "deepseek/custom")}}}})
         self.assertEqual(len(result["warnings"]), 1)
         self.assertIn("modelSync.overrides.claude.tiers.opus", result["warnings"][0])
-        self.assertIn("openrouter/custom", result["warnings"][0])
+        self.assertIn("deepseek/custom", result["warnings"][0])
         self.assertFalse(server.api_modelsync()["tiers"]["claude"]["opus"]["known"])
 
     # -- Claude 档位 --
@@ -267,8 +267,8 @@ class ModelSyncAPITests(unittest.TestCase):
         block = {"default": entry(),
                  "overrides": {"claude": {
                      "provider": "deepseek", "model": "deepseek/model-1",
-                     "tiers": {"opus": {"provider": "openrouter", "model": "openrouter/model-3"},
-                               "haiku": entry("stepfun", "stepfun/model-2", "low"),
+                     "tiers": {"opus": {"provider": "deepseek", "model": "deepseek/model-3"},
+                               "haiku": entry("deepseek", "deepseek/model-2", "low"),
                                # fable 是历史档位：必须能存回去，也参与解析，避免老配置漂移
                                "fable": entry("deepseek", "deepseek/model-1", None)}}}}
         result = self.put(block)
@@ -286,9 +286,9 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertNotIn("agent", tiers)
         self.assertNotIn("fable", tiers)
         self.assertTrue({"model", "opus", "haiku"} <= set(tiers))
-        self.assertEqual(tiers["opus"], {"provider": "openrouter", "model": "openrouter/model-3",
+        self.assertEqual(tiers["opus"], {"provider": "deepseek", "model": "deepseek/model-3",
                                          "reasoningEffort": None, "tier": "opus", "known": True})
-        self.assertEqual(tiers["haiku"], {"provider": "stepfun", "model": "stepfun/model-2",
+        self.assertEqual(tiers["haiku"], {"provider": "deepseek", "model": "deepseek/model-2",
                                           "reasoningEffort": "low", "tier": "haiku", "known": True})
         # 适配器视图里 fable 仍然可用：写进去的档位不能被解析层吞掉
         internal = engine.agent_model_tiers(self.config(), "claude")
@@ -382,10 +382,13 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(status["modelSyncResolved"]["codex"]["provider"], "deepseek")
         self.assertEqual(status["modelSyncResolved"]["codex"]["model"], "deepseek/model-3")
         # 写入后 status 立刻反映新配置。Claude 需要显式覆盖，而且覆盖里的供应商
-        # 必须是「可用的 Anthropic 供应商」——这里给 openrouter 补上 Anthropic 端点，
+        # 必须有 Claude 连接——这里给 openrouter 补上 Anthropic 连接，
         # 否则解析层会判定 Claude 仍由 deepseek 提供。
         cfg = self.config()
-        cfg["providers"]["openrouter"]["anthropicBaseUrl"] = "https://openrouter.ai/api"
+        cfg["providers"]["openrouter"]["agents"] = {
+            "codex": {"api": "openai-responses"},
+            "claude": {"baseUrl": "https://openrouter.ai/api", "api": "anthropic-messages"},
+        }
         engine.save_json(server.HUB_CONFIG, cfg)
         self.put({"default": entry("openrouter", "openrouter/model-6", "max"),
                   "overrides": {"claude": entry("openrouter", "openrouter/model-6", "max")}})
@@ -394,6 +397,14 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(status["modelSyncResolved"]["pi"]["model"], "openrouter/model-6")
         self.assertEqual(status["modelSyncResolved"]["claude"]["model"], "openrouter/model-6")
         self.assertEqual(status["modelSyncResolved"]["claude"]["reasoningEffort"], "max")
+        # 每个 Agent 各自可用的供应商按连接就绪度给出
+        self.assertEqual(status["agentCapable"]["claude"], ["deepseek", "openrouter"])
+        self.assertEqual(status["agentCapable"]["codex"], ["deepseek", "openrouter"])
+        self.assertEqual(status["agentCapable"]["pi"], ["deepseek", "stepfun", "openrouter", "firework"])
+        # 连接概况：未声明 Claude 连接的供应商显示未就绪
+        self.assertTrue(status["connections"]["deepseek"]["claude"]["ready"])
+        self.assertFalse(status["connections"]["stepfun"]["claude"]["ready"])
+        self.assertNotIn("anthropicBaseUrl", status["connections"]["deepseek"]["claude"])
 
     # -- HTTP 层 --
     def test_http_modelsync_get_and_put(self):

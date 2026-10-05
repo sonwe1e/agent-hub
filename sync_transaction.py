@@ -226,11 +226,113 @@ def _yaml_subset(text: str) -> Any:
         parts.append(value[start:].strip())
         return parts
 
+    escapes = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r",
+               "b": "\b", "f": "\f", "0": "\0", "a": "\a", "v": "\v", "e": "\x1b", " ": " "}
+
+    def unquote(raw: str) -> str:
+        """去掉引号并按需反转义，语义与 hub.yaml_unquote 完全一致。
+
+        双引号走 JSON 风格转义（写入端 json.dumps 的产物）；单引号在 YAML 里
+        没有转义，内容原样（Windows 路径 'C:\\Program Files\\...' 因此可读）。
+        """
+        if len(raw) < 2 or raw[-1] != raw[0] or raw[0] not in "\"'":
+            raise ValueError("Unsupported quoted YAML scalar")
+        body = raw[1:-1]
+        if raw[0] == "'":
+            if "'" in body:
+                raise ValueError("Unsupported quoted YAML scalar")
+            return body
+        out, index = [], 0
+        while index < len(body):
+            char = body[index]
+            if char == '"':
+                raise ValueError("Unsupported quoted YAML scalar")
+            if char == "\\":
+                index += 1
+                if index >= len(body):
+                    raise ValueError("Unsupported quoted YAML scalar")
+                esc = body[index]
+                if esc == "u":
+                    digits = body[index + 1:index + 5]
+                    if len(digits) != 4 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                        raise ValueError("Unsupported quoted YAML scalar")
+                    out.append(chr(int(digits, 16)))
+                    index += 5
+                    continue
+                if esc not in escapes:
+                    raise ValueError("Unsupported quoted YAML scalar")
+                out.append(escapes[esc])
+                index += 1
+                continue
+            out.append(char)
+            index += 1
+        return "".join(out)
+
+    # 键名：带引号的键（'...' / "..."，无转义）或裸键。裸键允许模型 ID 这类
+    # 含 [ ] / 的标识，也允许 off / on / true 这类词（工具自己的适配器就把
+    # reasoningEfforts 的 "off" 写成键；键一律按字符串处理，与宽松解析器一致）。
+    # 含 ": "、以指示符开头的键必须加引号，否则不同解析器会读出不同类型。
+    bare_key = re.compile(r"[^\s:#]+\Z")
+    key_indicators = "-?:,[]{}&*!|>'\"%@`"
+
     def mapping_pair(value):
-        match = re.fullmatch(r"([\w./-]+):(?:\s+(.*))?", value)
+        if value[0] in "\"'":
+            quote = value[0]
+            # 双引号键用的是写入端 json.dumps 的转义：扫结束引号时必须跳过
+            # `\"` / `\\`，否则键 `\` 会被读成结束引号，键和值一起读坏。
+            end = -1
+            index = 1
+            while index < len(value):
+                char = value[index]
+                if quote == '"' and char == "\\":
+                    index += 2
+                    continue
+                if char == quote:
+                    end = index
+                    break
+                index += 1
+            if end < 1:
+                raise ValueError("Unsupported quoted YAML key")
+            if quote == "'":
+                if "'" in value[1:end] or "\\" in value[1:end]:
+                    raise ValueError("Unsupported quoted YAML key")
+                key = value[1:end]
+            else:
+                key = unquote(value[:end + 1])
+            rest = value[end + 1:]
+            if not rest.startswith(":") or (len(rest) > 1 and rest[1] not in " \t"):
+                raise ValueError("Unsupported YAML mapping key")
+            return key, rest[2:].strip() if len(rest) > 1 else ""
+        match = re.fullmatch(r"([^\s:#]+):(?:\s+(.*))?", value)
         if not match:
             raise ValueError("Unsupported YAML mapping key")
-        return match.group(1), match.group(2) or ""
+        key = match.group(1)
+        if key[0] in key_indicators:
+            raise ValueError("Unsupported YAML mapping key")
+        return key, match.group(2) or ""
+
+    def list_item_is_mapping(content: str) -> bool:
+        """`- ` 后面到底是「映射的第一个键」还是普通列表项。
+
+        先走原来那条严格的裸键快路径，保持既有判定完全不变；只有它不匹配时才
+        用 mapping_pair 试一次，用来认出带引号的键（`- "a:b": {k: v}`）。
+        """
+        if re.match(r"[\w./-]+:(?:\s|$)", content):
+            return True
+        if content[:1] not in "\"'":
+            return False
+        try:
+            mapping_pair(content)
+        except ValueError:
+            return False
+        return True
+
+    # 纯数字 / 浮点 / 进制 / 六十进制前缀的裸标量必须显式加引号：不加引号时
+    # YAML 解析器会把它读成数值，静默改变类型。以数字开头但解析不成数值的
+    # （例如 UUID 形态的密钥 "3fa85f64-..." ）按规范就是字符串，可以裸写。
+    int_like = re.compile(r"[-+]?(0b[0-1_]+|0x[0-9a-fA-F_]+|0o[0-7_]+|[0-9][0-9_]*)\Z")
+    float_like = re.compile(r"[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?\Z")
+    sexagesimal = re.compile(r"[-+]?[0-9][0-9_]*(:[0-5]?[0-9])+\Z")
 
     def scalar(value):
         if not value or value in ("null", "Null", "NULL", "~"):
@@ -251,20 +353,39 @@ def _yaml_subset(text: str) -> Any:
                 result[key] = scalar(val)
             return result
         if value[0] in "\"'":
-            if len(value) < 2 or value[-1] != value[0] or "\\" in value or value[0] in value[1:-1]:
+            if len(value) < 2 or value[-1] != value[0]:
                 raise ValueError("Unsupported quoted YAML scalar")
-            return value[1:-1]
+            text = unquote(value)
+            # 写入端把「裸写会被本校验器拒绝」的数字形态（负数、科学计数法、
+            # inf / nan）加引号写出，这里必须用同一套规则还原类型，否则
+            # parse_yaml 与 _yaml_subset 会分别得到 -1 和 "-1"，校验必然失败。
+            native = sys.modules.get("hub")
+            restore = getattr(native, "_repr_quoted_number", None) if native is not None else None
+            coerce = getattr(native, "_numeric", None) if native is not None else None
+            if restore is not None and coerce is not None and restore(text):
+                return coerce(text)
+            return text
         if any(c in value for c in "[]{}&#*!|>'\"%@`") or re.search(r":(?:\s|$)", value):
             raise ValueError("Unsupported YAML scalar")
         if value.lower() in ("true", "false"):
             return value.lower() == "true"
+        if value[0] in "-+?." or value.lower() in ("yes", "no", "on", "off"):
+            raise ValueError("Ambiguous YAML scalar")
+        if value[0].isdigit():
+            # 数字开头：整数 / 小数按数值读取；进制、科学计数法、六十进制这类
+            # 形态必须显式加引号；其余（例如 UUID 形态的密钥 "3fa85f64-..."）
+            # 按 YAML 规范就是字符串，可以裸写。
+            if re.fullmatch(r"0|[1-9]\d*", value):
+                return int(value)
+            if re.fullmatch(r"(0|[1-9]\d*)\.\d+", value):
+                return float(value)
+            if int_like.fullmatch(value) or float_like.fullmatch(value) or sexagesimal.fullmatch(value):
+                raise ValueError("Ambiguous YAML scalar")
+            return value
         if re.fullmatch(r"-?(?:0|[1-9]\d*)", value):
             return int(value)
         if re.fullmatch(r"-?(?:0|[1-9]\d*)\.\d+", value):
             return float(value)
-        if (value.lower() in ("yes", "no", "on", "off") or value[0] in "-+?.:" or
-                re.match(r"\d", value)):
-            raise ValueError("Ambiguous YAML scalar")
         return value
 
     tokens = []
@@ -277,7 +398,7 @@ def _yaml_subset(text: str) -> Any:
         if indent % 2:
             raise ValueError("YAML must use two-space indentation")
         body = line[indent:]
-        if body.startswith("- ") and re.match(r"[\w./-]+:(?:\s|$)", body[2:]):
+        if body.startswith("- ") and list_item_is_mapping(body[2:]):
             tokens.extend(((indent, "-"), (indent + 2, body[2:])))
         else:
             tokens.append((indent, body))

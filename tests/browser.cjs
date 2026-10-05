@@ -36,8 +36,10 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     const go = async hash => { await page.locator(`nav a[href="#${hash}"]`).click(); await main.locator('h1').filter({ hasText: ({ models: '模型库', providers: '供应商', sync: '平台同步' })[hash] }).waitFor(); };
     const confirm = async label => { await page.locator('#confirm-dialog').waitFor({ state: 'visible' }); await page.locator('#confirm-ok').click(); await page.waitForFunction(() => !document.body.classList.contains('busy')); };
 
-    await step('initial model library and desktop layout', async () => {
+    await step('initial sync workspace and model library layout', async () => {
       await page.goto(url);
+      await main.locator('h1').filter({ hasText: '平台同步' }).waitFor();
+      await go('models');
       await main.locator('h1').filter({ hasText: '模型库' }).waitFor();
       assert.equal(await page.locator('#nav-model-count').textContent(), '28');
       assert.equal(await page.locator('#model-rows tr').count(), 20);
@@ -91,6 +93,8 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     });
     await step('add and configure supplier without changing its models', async () => {
       await main.locator('[data-action="add-provider"]').click();
+      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['pi', 'dsh', 'claude', 'codex']);
+      assert.equal(await dialog.locator('[name=allTargets]').isChecked(), false);
       await dialog.locator('[name=id]').fill('new-provider');
       await dialog.locator('[name=displayName]').fill('New Provider');
       await dialog.locator('[name=baseUrl]').fill('https://example.com/v1');
@@ -98,6 +102,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await submit.click();
       await waitSaved();
       assert.equal(Object.keys(await config()).length, 5);
+      assert.deepEqual((await config())['new-provider'].targets, ['pi', 'dsh', 'claude', 'codex']);
       await go('providers');
       await main.locator('[data-action="edit-provider"][data-pid="deepseek"]').click();
       await dialog.locator('[name=displayName]').fill('DeepSeek Updated');
@@ -105,6 +110,27 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await waitSaved();
       assert.equal((await config()).deepseek.models.length, 8);
       await page.screenshot({ path: path.join(artifacts, 'providers-desktop.png'), fullPage: true });
+    });
+    await step('Claude-only endpoint is configured as a Claude connection', async () => {
+      await main.locator('[data-action="add-provider"]').first().click();
+      await dialog.locator('[name=id]').fill('claude-plan');
+      await dialog.locator('[name=displayName]').fill('Claude Plan');
+      // 「按 Agent 覆盖」默认展开，每个 Agent 的连接是一个可折叠小节
+      await dialog.locator('summary').filter({ hasText: 'Claude Code 连接' }).click();
+      await dialog.locator('[name="agent-claude-baseUrl"]').fill('https://example.com/anthropic');
+      await dialog.locator('[name="agent-claude-apiKey"]').fill('test-only-key');
+      await submit.click();
+      await waitSaved();
+      const plan = (await config())['claude-plan'];
+      assert.equal(plan.baseUrl, '');
+      assert.equal(plan.agents.claude.baseUrl, 'https://example.com/anthropic');
+      assert.equal(plan.agents.claude.apiKey, 'test-only-key');
+      // 只有 Claude 连接就绪：pi / dsh / codex 不会写入这家供应商
+      const status = await (await page.request.get(`${url}/api/status`)).json();
+      assert.ok(status.agentCapable.claude.includes('claude-plan'));
+      assert.ok(!status.agentCapable.pi.includes('claude-plan'));
+      assert.ok(!status.agentCapable.codex.includes('claude-plan'));
+      assert.equal(status.connections['claude-plan'].claude.ready, true);
     });
     await step('discovery explicit selection and non-destructive import', async () => {
       await main.locator('[data-action="discover"][data-pid="deepseek"]').click();

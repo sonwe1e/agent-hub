@@ -28,7 +28,10 @@ def apply(h, plan_id):
 
 
 
-def discover(_provider):
+def discover(_provider, agent=None):
+    """按连接返回不同的模型列表：不同 Key 拉到的模型集合可以不同。"""
+    if agent == "claude":
+        return [{"id": "claude-plan/model-1", "name": "Claude plan model"}]
     return [{"id": "deepseek/model-1", "name": "Existing model"},
             {"id": "vendor/new-model", "name": "New vision model", "input": ["text", "image"]},
             {"id": "vendor/another-new", "name": "Another new model"}]

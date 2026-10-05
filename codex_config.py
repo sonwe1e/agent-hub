@@ -73,6 +73,17 @@ def compile_config(text, saved, mode, provider=None, selection=None):
     if active:
         if before.get("model_provider") != PROVIDER_ID or fingerprint(existing) != saved.get("providerHash"):
             raise ValueError("Codex 托管 provider 已在外部更改；请检查后重新选择，未覆盖外部编辑")
+        if "managed" in saved:
+            managed = saved["managed"]
+            if (not isinstance(managed, dict) or set(managed) != set(FIELDS) or
+                    any(not isinstance(entry, dict) or not isinstance(entry.get("present"), bool) or
+                        (entry["present"] and not isinstance(entry.get("value"), str))
+                        for entry in managed.values())):
+                raise ValueError("Codex 托管字段记录无效，请先检查备份")
+            if any((key in before) != entry["present"] or
+                   (entry["present"] and before[key] != entry["value"])
+                   for key, entry in managed.items()):
+                raise ValueError("Codex 托管的 model/provider/effort 已在外部更改；未覆盖外部编辑")
         original = saved.get("official")
         if not isinstance(original, dict) or set(original) != set(FIELDS):
             raise ValueError("Codex 官方恢复快照不完整")
@@ -134,8 +145,9 @@ def compile_config(text, saved, mode, provider=None, selection=None):
         effort = selection.get("reasoningEffort")
         if effort == "off":
             effort = "none"  # Global legacy vocabulary; Codex uses none.
-        if effort is not None and effort not in ("none", "minimal", "low", "medium", "high", "xhigh"):
-            raise ValueError("Codex reasoningEffort 仅支持 none/minimal/low/medium/high/xhigh；全局 max 请用 Codex 单独覆盖")
+        if effort is not None and effort not in ("none", "minimal", "low", "medium", "high",
+                                                 "xhigh", "max", "ultra"):
+            raise ValueError("Codex reasoningEffort 仅支持 none/minimal/low/medium/high/xhigh/max/ultra")
         block = {"name": provider.get("displayName") or provider.get("name") or PROVIDER_ID,
                  "base_url": base, "wire_api": "responses", "requires_openai_auth": False, **auth}
         for key, value in zip(FIELDS, (PROVIDER_ID, model, effort)):
@@ -150,6 +162,7 @@ def compile_config(text, saved, mode, provider=None, selection=None):
         lines += [f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in block.items()]
         expected.setdefault("model_providers", {})[PROVIDER_ID] = block
         next_state = {"version": 1, "active": True, "official": original, "providerHash": fingerprint(block),
+                      "managed": {key: {"present": key in expected, "value": expected.get(key)} for key in FIELDS},
                       "officialProviderTablePresent": saved.get("officialProviderTablePresent", False) if active else "model_providers" in before}
     result = "\n".join(lines) + "\n"
     try:

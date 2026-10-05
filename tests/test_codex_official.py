@@ -82,6 +82,36 @@ class CodexRoundTripTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"外部"):
             compile_config(third.replace("fixture.example","external.example"),state,"official")
 
+    def test_external_managed_root_edits_are_rejected(self):
+        third, state = compile_config(BASE,None,"third-party",PROVIDER,SELECTION)
+        for changed in (third.replace('model = "third-party-model"', 'model = "manual-model"'),
+                        third.replace('model_reasoning_effort = "high"', 'model_reasoning_effort = "low"'),
+                        third.replace('model_reasoning_effort = "high"\n', '')):
+            with self.subTest(changed=changed), self.assertRaisesRegex(ValueError,"外部"):
+                compile_config(changed,state,"official")
+        # Unmanaged native fields remain editable during a Hub-managed cycle.
+        changed = third.replace('notify = ["my-hook"]', 'notify = ["new-hook"]')
+        restored, _ = compile_config(changed,state,"official")
+        self.assertEqual(tomllib.loads(restored)["notify"], ["new-hook"])
+        without_effort, state = compile_config(BASE,None,"third-party",PROVIDER,{"model":"third-party-model"})
+        with self.assertRaisesRegex(ValueError,"外部"):
+            compile_config('model_reasoning_effort = "low"\n'+without_effort,state,"official")
+
+    def test_invalid_managed_root_record_is_rejected(self):
+        third, state = compile_config(BASE,None,"third-party",PROVIDER,SELECTION)
+        state["managed"] = None
+        with self.assertRaisesRegex(ValueError,"记录无效"):
+            compile_config(third,state,"official")
+
+    def test_legacy_active_state_upgrades_on_next_third_party_sync(self):
+        third, state = compile_config(BASE,None,"third-party",PROVIDER,SELECTION)
+        state.pop("managed")
+        updated, state = compile_config(third,state,"third-party",PROVIDER,SELECTION)
+        self.assertEqual(updated,third)
+        self.assertIn("managed",state)
+        with self.assertRaisesRegex(ValueError,"外部"):
+            compile_config(third.replace('model = "third-party-model"', 'model = "manual-model"'),state,"official")
+
     def test_invalid_toml_and_complex_multiline_fail_closed(self):
         for text in ('model = [', 'model = """a\nb"""\n'):
             with self.subTest(text=text), self.assertRaises(ValueError):

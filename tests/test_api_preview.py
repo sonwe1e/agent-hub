@@ -22,6 +22,16 @@ class PreviewContractTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.api_preview({'targets': ['pi']})
 
+    def test_cc_switch_is_not_offered_as_transactional_sync_target(self):
+        cfg = self.config()
+        cfg['sync']['targets']['cc-switch']['enabled'] = True
+        engine.save_json(server.HUB_CONFIG, cfg)
+        self.assertFalse(server.api_status()['targets']['cc-switch']['supported'])
+        with self.assertRaises(ValueError):
+            server.api_preview({'targets': ['cc-switch']})
+        with self.assertRaises(ValueError):
+            server.api_update_targets({'targets': {'cc-switch': {'enabled': True}}})
+
     def test_codex_mode_is_explicit_and_invalid_mode_is_atomic(self):
         before = server.HUB_CONFIG.read_bytes()
         for target, mode in [('codex', 'custom'), ('pi', 'third-party'), ('codex', True)]:
@@ -54,11 +64,20 @@ class PreviewContractTests(unittest.TestCase):
         entry = {'provider': 'deepseek', 'model': 'deepseek/model-1', 'reasoningEffort': 'none'}
         result = server.api_update_modelsync({'modelSync': {'overrides': {'codex': entry}}})
         self.assertEqual(result['modelSync']['overrides']['codex']['reasoningEffort'], 'none')
+        # Codex 线路放开 max / ultra；其它客户端用的是全局词表（含 off，不含 none）
+        for effort in ('max', 'ultra'):
+            with self.subTest(effort=effort):
+                server.api_update_modelsync({'modelSync': {
+                    'overrides': {'codex': {**entry, 'reasoningEffort': effort}}}})
         before = server.HUB_CONFIG.read_bytes()
-        for invalid in ['off', 'max']:
+        for invalid in ['off', 'turbo', 'nope']:
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 server.api_update_modelsync({'modelSync': {'overrides': {'codex': {**entry, 'reasoningEffort': invalid}}}})
             self.assertEqual(before, server.HUB_CONFIG.read_bytes())
+        # 全局词表相反：接受 off / ultra，拒绝 none
+        server.api_update_modelsync({'modelSync': {'default': {**entry, 'reasoningEffort': 'ultra'}}})
+        with self.assertRaises(ValueError):
+            server.api_update_modelsync({'modelSync': {'default': {**entry, 'reasoningEffort': 'none'}}})
 
     def test_preview_is_metadata_only_and_does_not_apply(self):
         before = server.HUB_CONFIG.read_bytes()

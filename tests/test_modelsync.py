@@ -56,6 +56,32 @@ class TierResolutionTests(unittest.TestCase):
         self.assertEqual(resolved["reasoningEffort"], "high")
         self.assertEqual(resolved["tier"], "model")
 
+    def test_claude_only_default_does_not_resolve_for_pi_or_dsh(self):
+        self.cfg["providers"]["claude-only"] = {
+            "name": "Claude only", "baseUrl": "", "apiKey": "sk-test",
+            "anthropicBaseUrl": "https://gateway.example/anthropic",
+            "targets": ["claude"], "enabled": True,
+            "models": [{"id": "claude-model"}],
+        }
+        self.cfg["modelSync"] = {"default": entry("claude-only", "claude-model")}
+        for target in ("pi", "dsh", "dsh-desktop", "codex"):
+            with self.subTest(target=target):
+                self.assertIsNone(engine.resolve_agent_model(self.cfg, target))
+        self.assertEqual(engine.resolve_agent_model(self.cfg, "claude")["provider"],
+                         "claude-only")
+
+    def test_claude_provider_without_connection_is_skipped(self):
+        """modelSync 指向的供应商没有 Claude 连接时，Claude Code 不被写入。"""
+        self.cfg["providers"]["claude-only"] = {
+            "name": "Claude only", "baseUrl": "", "apiKey": "sk-test",
+            "anthropicBaseUrl": "https://gateway.example/anthropic",
+            "targets": ["claude"], "enabled": True,
+            "models": [{"id": "claude-model"}],
+        }
+        self.cfg["modelSync"] = {"default": entry("stepfun", "stepfun/model-1")}
+        self.assertIsNone(engine.resolve_agent_model(self.cfg, "claude"))
+        self.assertEqual(engine.agent_model_tiers(self.cfg, "claude"), {})
+
     def test_global_default_does_not_move_claude_secondary_tiers(self):
         """一个全局设置不该顺手改掉 Claude Code 的 opus / haiku / subagent 档位。"""
         # 全局选的就是当前 Claude 供应商（fixture 的 activeProvider = deepseek）
@@ -67,29 +93,72 @@ class TierResolutionTests(unittest.TestCase):
         self.assertNotIn("subagent", tiers)
         self.assertNotIn("fable", tiers)
 
-    def test_explicit_tiers_beat_legacy_claude_models(self):
-        self.cfg["providers"]["deepseek"]["claudeModels"] = {
-            "model": "legacy-model", "opus": "legacy-opus", "haiku": "legacy-haiku",
-        }
-        self.cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
-        self.cfg["modelSync"] = {"default": entry(),
-                                 "overrides": {"claude": {
-                                     "provider": "deepseek", "model": "deepseek/model-1",
-                                     "tiers": {"opus": entry("openrouter", "openrouter/model-3")}}}}
+    def test_explicit_tiers_are_written_and_unset_tiers_stay_absent(self):
+        self.cfg["modelSync"] = {
+            "default": entry(),
+            "overrides": {"claude": {
+                "provider": "deepseek", "model": "deepseek/model-1",
+                "tiers": {"opus": entry("deepseek", "deepseek/model-3")}}}}
         tiers = self.tiers("claude")
-        self.assertEqual(tiers["opus"]["provider"], "openrouter")
-        self.assertEqual(tiers["opus"]["model"], "openrouter/model-3")
-        # 未显式覆盖的别名档位继续走旧 claudeModels
-        self.assertEqual(tiers["haiku"]["model"], "legacy-haiku")
-        # 主模型档位：全局选择的供应商 == 当前 Anthropic 供应商（都是 deepseek），
-        # 所以全局主模型接管，claudeModels.model 退居其次
+        self.assertEqual(tiers["opus"]["provider"], "deepseek")
+        self.assertEqual(tiers["opus"]["model"], "deepseek/model-3")
+        # 主模型档位跟随平台覆盖
+        self.assertEqual(tiers["model"]["model"], "deepseek/model-1")
+        # 未显式指定的别名档位不写：不替用户改 Claude Code 的配置
+        self.assertNotIn("haiku", tiers)
+        self.assertNotIn("subagent", tiers)
+        self.assertNotIn("fable", tiers)
+
+    def test_tier_provider_must_have_a_claude_connection(self):
+        """档位指向的供应商没有 Claude 连接时，该档位被忽略而不是写坏配置。"""
+        self.cfg["providers"]["pi-only"] = {
+            "name": "Pi only", "baseUrl": "https://gateway.example/v1",
+            "apiKey": "sk-test", "targets": ["pi"], "enabled": True,
+            "models": [{"id": "wrong-opus"}],
+        }
+        self.cfg["modelSync"] = {"overrides": {"claude": {
+            "provider": "deepseek", "model": "deepseek/model-1",
+            "tiers": {"opus": entry("pi-only", "wrong-opus")},
+        }}}
+        tiers = self.tiers("claude")
+        self.assertNotIn("opus", tiers)
+
+    def test_legacy_claude_models_are_no_longer_read(self):
+        """旧字段 claudeModels 不再参与解析（迁移命令负责搬进 modelSync）。"""
+        self.cfg["providers"]["deepseek"]["claudeModels"] = {"model": "legacy-model",
+                                                            "haiku": "legacy-haiku"}
+        self.cfg["modelSync"] = {"overrides": {"claude": {
+            "provider": "deepseek", "model": "deepseek/model-1"}}}
+        tiers = self.tiers("claude")
+        self.assertEqual(set(tiers), {"model"})
         self.assertEqual(tiers["model"]["model"], "deepseek/model-1")
 
-    def test_legacy_claude_models_only_from_active_provider(self):
-        """非活跃供应商的 claudeModels 不能污染当前档位（历史缺陷的根因）。"""
-        self.cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
-        self.cfg["providers"]["openrouter"]["claudeModels"] = {"haiku": "openrouter/haiku"}
-        self.assertNotIn("haiku", self.tiers("claude"))
+    def test_per_agent_models_catalogs_are_independent(self):
+        """同一供应商给不同 Agent 配不同 key 时，模型库按连接各自判断。"""
+        self.cfg["providers"]["tokenfree"] = {
+            "name": "TokenFree", "baseUrl": "https://gateway.example/v1",
+            "apiKey": "sk-openai", "api": "openai-completions", "enabled": True,
+            "models": [{"id": "gpt-6-astra"}],
+            "agents": {
+                "claude": {"baseUrl": "https://gateway.example/v1",
+                           "api": "anthropic-messages", "apiKey": "sk-anthropic",
+                           "models": [{"id": "claude-opus-5-5"}]},
+                "codex": {"baseUrl": "https://gateway.example/v1",
+                          "api": "openai-responses", "apiKey": "sk-codex",
+                          "models": [{"id": "gpt-6-astra"}]},
+            },
+        }
+        # 全局主模型在默认连接上，pi / codex 认它
+        self.cfg["modelSync"] = {"default": entry("tokenfree", "gpt-6-astra")}
+        self.assertTrue(engine.resolve_agent_model(self.cfg, "pi")["known"])
+        self.assertTrue(engine.resolve_agent_model(self.cfg, "codex")["known"])
+        # Claude 连接的模型库里没有 gpt-6-astra：跟随全局时会标记为手填值
+        claude = engine.resolve_agent_model(self.cfg, "claude")
+        self.assertEqual((claude["provider"], claude["model"]), ("tokenfree", "gpt-6-astra"))
+        self.assertFalse(claude["known"])
+        # 只有 Anthropic 连接里声明的模型对 Claude 是「已知」的
+        self.cfg["modelSync"] = {"overrides": {"claude": entry("tokenfree", "claude-opus-5-5")}}
+        self.assertTrue(engine.resolve_agent_model(self.cfg, "claude")["known"])
 
     def test_provider_agent_model_is_the_fallback_before_model_list(self):
         self.cfg["providers"]["deepseek"]["agentModel"] = "deepseek/model-6"
@@ -121,15 +190,15 @@ class TierResolutionTests(unittest.TestCase):
         self.cfg["modelSync"] = {"default": entry("deepseek", "hand-typed-model")}
         self.assertFalse(engine.resolve_agent_model(self.cfg, "pi")["known"])
 
-    def test_public_tier_view_hides_internal_tiers(self):
-        self.cfg["providers"]["deepseek"]["claudeModels"] = {"fable": "deepseek-flash",
-                                                             "model": "deepseek-v4-flash"}
-        self.cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
+    def test_public_tier_view_hides_historical_tiers(self):
+        self.cfg["modelSync"] = {"overrides": {"claude": {
+            "provider": "deepseek", "model": "deepseek/model-1",
+            "tiers": {"fable": entry("deepseek", "deepseek/model-2"),
+                      "opus": entry("deepseek", "deepseek/model-3")}}}}
         internal = engine.agent_model_tiers(self.cfg, "claude")
         public = engine.agent_model_tiers_public(self.cfg, "claude")
         self.assertIn("fable", internal)      # 适配器要靠它写/收回旧别名
         self.assertNotIn("fable", public)     # 界面不把它当目标档位
-        self.assertNotIn("agent", public)
 
 
 class PiModelSyncTests(unittest.TestCase):
@@ -177,7 +246,7 @@ class PiModelSyncTests(unittest.TestCase):
         """targets 限定 claude 的供应商不能被写成 pi 的默认 provider。"""
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         cfg["providers"]["tokenfree"] = {
-            "name": "TokenFree", "baseUrl": "https://api.tokenfree.shop",
+            "name": "TokenFree", "baseUrl": "",
             "anthropicBaseUrl": "https://api.tokenfree.shop", "apiKey": "sk-test",
             "api": "openai-completions", "enabled": True, "targets": ["claude"],
             "models": [{"id": "claude-opus-5-5", "name": "opus"}],
@@ -302,17 +371,16 @@ class DshModelSyncTests(unittest.TestCase):
     def test_dsh_target_restricted_provider_is_not_routed(self):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         cfg["providers"]["tokenfree"] = {
-            "name": "TokenFree", "baseUrl": "https://api.tokenfree.shop",
+            "name": "TokenFree", "baseUrl": "",
             "anthropicBaseUrl": "https://api.tokenfree.shop", "apiKey": "sk-test",
             "api": "openai-completions", "enabled": True, "targets": ["claude"],
             "models": [{"id": "claude-opus-5-5"}],
         }
         cfg["modelSync"] = {"default": entry("tokenfree", "claude-opus-5-5")}
         engine.save_json(server.HUB_CONFIG, cfg)
-        with self.assertRaises(ValueError) as ctx:
-            engine.Hub().push_dsh()
-        self.assertIn("tokenfree", str(ctx.exception))
-        # 失败的推送不能留下半套写入：模型选择必须还是用户原来的
+        engine.Hub().push_dsh()
+        self.assertNotIn("tokenfree", self.find("llm-pi-ai")["config"]["providers"])
+        # 全局默认值只适用于 Claude Code，dsh 保留用户原来的选择。
         self.assertEqual(self.find("agent-default-model")["config"]["provider"], "deepseek-account")
 
     def test_hand_typed_model_does_not_repoint_dsh(self):
@@ -349,13 +417,11 @@ class MultiAgentPushTests(unittest.TestCase):
 
     def test_one_choice_reaches_every_client(self):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["providers"]["deepseek"]["anthropicBaseUrl"] = "https://api.deepseek.com/anthropic"
-        cfg["providers"]["deepseek"]["claudeModels"] = {
-            "model": "deepseek-v4-flash", "haiku": "deepseek-v4-flash",
-            "subagent": "deepseek-v4-flash",
-        }
-        cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
-        cfg["modelSync"] = {"default": entry("deepseek", "deepseek/model-1", "medium")}
+        cfg["modelSync"] = {"default": entry("deepseek", "deepseek/model-1", "medium"),
+                            "overrides": {"claude": {
+                                "provider": "deepseek", "model": "deepseek/model-1",
+                                "tiers": {"haiku": entry("deepseek", "deepseek/model-2"),
+                                          "subagent": entry("deepseek", "deepseek/model-3")}}}}
         engine.save_json(server.HUB_CONFIG, cfg)
         hub = engine.Hub()
         hub.push_pi()
@@ -369,44 +435,74 @@ class MultiAgentPushTests(unittest.TestCase):
         agent_model = next(b for b in patch if b.get("id") == "agent-default-model")
         self.assertEqual(agent_model["config"]["model"], "deepseek/model-1")
         env = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))["env"]
-        # Claude Code 的供应商就是全局选中的这个，所以主模型一起对齐
+        # Claude Code 跟随全局主模型（deepseek 有 Claude 连接）
         self.assertEqual(env["ANTHROPIC_MODEL"], "deepseek/model-1")
-        # claudeModels 自己声明的档位（haiku / subagent）不被全局设置改写
-        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek-v4-flash")
-        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "deepseek-v4-flash")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        # modelSync 显式指定的档位照写
+        self.assertEqual(env["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "deepseek/model-2")
+        self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "deepseek/model-3")
+        # 没指定的档位不写
+        self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", env)
+        self.assertNotIn("ANTHROPIC_DEFAULT_FABLE_MODEL", env)
         # dsh 的子代理档位：allowedModels 写当前主模型
         settings = next(b for b in patch if b.get("id") == "subagent-model-selection-settings")
         self.assertEqual(settings["config"]["allowedModels"],
                          [{"provider": "deepseek", "model": "deepseek/model-1"}])
 
     def test_global_choice_does_not_cross_providers_for_claude(self):
-        """全局模型属于另一家供应商时，Claude Code 保持自己的 claudeModels。"""
+        """全局模型属于另一家供应商时，Claude Code 保持现状（不写 ANTHROPIC_*）。"""
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["providers"]["deepseek"]["claudeModels"] = {"model": "deepseek-v4-flash"}
-        cfg["sync"]["targets"]["claude"]["activeProvider"] = "deepseek"
         cfg["modelSync"] = {"default": entry("firework", "firework/model-1")}
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_claude()
-        env = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))["env"]
-        self.assertEqual(env["ANTHROPIC_MODEL"], "deepseek-v4-flash")
-        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
 
-    def test_global_choice_is_used_when_platform_has_no_active_provider(self):
-        """平台配置没有可用的 activeProvider 时，Claude Code 跟随全局选择。"""
+    def test_claude_uses_its_own_connection_key_and_endpoint(self):
+        """Claude 连接自带端点与密钥时不与默认连接混用。"""
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["providers"]["deepseek"]["anthropicBaseUrl"] = "https://api.deepseek.com/anthropic"
-        cfg["providers"]["deepseek"]["claudeModels"] = {"model": "stale-model"}
-        cfg["providers"]["openrouter"]["claudeModels"] = {"model": "openrouter/stale"}
-        cfg["sync"]["targets"]["claude"].pop("activeProvider", None)   # 未指定
-        cfg["modelSync"] = {"default": entry("deepseek", "deepseek/model-1")}
+        cfg["providers"]["deepseek"]["agents"]["claude"]["apiKey"] = "sk-anthropic-only"
+        cfg["modelSync"] = {"overrides": {"claude": entry("deepseek", "deepseek/model-1")}}
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_claude()
-        data = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))
-        self.assertEqual(data["env"]["ANTHROPIC_MODEL"], "deepseek/model-1")
-        self.assertEqual(data["env"]["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
-        # 编译不隐式回写 Hub；后续同步仍按相同的 modelSync 解析。
-        on_disk = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        self.assertNotIn("activeProvider", on_disk["sync"]["targets"]["claude"])
+        env = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))["env"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "sk-anthropic-only")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.deepseek.com/anthropic")
+
+    def test_same_provider_different_key_per_agent(self):
+        """同一供应商：Codex 用另一个 key 与另一套模型，Claude 用自己的连接。"""
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["providers"]["tokenfree"] = {
+            "name": "TokenFree", "displayName": "TokenFree", "baseUrl": "https://gateway.example/v1",
+            "apiKey": "sk-openai", "api": "openai-completions", "enabled": True,
+            "models": [{"id": "gpt-6-astra", "name": "GPT-6 Astra"}],
+            "agents": {
+                "claude": {"baseUrl": "https://gateway.example/v1", "api": "anthropic-messages",
+                           "apiKey": "sk-anthropic", "models": [{"id": "claude-opus-5-5"}]},
+                "codex": {"baseUrl": "https://gateway.example/v1", "api": "openai-responses",
+                          "apiKeyEnv": "TOKENFREE_API_KEY",
+                          "models": [{"id": "gpt-6-astra", "name": "GPT-6 Astra"}]},
+            },
+        }
+        cfg["modelSync"] = {"overrides": {"claude": entry("tokenfree", "claude-opus-5-5"),
+                                          "codex": entry("tokenfree", "gpt-6-astra", "high")}}
+        engine.save_json(server.HUB_CONFIG, cfg)
+        engine.Hub().push_claude()
+        env = json.loads((self.home / ".claude" / "settings.json").read_text(encoding="utf-8"))["env"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "sk-anthropic")
+        self.assertEqual(env["ANTHROPIC_MODEL"], "claude-opus-5-5")
+
+        codex = self.home / ".codex"
+        codex.mkdir(parents=True, exist_ok=True)
+        (codex / "config.toml").write_text('model = "official-model"\n', encoding="utf-8")
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["sync"]["targets"]["codex"] = {"enabled": True, "mode": "third-party"}
+        engine.save_json(server.HUB_CONFIG, cfg)
+        engine.Hub().push_codex()
+        text = (codex / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model = "gpt-6-astra"', text)
+        self.assertIn('model_reasoning_effort = "high"', text)
+        self.assertIn('env_key = "TOKENFREE_API_KEY"', text)
+        self.assertIn('base_url = "https://gateway.example/v1"', text)
 
 
 class CodexAdapterTests(unittest.TestCase):
@@ -506,13 +602,14 @@ class CodexAdapterTests(unittest.TestCase):
 
     def test_wire_api_defaults_to_responses(self):
         cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
-        cfg["providers"]["deepseek"].pop("codexWireApi")
+        cfg["providers"]["deepseek"].pop("agents")
         cfg["providers"]["deepseek"]["api"] = "openai-responses"
         engine.save_json(server.HUB_CONFIG, cfg)
         engine.Hub().push_codex()
         self.assertIn('wire_api = "responses"', self.text())
 
-        cfg["providers"]["deepseek"]["codexWireApi"] = "chat"
+        # Codex 连接只接受 Responses；声明成别的协议直接拒绝，不写文件
+        cfg["providers"]["deepseek"]["agents"] = {"codex": {"api": "openai-chat-completions"}}
         engine.save_json(server.HUB_CONFIG, cfg)
         before = self.text()
         with self.assertRaises(ValueError):

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from contextlib import ExitStack
@@ -178,10 +179,90 @@ class APITests(unittest.TestCase):
         server.api_update_targets({"targets": {"codex": {"enabled": True}}})
         self.assertTrue(self.config()["sync"]["targets"]["codex"]["enabled"])
 
-    def test_claude_provider_requires_compatibility(self):
-        with self.assertRaises(ValueError):
-            server.api_update_targets({"targets": {"claude": {"activeProvider": "stepfun"}}})
-        server.api_update_targets({"targets": {"claude": {"activeProvider": "deepseek"}}})
+    def test_claude_provider_requires_a_claude_connection(self):
+        """没有 Anthropic 连接的供应商不能作为 Claude 的可用供应商。"""
+        server.api_add_provider({"id": "plain", "name": "Plain", "baseUrl": "https://a.example.com/v1",
+                                 "apiKey": "sk-test"})
+        self.assertNotIn("plain", server.api_status()["anthropicCapable"])
+        server.api_add_provider({"id": "claude-plan", "name": "Claude Plan",
+                                 "baseUrl": "", "apiKey": "sk-test",
+                                 "anthropicBaseUrl": "https://claude.example/v1",
+                                 "targets": ["claude"]})
+        self.assertIn("claude-plan", server.api_status()["anthropicCapable"])
+
+    def test_anthropic_connection_excluded_by_targets_is_not_available(self):
+        server.api_add_provider({
+            "id": "pi-only", "name": "Pi only", "baseUrl": "https://gateway.example/v1",
+            "apiKey": "sk-test", "anthropicBaseUrl": "https://gateway.example/anthropic",
+            "targets": ["pi"],
+        })
+        self.assertNotIn("pi-only", server.api_status()["anthropicCapable"])
+
+    def test_openai_base_url_required_for_other_targets(self):
+        provider = {
+            "id": "claude-plan", "name": "Claude Plan", "apiKey": "sk-test",
+            "anthropicBaseUrl": "https://claude.example/v1", "targets": ["claude"],
+        }
+        for targets in (None, [], ["claude", "pi"]):
+            with self.subTest(targets=targets), self.assertRaisesRegex(ValueError, "baseUrl"):
+                server.api_add_provider({**provider, "targets": targets})
+        with self.assertRaisesRegex(ValueError, "baseUrl"):
+            server.api_add_provider({**provider, "anthropicBaseUrl": ""})
+
+    def test_agent_overrides_round_trip_and_validate(self):
+        """agents.<agent>：按 Agent 覆盖端点 / 密钥 / 协议 / 模型与透传字段。"""
+        body = {
+            "id": "tokenfree", "name": "TokenFree", "displayName": "TokenFree",
+            "baseUrl": "https://api.tokenfree.shop/v1", "apiKey": "sk-openai",
+            "api": "openai-completions",
+            "agents": {
+                "claude": {"baseUrl": "https://api.tokenfree.shop/v1",
+                           "apiKey": "sk-anthropic", "api": "anthropic-messages",
+                           "models": [{"id": "claude-opus-5-5", "name": "Opus"}],
+                           "env": {"ENABLE_TOOL_SEARCH": "true"},
+                           "settings": {"effortLevel": "high"}},
+                "codex": {"baseUrl": "https://api.tokenfree.shop/v1",
+                          "apiKeyEnv": "TOKENFREE_API_KEY", "api": "openai-responses",
+                          "models": [{"id": "gpt-6-astra", "name": "Astra"}]},
+            },
+        }
+        server.api_add_provider(body)
+        p = engine.Hub().providers["tokenfree"]
+        self.assertEqual(p["agents"]["claude"]["apiKey"], "sk-anthropic")
+        self.assertEqual(p["agents"]["codex"]["apiKeyEnv"], "TOKENFREE_API_KEY")
+        self.assertEqual([m["id"] for m in p["agents"]["claude"]["models"]], ["claude-opus-5-5"])
+        # 连接就绪度：Claude / Codex 各自就绪，pi 用默认连接
+        status = server.api_status()
+        self.assertIn("tokenfree", status["anthropicCapable"])
+        self.assertIn("tokenfree", status["agentCapable"]["codex"])
+        self.assertIn("tokenfree", status["agentCapable"]["pi"])
+        # 错误的协议 / 结构 / 未知 Agent 被拒绝，且不落盘
+        before = server.HUB_CONFIG.read_bytes()
+        for bad in ({"claude": {"baseUrl": "https://x.example/v1", "api": "openai-completions"}},
+                    {"codex": {"api": "openai-chat-completions"}},
+                    {"claude": {"apiKeyEnv": "invalid space"}},
+                    {"claude": {"env": {"env": "1"}}},
+                    {"claude": {"models": "nope"}},
+                    {"claude": "nope"},
+                    {"nope": {}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                server.api_update_provider("tokenfree", {"agents": bad})
+        self.assertEqual(before, server.HUB_CONFIG.read_bytes())
+        # 更新：整体替换（模型随连接一起走，护栏会拦住悄悄丢模型的写入）
+        server.api_update_provider("tokenfree", {"agents": {
+            "claude": {"baseUrl": "https://api.tokenfree.shop/v1", "api": "anthropic-messages",
+                       "apiKey": "sk-anthropic", "models": [{"id": "claude-opus-5-5"}]},
+            "codex": {"baseUrl": "https://api.tokenfree.shop/v1", "api": "openai-responses",
+                      "apiKey": "sk-codex", "models": [{"id": "gpt-6-astra"}]}}})
+        p = engine.Hub().providers["tokenfree"]
+        self.assertEqual(set(p["agents"]), {"claude", "codex"})
+        self.assertEqual([m["id"] for m in p["agents"]["claude"]["models"]], ["claude-opus-5-5"])
+        # 整块替换掉已有连接会丢模型：护栏拒绝，不静默落盘
+        before = server.HUB_CONFIG.read_bytes()
+        with self.assertRaises(engine.ModelLossError):
+            server.api_update_provider("tokenfree", {"agents": {
+                "codex": {"api": "openai-responses", "models": [{"id": "gpt-6-astra"}]}}})
+        self.assertEqual(before, server.HUB_CONFIG.read_bytes())
 
     def test_selected_sync_deduplicates_alias(self):
         self.adapters()
@@ -199,8 +280,8 @@ class APITests(unittest.TestCase):
                 server.api_push({"targets": targets})
         engine.Hub.push_pi.assert_not_called()
 
-    def test_custom_provider_declarative_fields_round_trip(self):
-        """自定义供应商：claudeEnv / claudeSettings / targets 经 API 增减后原样保留。"""
+    def test_legacy_claude_fields_still_validate_and_round_trip(self):
+        """旧扁平字段（claudeEnv / claudeSettings / claudeModels）迁移前仍然可用。"""
         body = {
             "id": "tokenfree", "name": "TokenFree", "displayName": "TokenFree (Anthropic proxy)",
             "baseUrl": "https://api.tokenfree.shop", "apiKey": "sk-test-not-a-real-key",
@@ -214,16 +295,23 @@ class APITests(unittest.TestCase):
         }
         server.api_add_provider(body)
         p = engine.Hub().providers["tokenfree"]
+        self.assertEqual(p["claudeModels"], body["claudeModels"])
         self.assertEqual(p["claudeEnv"]["ENABLE_TOOL_SEARCH"], "true")
         self.assertEqual(p["claudeSettings"]["effortLevel"], "high")
-        self.assertEqual(p["claudeSettings"]["permissions"], {"allow": []})
         self.assertEqual(p["targets"], ["claude"])
+        # 旧字段在读取时映射成 Claude 连接：端点 / 密钥 / 透传都按它解析
+        conn = engine.agent_connection(p, "claude")
+        self.assertEqual(conn["baseUrl"], "https://api.tokenfree.shop")
+        self.assertEqual(conn["api"], "anthropic-messages")
+        self.assertEqual(conn["env"]["ENABLE_TOOL_SEARCH"], "true")
+        self.assertEqual(conn["settings"]["effortLevel"], "high")
         # 更新：可改，也可清空
         server.api_update_provider("tokenfree", {"claudeSettings": {"effortLevel": "low"}})
         p = engine.Hub().providers["tokenfree"]
         self.assertEqual(p["claudeSettings"], {"effortLevel": "low"})
         self.assertEqual(p["claudeEnv"]["ENABLE_TOOL_SEARCH"], "true")  # 未声明的字段保留
         # 非法值被拒绝且不落盘
+        before = server.HUB_CONFIG.read_bytes()
         with self.assertRaises(ValueError):
             server.api_update_provider("tokenfree", {"claudeEnv": "nope"})
         with self.assertRaises(ValueError):
@@ -231,20 +319,76 @@ class APITests(unittest.TestCase):
         self.assertEqual(engine.Hub().providers["tokenfree"]["claudeEnv"]["ENABLE_TOOL_SEARCH"], "true")
         self.assertEqual(engine.Hub().providers["tokenfree"]["targets"], ["claude"])
 
-    def test_custom_provider_can_become_active_claude_provider(self):
-        """只有声明了 Anthropic 端点且启用的自定义供应商才能成为 claude 的 active。"""
-        server.api_add_provider({
-            "id": "tokenfree", "name": "TokenFree", "baseUrl": "https://api.tokenfree.shop",
-            "apiKey": "sk-test-not-a-real-key", "anthropicBaseUrl": "https://api.tokenfree.shop",
-            "targets": ["claude"],
-        })
-        server.api_update_targets({"targets": {"claude": {"activeProvider": "tokenfree"}}})
-        self.assertEqual(engine.Hub().cfg["sync"]["targets"]["claude"]["activeProvider"], "tokenfree")
-        # 没有 Anthropic 端点的不行
+    def test_openai_only_provider_is_not_claude_ready(self):
+        """只有默认 OpenAI 端点、没有声明 Claude 连接的供应商不进 Claude 同步。"""
         server.api_add_provider({"id": "plain", "name": "Plain", "baseUrl": "https://a.example.com/v1",
                                  "apiKey": "sk-test"})
+        self.assertNotIn("plain", server.api_status()["anthropicCapable"])
+        p = engine.Hub().providers["plain"]
+        self.assertEqual(engine.agent_connection(p, "claude")["baseUrl"], "")
+
+    def test_model_crud_is_scoped_to_its_connection(self):
+        """模型按连接存放：写入 claude 连接的模型不进默认模型库。"""
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["providers"]["tokenfree"] = {
+            "name": "TokenFree", "baseUrl": "https://gateway.example/v1", "apiKey": "sk-openai",
+            "api": "openai-completions", "enabled": True,
+            "models": [{"id": "gpt-6-astra", "name": "Astra"}],
+            "agents": {"claude": {"baseUrl": "https://gateway.example/v1",
+                                  "api": "anthropic-messages", "apiKey": "sk-anthropic",
+                                  "models": []}},
+        }
+        engine.save_json(server.HUB_CONFIG, cfg)
+        server.api_add_model("tokenfree", {"id": "claude-opus-5-5", "name": "Opus", "agent": "claude",
+                                           "contextWindow": 200000, "maxTokens": 32768,
+                                           "input": ["text"], "reasoning": True})
+        p = engine.Hub().providers["tokenfree"]
+        self.assertEqual([m["id"] for m in p["models"]], ["gpt-6-astra"])
+        self.assertEqual([m["id"] for m in p["agents"]["claude"]["models"]], ["claude-opus-5-5"])
+        # 删除同样只作用于该连接（不带 agent 就只作用于默认连接）
         with self.assertRaises(ValueError):
-            server.api_update_targets({"targets": {"claude": {"activeProvider": "plain"}}})
+            server.api_delete_model("tokenfree", "claude-opus-5-5")
+        server.api_delete_model("tokenfree", "claude-opus-5-5", "claude")
+        p = engine.Hub().providers["tokenfree"]
+        self.assertEqual(p["agents"]["claude"]["models"], [])
+        self.assertEqual([m["id"] for m in p["models"]], ["gpt-6-astra"])
+
+    def test_discover_uses_the_selected_connection(self):
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["providers"]["tokenfree"] = {
+            "name": "TokenFree", "baseUrl": "https://gateway.example/v1", "apiKey": "sk-openai",
+            "api": "openai-completions", "enabled": True,
+            "models": [],
+            "agents": {"claude": {"baseUrl": "https://gateway.example/v1",
+                                  "api": "anthropic-messages", "apiKey": "sk-anthropic",
+                                  "models": []}},
+        }
+        engine.save_json(server.HUB_CONFIG, cfg)
+        calls = []
+
+        def fake_http(url, headers, timeout=15.0):
+            calls.append((url, dict(headers)))
+            if url.endswith("/v1/models") and "x-api-key" in headers:
+                return {"data": [{"id": "claude-opus-5-5"}]}
+            return {"data": [{"id": "gpt-6-astra"}]}
+
+        with unittest.mock.patch("discover._http_get_json", side_effect=fake_http):
+            claude_models = server.api_discover_models("tokenfree", "claude")["models"]
+            default_models = server.api_discover_models("tokenfree")["models"]
+        self.assertEqual([m["id"] for m in claude_models], ["claude-opus-5-5"])
+        self.assertEqual([m["id"] for m in default_models], ["gpt-6-astra"])
+        # Anthropic 连接用 x-api-key，默认连接用 Bearer
+        self.assertTrue(any("x-api-key" in headers for _, headers in calls))
+        self.assertTrue(any("Authorization" in headers for _, headers in calls))
+        # 导入到指定连接
+        server.api_import_models("tokenfree", {"agent": "claude",
+                                               "models": [{"id": "claude-opus-5-5", "name": "Opus",
+                                                           "contextWindow": 200000,
+                                                           "maxTokens": 32768,
+                                                           "input": ["text"], "reasoning": True}]})
+        p = engine.Hub().providers["tokenfree"]
+        self.assertEqual([m["id"] for m in p["agents"]["claude"]["models"]], ["claude-opus-5-5"])
+        self.assertEqual(p["models"], [])
 
     def test_full_sync_clears_pending_and_edit_restores_it(self):
         self.adapters()

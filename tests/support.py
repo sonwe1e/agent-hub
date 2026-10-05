@@ -28,10 +28,14 @@ def fixture() -> dict:
                                       "input": ["text", "image"] if i % 2 else ["text"],
                                       "reasoning": i % 3 != 0, "cost": {"input": 0.5}, "compat": {"custom": True}}
                                      for i in range(7)]}
-    providers["deepseek"]["anthropicBaseUrl"] = "https://api.deepseek.com/anthropic"
+    providers["deepseek"]["agents"] = {
+        # Anthropic 端点单独放在 claude 连接上；Codex 只走 Responses
+        "claude": {"baseUrl": "https://api.deepseek.com/anthropic", "api": "anthropic-messages"},
+        "codex": {"api": "openai-responses"},
+    }
+    providers["openrouter"]["agents"] = {"codex": {"api": "openai-responses"}}
     targets = {n: {"enabled": True, "files": [f"~/test-clients/{n}.json"]}
                for n in ("pi", "mcode", "zcode", "dsh", "claude", "cc-switch", "omp")}
-    targets["claude"]["activeProvider"] = "deepseek"
     targets["dsh-desktop"] = {"enabled": True, "aliasOf": "dsh", "files": ["~/test-clients/dsh.json"]}
     targets["codex"] = {"enabled": False, "notes": "自行维护官方授权"}
     return {"providers": providers, "removedProviders": {}, "sync": {"targets": targets},

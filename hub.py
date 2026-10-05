@@ -155,14 +155,14 @@ def save_json(path: Path, data: Any, indent: int = 2) -> None:
     if path.name == "providers.json" and path.exists():
         try:
             old = json.loads(path.read_text(encoding="utf-8"))
-            old_n = sum(len((p or {}).get("models") or []) for p in (old.get("providers") or {}).values())
-            new_n = sum(len((p or {}).get("models") or []) for p in (data.get("providers") or {}).values())
+            old_n = sum(_model_count(old, pid) for pid in (old.get("providers") or {}))
+            new_n = sum(_model_count(data, pid) for pid in (data.get("providers") or {}))
             dropped = old_n > 0 and new_n < old_n * 0.5
             if not dropped:
                 # 总量没腰斩也要留证：单个供应商被清空同样是事故信号
                 for pid, entry in (old.get("providers") or {}).items():
-                    before = len((entry or {}).get("models") or [])
-                    after = len((((data.get("providers") or {}).get(pid)) or {}).get("models") or [])
+                    before = _model_count(old, pid)
+                    after = _model_count(data, pid)
                     if before > 0 and after < before * 0.5:
                         dropped = True
                         break
@@ -191,8 +191,26 @@ class ModelLossError(RuntimeError):
 
 
 def _model_ids(cfg: Any, pid: str) -> set[str]:
+    """供应商在所有连接上的模型 ID：默认连接 + 各 Agent 覆盖。"""
     entry = (cfg or {}).get("providers", {}).get(pid) or {}
-    return {m.get("id") for m in (entry.get("models") or []) if isinstance(m, dict)}
+    ids = {m.get("id") for m in (entry.get("models") or []) if isinstance(m, dict)}
+    agents = entry.get("agents")
+    if isinstance(agents, dict):
+        for override in agents.values():
+            if isinstance(override, dict):
+                ids |= {m.get("id") for m in (override.get("models") or []) if isinstance(m, dict)}
+    return ids
+
+
+def _model_count(cfg: Any, pid: str) -> int:
+    entry = (cfg or {}).get("providers", {}).get(pid) or {}
+    total = len([m for m in (entry.get("models") or []) if isinstance(m, dict)])
+    agents = entry.get("agents")
+    if isinstance(agents, dict):
+        for override in agents.values():
+            if isinstance(override, dict):
+                total += len([m for m in (override.get("models") or []) if isinstance(m, dict)])
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +223,119 @@ def _model_ids(cfg: Any, pid: str) -> set[str]:
 AGENT_MODEL_TIERS: dict[str, tuple[str, ...]] = {
     "pi": ("agent",),
     "dsh": ("agent", "subagent"),
-    "claude": ("agent", "model", "opus", "sonnet", "haiku", "fable", "subagent"),
+    # Claude Code 的主模型档位叫 model（→ ANTHROPIC_MODEL）；agent 是 pi/dsh/codex
+    # 的叫法，这里不重复解析，避免同一选择出现两个档位。
+    "claude": ("model", "opus", "sonnet", "haiku", "fable", "subagent"),
     # Codex 只有一个顶层 model；codex-auto-review 之类子代理不在本工具管理范围。
     "codex": ("agent",),
 }
 
-REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# Codex 用 none 表示关闭推理；max / ultra 是否被具体模型接受由客户端自己判断。
+CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+# Claude Code 连接默认只走 Anthropic Messages；Codex 第三方只走 Responses。
+AGENT_DEFAULT_API = {"claude": "anthropic-messages", "codex": "openai-responses"}
+# 每个供应商在这几个 Agent 上的连接会被界面与状态展示（含未声明天认的默认连接）。
+AGENT_CONNECTION_TARGETS = ("pi", "dsh", "claude", "codex")
+
+
+def canonical_target(target: str) -> str:
+    """dsh-desktop 与 dsh 共用同一份配置，连接与档位都按 dsh 解析。"""
+    return "dsh" if target == "dsh-desktop" else target
+
+
+def agent_connection(provider: dict, target: str) -> dict:
+    """provider 面向某个 Agent 的连接：默认连接 + ``agents.<agent>`` 覆盖。
+
+    一个供应商可以同时服务多个 Coding Agent，也可以给不同 Agent 配不同的
+    端点、密钥和模型（同一网关的不同 key 往往对应不同模型集合）。未声明
+    ``agents.<agent>`` 时该 Agent 直接用顶层默认连接，行为与旧版一致。
+
+    兼容旧字段：``anthropicBaseUrl`` → claude 连接的 baseUrl，
+    ``openaiApiKey`` / ``apiKeyEnv`` / ``codexWireApi`` → codex 连接，
+    ``claudeEnv`` / ``claudeSettings`` → claude 连接的 env / settings。
+    """
+    canonical = canonical_target(target)
+    agents = provider.get("agents")
+    agents = agents if isinstance(agents, dict) else {}
+    override = agents.get(canonical)
+    override = override if isinstance(override, dict) else {}
+
+    def pick(key: str, default=None):
+        if key in override and override[key] is not None:
+            return override[key]
+        return default
+
+    base_url = pick("baseUrl", provider.get("baseUrl") or "")
+    api_key = pick("apiKey", provider.get("apiKey") or "")
+    api = pick("api", provider.get("api") or "openai-completions")
+    api_key_env = pick("apiKeyEnv", provider.get("apiKeyEnv") or "")
+    models = pick("models", provider.get("models") or [])
+    models = models if isinstance(models, list) else []
+    compat = pick("compat", provider.get("compat"))
+    env = pick("env", {}) if isinstance(pick("env"), dict) else {}
+    settings = pick("settings", {}) if isinstance(pick("settings"), dict) else {}
+
+    if canonical == "claude":
+        # Claude Code 只认 Anthropic Messages 端点，且必须显式声明：
+        # agents.claude.baseUrl、旧 anthropicBaseUrl，或整个 provider 就是
+        # anthropic-messages 协议。没声明就没有 Claude 连接（默认的 OpenAI
+        # 端点不能直接给 Claude Code 用）。
+        legacy_base = provider.get("anthropicBaseUrl")
+        legacy_base = legacy_base if isinstance(legacy_base, str) else ""
+        override_base = override.get("baseUrl")
+        override_base = override_base if isinstance(override_base, str) else ""
+        if override_base.strip():
+            base_url = override_base
+        elif legacy_base.strip():
+            base_url = legacy_base
+        elif provider.get("api") == AGENT_DEFAULT_API["claude"]:
+            base_url = provider.get("baseUrl") or ""
+        else:
+            base_url = ""
+        api = override.get("api") or (AGENT_DEFAULT_API["claude"] if base_url.strip() else api)
+        if not override.get("env") and isinstance(provider.get("claudeEnv"), dict):
+            env = provider["claudeEnv"]
+        if not override.get("settings") and isinstance(provider.get("claudeSettings"), dict):
+            settings = provider["claudeSettings"]
+    if canonical == "codex":
+        if not override.get("apiKey") and isinstance(provider.get("openaiApiKey"), str) \
+                and provider["openaiApiKey"].strip():
+            api_key = provider["openaiApiKey"]
+        if not override.get("apiKeyEnv") and isinstance(provider.get("apiKeyEnv"), str) \
+                and provider["apiKeyEnv"].strip():
+            api_key_env = provider["apiKeyEnv"]
+        if not override.get("api"):
+            api = AGENT_DEFAULT_API["codex"] if provider.get("codexWireApi") == "responses" \
+                else (provider.get("api") or "openai-completions")
+    return {"baseUrl": base_url if isinstance(base_url, str) else "",
+            "apiKey": api_key if isinstance(api_key, str) else "",
+            "apiKeyEnv": api_key_env if isinstance(api_key_env, str) else "",
+            "api": api if isinstance(api, str) else "openai-completions",
+            "models": models, "compat": compat, "env": env, "settings": settings}
+
+
+def agent_connection_ready(provider: dict, target: str) -> bool:
+    """该 provider 是否能给这个 Agent 用：端点齐全且协议匹配。
+
+    Claude Code 需要显式声明的 Anthropic Messages 端点；Codex 第三方线路只接受
+    Responses。没有对应连接的供应商不会进入该平台的同步。
+    """
+    canonical = canonical_target(target)
+    conn = agent_connection(provider, canonical)
+    if not conn["baseUrl"].strip():
+        return False
+    if canonical == "claude":
+        return conn["api"] == "anthropic-messages"
+    if canonical == "codex":
+        return conn["api"] == "openai-responses"
+    return True
+
+
+def provider_agents(provider: dict) -> list[str]:
+    """该 provider 显式声明了连接覆盖的 Agent 名。"""
+    agents = provider.get("agents")
+    return sorted(agents) if isinstance(agents, dict) else []
 
 
 def _norm_pid_model(pid: Any, model: Any) -> tuple[str, str] | None:
@@ -226,19 +351,16 @@ def _cfg_providers(cfg: Any) -> dict:
     return providers if isinstance(providers, dict) else {}
 
 
-def _legacy_tier(pid: str | None, claude_models: dict, tier: str) -> dict | None:
-    """旧字段 provider.claudeModels 里某一档位的 {provider, model}。
+def provider_targets(p: dict, target: str) -> bool:
+    """Whether a provider is configured for an adapter target."""
+    return not p.get("targets") or canonical_target(target) in p["targets"]
 
-    `model` / `agent` 两档都对应 ANTHROPIC_MODEL，`fable` 是历史档位，
-    不再作为目标档位，但仍然被适配器接手。
-    """
-    if not pid:
-        return None
-    key = "model" if tier == "agent" else tier
-    value = claude_models.get(key)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    return {"provider": pid, "model": value.strip()}
+
+def claude_providers(providers: dict) -> dict:
+    """The providers that the Claude Code adapter can actually use."""
+    return {pid: p for pid, p in providers.items()
+            if isinstance(p, dict) and provider_targets(p, "claude")
+            and p.get("enabled", True) and agent_connection_ready(p, "claude")}
 
 
 def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
@@ -246,19 +368,23 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
 
     取值优先级（从高到低）：
       1. modelSync.overrides.<target>.tiers.<tier> —— 该档位被显式指定；
-      2. provider.claudeModels —— 旧 Claude 档位字段，只认活跃供应商自己声明的档位；
-      3. modelSync.overrides.<target>.{provider,model} —— 平台级指定；
-      4. provider.agentModel —— 供应商声明的 agent 默认模型；
-      5. modelSync.default.{provider,model} —— 全局主模型；
-      6. 供应商 models 列表的第一项 —— 兜底。
+      2. modelSync.overrides.<target>.{provider,model} —— 平台级指定；
+      3. provider.agentModel —— 供应商声明的 agent 默认模型；
+      4. modelSync.default.{provider,model} —— 全局主模型；
+      5. 供应商该连接模型列表的第一项 —— 兜底。
 
-    第 3~6 条只作用于「主模型」（pi 的 agent、dsh 的 agent、Claude Code 的 model 档）；
-    Claude Code 的 opus/sonnet/haiku/fable/subagent 档位不会因为一个全局设置被改写。
+    第 2~5 条只作用于「主模型」（pi 的 agent、dsh 的 agent、Claude Code 的 model 档）；
+    Claude Code 的 opus/sonnet/haiku/fable/subagent 档位不会被一个全局设置改写，
+    只有 modelSync 显式指定过才写。
+
+    可用供应商 = 通过 targets 限定、已启用、且该 Agent 连接就绪（端点 + 协议匹配）。
+    「模型是否已知」按该连接的模型库判断：同一供应商给不同 Agent 配不同 key 时，
+    各自连接的模型库可以完全不同。
 
     每个档位返回 {"provider","model","reasoningEffort","known","tier"}；
-    `known` 表示该模型 ID 是否出现在供应商的模型库里（手填值会是 False）。
+    `known` 表示该模型 ID 是否出现在该连接的模型库里（手填值会是 False）。
     """
-    canonical = "dsh" if target == "dsh-desktop" else target
+    canonical = canonical_target(target)
     tier_names = AGENT_MODEL_TIERS.get(canonical, ())
     if not tier_names:
         return {}
@@ -269,6 +395,11 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
     overrides = sync.get("overrides") if isinstance(sync.get("overrides"), dict) else {}
     override = overrides.get(canonical) if isinstance(overrides.get(canonical), dict) else {}
     override_tiers = override.get("tiers") if isinstance(override.get("tiers"), dict) else {}
+    available = {
+        pid: p for pid, p in providers.items()
+        if isinstance(p, dict) and provider_targets(p, canonical)
+        and p.get("enabled", True) and agent_connection_ready(p, canonical)
+    }
 
     def pick(*candidates: Any) -> dict | None:
         for candidate in candidates:
@@ -276,17 +407,24 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
                 parsed = _norm_pid_model(candidate.get("provider"), candidate.get("model"))
                 if parsed:
                     effort = candidate.get("reasoningEffort")
+                    allowed = CODEX_REASONING_EFFORTS if canonical == "codex" else REASONING_EFFORTS
                     return {"provider": parsed[0], "model": parsed[1],
-                            "reasoningEffort": effort if effort in REASONING_EFFORTS or (canonical == "codex" and effort == "none") else None}
+                            "reasoningEffort": effort if effort in allowed else None}
         return None
+
+    def pick_available(candidate: Any) -> dict | None:
+        selected = pick(candidate)
+        return selected if selected and selected["provider"] in available else None
 
     def provider_models(pid: str) -> list[str]:
         entry = providers.get(pid)
         entry = entry if isinstance(entry, dict) else {}
-        return [m["id"] for m in (entry.get("models") or [])
+        return [m["id"] for m in agent_connection(entry, canonical)["models"]
                 if isinstance(m, dict) and isinstance(m.get("id"), str)]
 
     def fallback_for(pid: str) -> dict | None:
+        if pid not in available:
+            return None
         entry = providers.get(pid)
         entry = entry if isinstance(entry, dict) else {}
         agent_model = entry.get("agentModel")
@@ -297,72 +435,32 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
             return {"provider": pid, "model": first[0], "reasoningEffort": None}
         return None
 
-    # 谁才是 Claude Code 实际会用的供应商（与 push_claude 同一套判定）：activeProvider
-    # 不可用时回退到第一个可用的 Anthropic 供应商；全局/平台级选择指向的那家有
-    # Anthropic 端点时，适配器会切过去，所以这里也按它算。
-    legacy_pid: str | None = None
-    legacy_models: dict = {}
-    active_claude_pid: str | None = None
-    if canonical == "claude":
-        configured_active = ((cfg or {}).get("sync", {}).get("targets", {}).get("claude")
-                             or {}).get("activeProvider")
-
-        def anthropic_ready(pid: Any) -> bool:
-            entry = providers.get(pid) if isinstance(pid, str) else None
-            return bool(isinstance(entry, dict) and entry.get("anthropicBaseUrl")
-                        and entry.get("enabled", True))
-
-        fallback_active = next((pid for pid, p in providers.items()
-                                if isinstance(p, dict) and p.get("anthropicBaseUrl")
-                                and p.get("enabled", True)), None)
-        # 与 push_claude 同一套顺序：平台级/全局选择（覆盖）优先，其次平台配置里的
-        # activeProvider，都不可用时回退到第一个可用的 Anthropic 供应商。
-        if anthropic_ready(override.get("provider")):
-            active_claude_pid = override["provider"]
-        elif anthropic_ready(default.get("provider")):
-            active_claude_pid = default["provider"]
-        elif anthropic_ready(configured_active):
-            active_claude_pid = configured_active
-        else:
-            active_claude_pid = fallback_active
-        if isinstance(active_claude_pid, str):
-            active_entry = providers.get(active_claude_pid)
-            if isinstance(active_entry, dict) and isinstance(active_entry.get("claudeModels"), dict):
-                legacy_pid, legacy_models = active_claude_pid, active_entry["claudeModels"]
-
     # 平台级覆盖：overrides.<target> 可带 tiers 子对象（每个档位单独指定）
     override_pid = override.get("provider")
-    base = (pick(override)
+    base = (pick_available(override)
             or (fallback_for(override_pid) if isinstance(override_pid, str) else None)
-            or pick(default)
+            or pick_available(default)
             or (fallback_for(default["provider"]) if isinstance(default.get("provider"), str) else None))
 
     out: dict[str, dict] = {}
     for tier in tier_names:
         resolved = None
         if canonical == "claude":
-            # 1) 该档位被界面显式指定
-            if tier in override_tiers:
-                resolved = pick(override_tiers.get(tier))
+            # 1) 该档位被界面显式指定（供应商必须具备 Claude 连接）
+            resolved = pick_available(override_tiers.get(tier))
             if resolved is None and tier == "model":
-                # 2) 主模型档位：平台级覆盖 / 全局主模型，必须与「实际会用的 Anthropic
-                #    供应商」是同一家（baseUrl 与 apiKey 必须配套，跨供应商套用模型名
-                #    只会写出一个对方不认的模型）
+                # 2) 主模型档位：平台级覆盖 / 全局主模型。baseUrl 与 apiKey 必须
+                #    配套，所以只认「该供应商确实有 Claude 连接」的选择。
                 for candidate in (override, default):
                     picked = pick(candidate)
-                    if picked and picked["provider"] == active_claude_pid:
+                    if picked and picked["provider"] in available:
                         resolved = picked
                         break
-                # 3) 仍然没有就用该供应商自己声明的 claudeModels.model
-                if resolved is None:
-                    resolved = pick(_legacy_tier(legacy_pid, legacy_models, tier))
-            elif resolved is None:
-                # 别名档位（opus/sonnet/haiku/fable/subagent）只认活跃供应商自己声明的
-                # claudeModels：未声明的档位不做兜底，否则会把 opus/haiku 悄悄指过去，
-                # 等于替用户改了 Claude Code 的配置。
-                resolved = pick(_legacy_tier(legacy_pid, legacy_models, tier))
+            # 3) 别名档位（opus/sonnet/haiku/fable/subagent）没有兜底：未显式
+            #    指定的档位不写，避免替用户改掉 Claude Code 的配置。
         else:
-            # pi 的 agent 档、dsh 的 agent/subagent 档都跟随同一个主模型
+            # pi 的 agent 档、dsh 的 agent/subagent 档、Codex 的 agent 档
+            # 都跟随同一个主模型
             resolved = base
         if resolved is None:
             continue
@@ -376,14 +474,14 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
 def agent_model_tiers_public(cfg: Any, target: str) -> dict[str, dict]:
     """给界面/API 用的档位视图。
 
-    与 agent_model_tiers 的区别：隐藏 `agent` 这一内部档位（它与 claude 的 `model`
-    档同源），并隐藏历史档位 `fable`。适配器仍通过 agent_model_tiers 读到 fable，
-    这样旧配置里的 ANTHROPIC_DEFAULT_FABLE_MODEL 该写就写、该收回就收回。
+    与 agent_model_tiers 的区别：隐藏历史档位 `fable`。适配器仍通过
+    agent_model_tiers 读到 fable，这样旧配置里的 ANTHROPIC_DEFAULT_FABLE_MODEL
+    该写就写、该收回就收回。
     """
     tiers = agent_model_tiers(cfg, target)
-    canonical = "dsh" if target == "dsh-desktop" else target
+    canonical = canonical_target(target)
     if canonical == "claude":
-        tiers = {k: v for k, v in tiers.items() if k not in ("agent", "fable")}
+        tiers = {k: v for k, v in tiers.items() if k != "fable"}
     return tiers
 
 
@@ -399,21 +497,53 @@ def resolve_agent_model(cfg: Any, target: str) -> dict | None:
     return tiers.get("agent") or tiers.get("model")
 
 
-def agent_model_options(cfg: Any) -> dict[str, list[dict]]:
-    """每个供应商可供选择的模型（精简字段，供界面下拉使用）。"""
+def agent_model_options(cfg: Any, target: str | None = None) -> dict[str, list[dict]]:
+    """每个供应商可供选择的模型（精简字段，供界面下拉使用）。
+
+    `target` 为 None 时返回该供应商所有连接合并后的模型（模型库总览用）；
+    指定 target 时只返回该 Agent 连接上的模型——同一供应商给不同 Agent 配
+    不同 key 时，下拉里只应出现这条连接真正提供的模型。
+    """
     out: dict[str, list[dict]] = {}
     for pid, entry in _cfg_providers(cfg).items():
         if not isinstance(entry, dict) or entry.get("enabled") is False:
             continue
-        models = []
-        for m in entry.get("models") or []:
-            if not isinstance(m, dict) or not isinstance(m.get("id"), str):
-                continue
-            models.append({
-                "id": m["id"],
-                "name": m.get("name", m["id"]),
-            })
+        if target is None:
+            sources = [entry.get("models") or []]
+            sources += [agent_connection(entry, name)["models"] for name in provider_agents(entry)]
+        else:
+            sources = [agent_connection(entry, target)["models"]]
+        models, seen = [], set()
+        for source in sources:
+            for m in source or []:
+                if not isinstance(m, dict) or not isinstance(m.get("id"), str):
+                    continue
+                if m["id"] in seen:
+                    continue
+                seen.add(m["id"])
+                models.append({"id": m["id"], "name": m.get("name", m["id"])})
         out[pid] = models
+    return out
+
+
+def agent_connections(cfg: Any) -> dict[str, dict[str, dict]]:
+    """每个供应商在每个 Agent 上的连接概况（界面与状态展示用，不含密钥）。"""
+    out: dict[str, dict[str, dict]] = {}
+    for pid, entry in _cfg_providers(cfg).items():
+        if not isinstance(entry, dict):
+            continue
+        agents = {}
+        for name in AGENT_CONNECTION_TARGETS:
+            conn = agent_connection(entry, name)
+            agents[name] = {
+                "ready": agent_connection_ready(entry, name),
+                "overridden": name in provider_agents(entry),
+                "baseUrl": conn["baseUrl"],
+                "api": conn["api"],
+                "hasKey": bool(conn["apiKey"].strip() or conn["apiKeyEnv"].strip()),
+                "modelCount": len([m for m in conn["models"] if isinstance(m, dict)]),
+            }
+        out[pid] = agents
     return out
 
 
@@ -435,15 +565,14 @@ def assert_expected_model_changes(
     disk_providers = (disk_cfg or {}).get("providers") or {}
     new_providers = (new_cfg or {}).get("providers") or {}
     for pid, entry in disk_providers.items():
-        old_ids = {m.get("id") for m in (entry.get("models") or []) if isinstance(m, dict)}
+        old_ids = _model_ids(disk_cfg, pid)
         if not old_ids:
             continue
         if pid not in new_providers:
             if pid not in removed_providers:
                 raise ModelLossError(f"拒绝写入 providers.json：供应商 {pid} 会被整体删除")
             continue
-        new_ids = {m.get("id") for m in ((new_providers.get(pid) or {}).get("models") or [])
-                   if isinstance(m, dict)}
+        new_ids = _model_ids(new_cfg, pid)
         unexpected = old_ids - new_ids - set(allowed_removed.get(pid, ()))
         if unexpected:
             preview = "、".join(sorted(unexpected)[:5])
@@ -559,16 +688,201 @@ def _yaml_scalar(s: str) -> Any:
         return True
     if s in ("false", "False", "FALSE"):
         return False
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        return s[1:-1]
-    try:
-        if re.fullmatch(r"-?\d+", s):
-            return int(s)
-        if re.fullmatch(r"-?\d+\.\d+", s):
-            return float(s)
-    except ValueError:
-        pass
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        text = yaml_unquote(s)
+        # 带引号的正整数 / 小数 / 进制字面量都是字符串（"1000000" 就该读成 str）；
+        # 只有「写入端为数字加过引号」的形态才还原成数字，否则 -1 会变成 "-1"。
+        if _repr_quoted_number(text):
+            return _numeric(text)
+        return text
+    return _numeric(s)
+
+
+# 写入端会把这些形态加引号写出（安全校验器不接受它们的裸写形式），读取端必须
+# 认识同一套形态才能把类型还原回来。顺序即优先级，第一个匹配的赢。
+def _strip_underscores(text: str) -> str:
+    return text.replace("_", "")
+
+
+# (正则, 还原函数)。还原函数收 "[-+]?0x1f" 这种带符号 / 下划线的原文。
+# 整数那条要带上 `+`：写入端会把 "+1" 这类字符串加引号写出，读取端得还原成 int。
+_NUMBER_FORMS: tuple[tuple[re.Pattern, Any], ...] = (
+    (re.compile(r"[-+]?\d[\d_]*"), lambda t: int(t)),
+    (re.compile(r"[-+]?\d[\d_]*\.\d+"), lambda t: float(t)),
+    (re.compile(r"[-+]?(?:\d[\d_]*\.?[\d_]*|\.\d+)[eE][-+]?\d+"), lambda t: float(t)),
+    (re.compile(r"[-+]?(?:inf(?:inity)?|nan)", re.IGNORECASE), lambda t: float(t)),
+    (re.compile(r"[-+]?\d[\d_]*\."), lambda t: float(t)),
+    (re.compile(r"[-+]?0[bB][01_]+"), lambda t: int(_strip_underscores(t), 2)),
+    (re.compile(r"[-+]?0[xX][0-9a-fA-F_]+"), lambda t: int(_strip_underscores(t), 16)),
+    (re.compile(r"[-+]?0[oO][0-7_]+"), lambda t: int(_strip_underscores(t), 8)),
+)
+
+
+def _numeric(s: str) -> Any:
+    """标量的数值还原（不能还原就原样返回字符串）。"""
+    for pattern, convert in _NUMBER_FORMS:
+        if pattern.fullmatch(s):
+            try:
+                return convert(s)
+            except ValueError:
+                return s
     return s
+
+
+_YAML_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "t": "\t", "r": "\r",
+                 "b": "\b", "f": "\f", "0": "\0", "a": "\a", "v": "\v", "e": "\x1b", " ": " "}
+
+
+def yaml_unquote(raw: str) -> str:
+    """去掉 YAML 标量的引号并按需反转义。
+
+    双引号是 JSON 风格（写入端 ``json.dumps`` 用的就是它）：支持 ``\\"``、
+    ``\\\\``、``\\n``、``\\t``、``\\r``、``\\uXXXX`` 等；单引号在 YAML 里没有
+    转义，内容原样返回（因此 Windows 路径 ``'C:\\Program Files\\...'`` 可读）。
+    无法确定语义的转义一律拒绝，不猜。
+    """
+    if len(raw) < 2 or raw[-1] != raw[0] or raw[0] not in "\"'":
+        raise ValueError("Unsupported quoted YAML scalar")
+    body = raw[1:-1]
+    if raw[0] == "'":
+        if "'" in body:
+            raise ValueError("Unsupported quoted YAML scalar")
+        return body
+    out, index = [], 0
+    while index < len(body):
+        char = body[index]
+        if char == '"':
+            raise ValueError("Unsupported quoted YAML scalar")
+        if char == "\\":
+            index += 1
+            if index >= len(body):
+                raise ValueError("Unsupported quoted YAML scalar")
+            esc = body[index]
+            if esc == "u":
+                digits = body[index + 1:index + 5]
+                if len(digits) != 4 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                    raise ValueError("Unsupported quoted YAML scalar")
+                out.append(chr(int(digits, 16)))
+                index += 5
+                continue
+            if esc not in _YAML_ESCAPES:
+                raise ValueError("Unsupported quoted YAML scalar")
+            out.append(_YAML_ESCAPES[esc])
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _yaml_key(raw: str) -> str:
+    """映射键：去掉成对的引号（与安全校验器保持一致）。
+
+    MiniMax 等客户端会写 `'1000000': hint` 这种带引号的键；两个解析器必须
+    得到同一个字符串键，否则「严格子集可往返」的校验会误判配置不被支持。
+
+    引号只能整段包住键（`"a:b"`）或出现在键中间（`x'y`）；首尾落单的引号
+    （`"a: b`）必须报错，否则两个解析器会「成功」地读出不同的坏键——静默读坏
+    比拒绝更危险。
+    """
+    key = raw.strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+        return yaml_unquote(key)
+    if key[:1] in "\"'" or key[-1:] in "\"'":
+        raise ValueError(f"Unsupported quoted YAML key: {raw!r}")
+    return key
+
+
+def _yaml_split_comment(line: str) -> str:
+    """去掉行内注释，但不碰引号里面的 ``#``。
+
+    旧实现用 ``re.sub(r"\\s+#.*$")`` 一刀切，会把 ``"has #comment"`` 截成
+    ``"has``：写入端明明加了引号，读回来却成了坏标量。所以扫描时必须跟踪
+    引号状态——引号内的 ``#`` 是内容，只有引号外、前面是空白的 ``#`` 才是注释。
+
+    引号只在「标量开头」才算引号定界符（行首、``: `` 之后、``- `` 之后）；
+    ``k: it's # 注释`` 里的撇号是普通内容，不能当成引号开引号状态，否则行内
+    注释会被当成内容留下来。
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote is None:
+            if char in "\"'" and _at_scalar_start(line, index):
+                quote = char
+            elif char == "#" and index > 0 and line[index - 1] in " \t":
+                return line[:index].rstrip()
+        elif quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+        elif char == "'":
+            quote = None
+        index += 1
+    return line.rstrip()
+
+
+def _at_scalar_start(line: str, index: int) -> bool:
+    """index 处的引号是否处在「一个标量的开头」。"""
+    before = line[:index]
+    if not before.strip():
+        return True                       # 行首（缩进之后）
+    stripped = before.rstrip()
+    if stripped.endswith(":"):
+        return before != stripped         # `key: "…"`，冒号后必须有空白
+    if stripped.endswith("-"):
+        return before != stripped         # `- "…"`，横杠后必须有空白
+    return False
+
+
+def _yaml_split_key(text: str) -> tuple[str, str] | None:
+    """在引号外的第一个 ``:`` 处切分「键: 值」；切不开或切出可疑结果返回 None。
+
+    键可能自带冒号（``'a:b': 1``）或盘符（``"C:\\\\path"``），直接
+    ``partition(":")`` 会在引号内部切断，于是键变成 ``"a``、值变成 ``b"``。
+
+    只有「键的第一个字符是引号」才算引号键；键中间的引号（``a": 1``）是普通
+    内容，否则这种裸键会被误判成引号键而读不回来。
+    """
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote is None:
+            if char in "\"'" and not text[:index].strip():
+                quote = char
+            elif char == ":":
+                key = text[:index].strip()
+                rest = text[index + 1:].strip()
+                if not key:
+                    return None
+                # 引号必须对称。合法形态只有两种：
+                #   1. 整段被同一种引号包住（`"a:b"`）；
+                #   2. 键的首尾都不是引号（引号只能出现在中间，如 `a"b`）。
+                # 首尾出现单个引号（`"a`、`a"`）说明两个读取端会读出不同结果，
+                # 交给上层 fail-closed。
+                if len(key) >= 2 and key[0] == key[-1] and key[0] in "\"'":
+                    pass
+                elif key[0] in "\"'" or key[-1] in "\"'":
+                    return None
+                return key, rest
+        elif quote == '"':
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                quote = None
+        elif char == "'":
+            quote = None
+        index += 1
+    return None
+
+
+def _yaml_has_key(text: str) -> bool:
+    return _yaml_split_key(text) is not None
 
 
 def parse_yaml(text: str) -> Any:
@@ -577,8 +891,8 @@ def parse_yaml(text: str) -> Any:
     for raw in text.splitlines():
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
-        # 去掉行内注释 (简单情况: 空格+#+空格)
-        stripped = re.sub(r"\s+#.*$", "", raw.rstrip())
+        # 去掉行内注释 (引号内的 # 是内容，不算注释)
+        stripped = _yaml_split_comment(raw.rstrip())
         if not stripped.strip():
             continue
         indent = len(stripped) - len(stripped.lstrip(" "))
@@ -598,31 +912,36 @@ def parse_yaml(text: str) -> Any:
                     # 嵌套块
                     val, idx = parse_block(idx + 1, indent + 2)
                     items.append(val)
-                elif ":" in content and not content.startswith("{") and not content.startswith("["):
+                elif not content.startswith(("{", "[")) and _yaml_has_key(content):
                     # 列表项是映射的第一个键
-                    key, _, rest = content.partition(":")
-                    rest = rest.strip()
+                    key, rest = _yaml_split_key(content)  # type: ignore[misc]
                     obj: dict[str, Any] = {}
                     if rest:
-                        obj[key.strip()] = _yaml_scalar(rest) if not rest.startswith(("{", "[")) else _parse_flow(rest)
+                        obj[_yaml_key(key)] = _yaml_scalar(rest) if not rest.startswith(("{", "[")) else _parse_flow(rest)
                         idx += 1
                     else:
                         idx += 1
                         sub, idx = parse_block(idx, indent + 2)
-                        obj[key.strip()] = sub
+                        obj[_yaml_key(key)] = sub
                     # 同缩进后续键
                     while idx < len(lines) and lines[idx][0] >= indent + 2 and not lines[idx][1].startswith("- "):
-                        k2, _, r2 = lines[idx][1].partition(":")
-                        r2 = r2.strip()
+                        split2 = _yaml_split_key(lines[idx][1])
+                        if split2 is None:
+                            # 不能 break：那会把 idx 留在原地，顶层
+                            # `parse_block(0, ...)` 丢掉返回的游标，于是这一行
+                            # 之后的整个文档被静默吞掉。读不懂就报错。
+                            raise ValueError(
+                                f"Unsupported YAML line in list item: {lines[idx][1]!r}")
+                        k2, r2 = split2
                         if r2:
-                            obj[k2.strip()] = (
+                            obj[_yaml_key(k2)] = (
                                 _yaml_scalar(r2) if not r2.startswith(("{", "[")) else _parse_flow(r2)
                             )
                             idx += 1
                         else:
                             idx += 1
                             sub, idx = parse_block(idx, lines[idx - 1][0] + 2 if False else indent + 4)
-                            obj[k2.strip()] = sub
+                            obj[_yaml_key(k2)] = sub
                     items.append(obj)
                 else:
                     items.append(_yaml_scalar(content) if not content.startswith(("{", "[")) else _parse_flow(content))
@@ -632,9 +951,13 @@ def parse_yaml(text: str) -> Any:
         # 映射
         obj = {}
         while idx < len(lines) and lines[idx][0] == indent and not lines[idx][1].startswith("- "):
-            key, _, rest = lines[idx][1].partition(":")
-            key = key.strip()
-            rest = rest.strip()
+            split = _yaml_split_key(lines[idx][1])
+            if split is None:
+                # 既不是「键: 值」也不是列表项：子集解析器读不懂，抛错让上层
+                # fail-closed，而不是悄悄产出一个坏结果。
+                raise ValueError(f"Unsupported YAML line: {lines[idx][1]!r}")
+            key, rest = split
+            key = _yaml_key(key)
             if rest:
                 obj[key] = _yaml_scalar(rest) if not rest.startswith(("{", "[")) else _parse_flow(rest)
                 idx += 1
@@ -655,8 +978,13 @@ def parse_yaml(text: str) -> Any:
                 return {}
             result = {}
             for part in _split_flow(inner):
-                k, _, v = part.partition(":")
-                result[k.strip()] = _yaml_scalar(v) if not v.strip().startswith(("[", "{")) else _parse_flow(v)
+                # 行内映射的键也要按引号规则切分：键含冒号（{"a:b": 1}）时
+                # partition(":") 会在键内部切断。
+                pair = _yaml_split_key(part)
+                if pair is None:
+                    raise ValueError(f"Unsupported YAML flow mapping: {part!r}")
+                k, v = pair
+                result[_yaml_key(k)] = _yaml_scalar(v) if not v.startswith(("[", "{")) else _parse_flow(v)
             return result
         if s.startswith("[") and s.endswith("]"):
             inner = s[1:-1].strip()
@@ -666,9 +994,33 @@ def parse_yaml(text: str) -> Any:
         return _yaml_scalar(s)
 
     def _split_flow(s: str) -> list[str]:
+        """按顶层逗号切分行内集合；引号内的逗号是内容。
+
+        旧实现只跟踪 ``{}``/``[]`` 深度，`["x,y"]` 会被切成两个元素，
+        `{b: "x,y"}` 会切出一个坏片段（写入端产出的文本读不回来）。
+        """
         parts, depth, cur = [], 0, []
-        for ch in s:
-            if ch in "{[":
+        quote: str | None = None
+        index = 0
+        while index < len(s):
+            ch = s[index]
+            if quote is not None:
+                cur.append(ch)
+                if quote == '"':
+                    if ch == "\\":
+                        if index + 1 < len(s):
+                            cur.append(s[index + 1])
+                            index += 2
+                            continue
+                    elif ch == '"':
+                        quote = None
+                elif ch == "'":
+                    quote = None
+                index += 1
+                continue
+            if ch in "\"'":
+                quote = ch
+            elif ch in "{[":
                 depth += 1
             elif ch in "}]":
                 depth -= 1
@@ -677,11 +1029,19 @@ def parse_yaml(text: str) -> Any:
                 cur = []
             else:
                 cur.append(ch)
+            index += 1
         if cur:
             parts.append("".join(cur))
         return parts
 
-    data, _ = parse_block(0, lines[0][0] if lines else 0)
+    # 空文档写成 `{}` / `[]`（dump_yaml 对空容器的产物）：安全校验器有专门的
+    # 分支接受它们，宽松解析器也必须接受，否则写入端自己的输出读不回来。
+    if len(lines) == 1 and lines[0][1] in ("{}", "[]"):
+        return {} if lines[0][1] == "{}" else []
+    data, end = parse_block(0, lines[0][0] if lines else 0)
+    if end != len(lines):
+        # 游标没走完说明有内容被静默丢弃；宁可报错，也不能让调用方拿到半份配置。
+        raise ValueError(f"Unconsumed YAML content at line {end + 1}: {lines[end][1]!r}")
     return data
 
 
@@ -694,23 +1054,23 @@ def dump_yaml(obj: Any, indent: int = 0) -> str:
         lines = []
         for k, v in obj.items():
             if isinstance(v, dict) and v:
-                lines.append(f"{pad}{k}:")
+                lines.append(f"{pad}{_fmt_key(k)}:")
                 lines.append(dump_yaml(v, indent + 1))
             elif isinstance(v, list) and v:
-                lines.append(f"{pad}{k}:")
+                lines.append(f"{pad}{_fmt_key(k)}:")
                 lines.append(dump_yaml(v, indent + 1))
             elif isinstance(v, dict):
-                lines.append(f"{pad}{k}: {{}}")
+                lines.append(f"{pad}{_fmt_key(k)}: {{}}")
             elif isinstance(v, list):
-                lines.append(f"{pad}{k}: []")
+                lines.append(f"{pad}{_fmt_key(k)}: []")
             elif v is None:
-                lines.append(f"{pad}{k}: null")
+                lines.append(f"{pad}{_fmt_key(k)}: null")
             elif isinstance(v, bool):
-                lines.append(f"{pad}{k}: {'true' if v else 'false'}")
+                lines.append(f"{pad}{_fmt_key(k)}: {'true' if v else 'false'}")
             elif isinstance(v, (int, float)):
-                lines.append(f"{pad}{k}: {v}")
+                lines.append(f"{pad}{_fmt_key(k)}: {_fmt_number(v)}")
             else:
-                lines.append(f"{pad}{k}: {_fmt_str(v)}")
+                lines.append(f"{pad}{_fmt_key(k)}: {_fmt_str(v)}")
         return "\n".join(lines)
     if isinstance(obj, list):
         if not obj:
@@ -724,7 +1084,9 @@ def dump_yaml(obj: Any, indent: int = 0) -> str:
                     continue
                 first = keys[0]
                 rest = {k: item[k] for k in keys[1:]}
-                head = f"{pad}- {first}: {_fmt_val_inline(item[first])}"
+                # 列表项里映射的第一个键走 _fmt_key：键含冒号时裸写会让读取端
+                # 在错误的位置切开（`- a:b: {k: v}` 被读成 a -> 'b: {k: v}'）。
+                head = f"{pad}- {_fmt_key(first)}: {_fmt_val_inline(item[first])}"
                 lines.append(head)
                 if rest:
                     sub = dump_yaml(rest, indent + 1)
@@ -736,18 +1098,131 @@ def dump_yaml(obj: Any, indent: int = 0) -> str:
                         else:
                             lines.append(sl)
             elif isinstance(item, list):
-                lines.append(f"{pad}-")
-                lines.append(dump_yaml(item, indent + 1))
+                if not item:
+                    # 空列表占位必须写成 `- []`：裸写 `[]` 会变成一行独立的
+                    # `[]`，两个读取端都读不懂。
+                    lines.append(f"{pad}- []")
+                else:
+                    lines.append(f"{pad}-")
+                    lines.append(dump_yaml(item, indent + 1))
             else:
                 lines.append(f"{pad}- {_fmt_val_inline(item)}")
         return "\n".join(lines)
     return f"{pad}{_fmt_val_inline(obj)}"
 
 
+def _fmt_key(key: Any) -> str:
+    """映射键的 YAML 写法。
+
+    含 ``:``、引号、空白+#、控制字符、以 YAML 指示符或 ``#`` 开头、或本身像
+    布尔 / 空值的键必须加引号：不加引号时安全校验读不回来（``#lead:`` 整行会被
+    当成注释丢掉，``ovh'cloud:`` 会让两个读取端读出不同结果），工具自己的输出
+    必须能被自己安全地读回。模型 ID（含 ``[ ] /`` 等）不需要引号。
+    """
+    s = str(key)
+    if (not s or ":" in s or s[0] in _UNQUOTED_START or any(c.isspace() for c in s)
+            or _needs_escaped_quote(s) or _NEEDS_QUOTE.search(s)
+            or s.lower() in _YAML_WORDS or _numberish(s)):
+        return _quoted(s)
+    return s
+
+
+# 看起来像布尔 / 空值 / 数字的字符串：必须加引号，否则读回来类型就变了。
+# 单个数字形态统一由 _NUMBER_FORMS 判定，避免两处列表各自漂移。
+_YAML_WORDS = frozenset((
+    "true", "false", "null", "~", "yes", "no", "on", "off"))
+
+
+def _bare_number(text: str) -> bool:
+    """裸写形态会被安全校验器接受、且读成数字的形态。
+
+    校验器对以 ``-`` / ``+`` / ``?`` / ``.`` 开头的标量一律判为 Ambiguous，
+    所以只有无符号的整数与小数能裸写：``128000`` / ``1.5`` 可以，``-1`` 不行。
+    这类字符串必须加引号才能保住字符串类型（裸写会被读成数字）。
+    """
+    return bool(re.fullmatch(r"\d[\d_]*", text)
+                or re.fullmatch(r"[\d_]*\.[\d_]+", text))
+
+
+def _repr_quoted_number(text: str) -> bool:
+    """写入端为「数字」加过引号的形态：只有这些读回来才还原成数字。
+
+    即负数、科学计数法（``1e+30`` / ``1e-07``）与 ``inf`` / ``nan``——它们裸写
+    会被校验器拒绝或读成字符串，所以数字由 ``repr`` 写出、读取端必须还原。
+    ``0x1f`` / ``1.`` / ``0b101`` 只是「长得像数字的字符串」，写入端照常加引号
+    当字符串，读回来也保持字符串。
+    """
+    return bool(re.fullmatch(r"[+-][\d_]+", text)
+                or re.fullmatch(r"[+-][\d_]*\.[\d_]+", text)
+                or re.fullmatch(r"[+-]?(?:\d[\d_]*\.?[\d_]*|\.\d+)[eE][-+]?\d+", text)
+                or re.fullmatch(r"[+-]?(?:inf(?:inity)?|nan)", text, re.IGNORECASE))
+
+
+def _numberish(text: str) -> bool:
+    """任何「看起来是数字」的形态：这类字符串加引号以保住字符串类型。"""
+    if _bare_number(text):
+        return True
+    return _repr_quoted_number(text) or bool(
+        re.fullmatch(r"[+-]?0[bB][01_]+", text)
+        or re.fullmatch(r"[+-]?0[xX][0-9a-fA-F_]+", text)
+        or re.fullmatch(r"[+-]?0[oO][0-7_]+", text)
+        or re.fullmatch(r"[+-]?[\d_]+\.", text))
+
+
+_UNQUOTED_START = "-?:,[]{}#&*!|>'\"%@`"
+# 包含它们就必须加引号：流式集合、注释「 #」、键值分隔符、引号。
+# 模型 ID 常含 [ ]（如 anthropic/stealth/space-bunny-alpha[1m]），不加引号会让
+# 安全校验读不回来；`#` 会被当成行内注释截断，也需要引号。
+_NEEDS_QUOTE = re.compile(r"""[:\[\]{}&*!|>%@`,#'"]""")
+# 行分隔符 + 其它控制字符：裸写会被 str.splitlines() 切断（U+2028 等 json.dumps
+# 不会转义），读回来只剩前半截；TAB 则直接被安全校验拒绝。
+_YAML_ESCAPE_ALWAYS = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0085\u2028\u2029\t]")
+
+
+def _needs_escaped_quote(s: str) -> bool:
+    """必须用双引号 + 转义写出的字符：引号、控制字符、行分隔符、非 ASCII 换行。
+
+    ``json.dumps`` 会把它们转义成 ``\\n`` / ``\\t`` / ``\\uXXXX``，两个读取端都认。
+    """
+    if any(c in s for c in "\"'") or any(c.isspace() and c != " " for c in s):
+        return True
+    return bool(_YAML_ESCAPE_ALWAYS.search(s))
+
+
+# json.dumps(ensure_ascii=False) 不会转义这几个：U+0085/U+2028/U+2029 是
+# Unicode 行分隔符，而 str.splitlines() 会在它们处断行——原样写出去会把一个
+# 标量劈成两行，读回来只剩前半截。所以写出前显式转成 \uXXXX。
+_UNESCAPED_LINE_BREAKS = re.compile(r"[\u0085\u2028\u2029]")
+
+
+def _quoted(s: str) -> str:
+    """安全的双引号 YAML/JSON 标量：json.dumps + 手工补上 Unicode 行分隔符。"""
+    return _UNESCAPED_LINE_BREAKS.sub(
+        lambda m: "\\u%04x" % ord(m.group(0)), json.dumps(s, ensure_ascii=False))
+
+
+def _fmt_number(v: Any) -> str:
+    """数字的 YAML 写法：裸写形态必须能被两个读取端还原成同一个值。
+
+    整数与普通小数（含负数，如 ``-1`` / ``-3.25``）裸写即可，校验器接受。
+    科学计数法（``1e+30``）、进制字面量、``inf`` / ``nan`` 裸写会被校验器拒绝或
+    读成字符串，所以加引号写出，再由 ``_numeric`` 还原类型。万一还原不回去就退回
+    字符串写法，绝不写出会静默变类型的文本。
+    """
+    plain = str(v) if isinstance(v, int) and not isinstance(v, bool) else repr(v)
+    if _bare_number(plain) and _numeric(plain) == v:
+        return plain
+    quoted = _quoted(plain)
+    return quoted if _numeric(plain) == v else _quoted(str(v))
+
+
 def _fmt_str(v: Any) -> str:
     s = str(v)
-    if s == "" or re.search(r"[:#\[\]{},&*?|>!%@`]", s) or s.strip() != s:
-        return json.dumps(s, ensure_ascii=False)
+    if (not s or s.strip() != s or _needs_escaped_quote(s)
+            or s.lower() in _YAML_WORDS or _numberish(s)
+            or s[0] in _UNQUOTED_START or _NEEDS_QUOTE.search(s)):
+        return _quoted(s)
     return s
 
 
@@ -757,11 +1232,11 @@ def _fmt_val_inline(v: Any) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
-        return str(v)
+        return _fmt_number(v)
     if isinstance(v, dict):
         if not v:
             return "{}"
-        inner = ", ".join(f"{k}: {_fmt_val_inline(val)}" for k, val in v.items())
+        inner = ", ".join(f"{_fmt_key(k)}: {_fmt_val_inline(val)}" for k, val in v.items())
         return "{" + inner + "}"
     if isinstance(v, list):
         if not v:
@@ -797,7 +1272,8 @@ class DshModelPlan:
         for pid, p in self.providers.items():
             if not p.get("enabled", True):
                 continue
-            if not p.get("baseUrl"):
+            conn = agent_connection(p, "dsh")
+            if not conn["baseUrl"]:
                 raise ValueError(f"dsh 需要 {pid} 的 baseUrl（OpenAI 兼容端点）")
             self.routes[pid] = pid
 
@@ -808,6 +1284,7 @@ class DshModelPlan:
 
     def block(self, pid: str) -> dict:
         p = self.providers[pid]
+        conn = agent_connection(p, "dsh")
         models = [
             {
                 "id": m["id"],
@@ -817,14 +1294,14 @@ class DshModelPlan:
                 "input": m.get("input", ["text"]),
                 "reasoningEfforts": {"off": None, "low": "low", "high": "high", "max": "max"},
             }
-            for m in p.get("models", [])
+            for m in conn["models"]
         ]
         return {
             "displayName": p.get("displayName") or p.get("name"),
             "apiKeyEnv": self.env_name(pid),
-            "api": p.get("api", "openai-completions"),
-            "baseURL": p["baseUrl"],
-            **({"compat": p["compat"]} if p.get("compat") else {}),
+            "api": conn["api"],
+            "baseURL": conn["baseUrl"],
+            **({"compat": conn["compat"]} if conn.get("compat") else {}),
             "models": models,
         }
 
@@ -834,7 +1311,7 @@ class DshModelPlan:
     def credentials(self) -> dict[str, str]:
         out = {}
         for pid in self.routes:
-            key = self.providers[pid].get("apiKey")
+            key = agent_connection(self.providers[pid], "dsh")["apiKey"]
             if isinstance(key, str) and key.strip():
                 out[self.env_name(pid)] = key
         return out
@@ -924,11 +1401,18 @@ class Hub:
         provider 可以用 "targets": ["claude"] 把自己限制到指定平台；
         未声明时进入所有平台。这样 Anthropic 专用网关不会污染 pi/mcode/zcode
         等 OpenAI 兼容平台的配置。
+
+        同时要求该 Agent 的连接就绪（端点 + 协议匹配）：给 Claude Code 用需要
+        Anthropic Messages 端点，给 Codex 第三方用需要 Responses 端点；
+        按 Agent 覆盖（agents.<agent>）可以为同一供应商补齐这些连接。
         """
+        canonical = canonical_target(target)
         return {
             pid: p
             for pid, p in self.providers.items()
-            if not p.get("targets") or target in p["targets"]
+            if provider_targets(p, canonical)
+            and p.get("enabled", True)
+            and agent_connection_ready(p, canonical)
         }
 
     # -- push adapters --
@@ -984,7 +1468,8 @@ class Hub:
         for pid, p in self.providers_for("pi").items():
             if not p.get("enabled", True):
                 continue
-            if not isinstance(p.get("apiKey"), str) or not p["apiKey"].strip():
+            conn = agent_connection(p, "pi")
+            if not isinstance(conn["apiKey"], str) or not conn["apiKey"].strip():
                 raise ValueError(f"pi 供应商 {pid} 缺少 apiKey；此版本的 pi 适配器不解析 Codex 环境变量引用")
             # 以 pi 现有条目为底稿：hub 只覆盖自己管理的键，
             # pi 侧独有的 cost / headers / oauth 等字段与用户手工参数不会被抹掉。
@@ -993,22 +1478,22 @@ class Hub:
             entry.update(
                 {
                     "name": p.get("displayName") or p.get("name"),
-                    "baseUrl": p["baseUrl"],
-                    "api": p.get("api", "openai-completions"),
-                    "apiKey": p["apiKey"],
+                    "baseUrl": conn["baseUrl"],
+                    "api": conn["api"],
+                    "apiKey": conn["apiKey"],
                 }
             )
             # 供应商级 compat 必须下发：maxTokensField / supportsDeveloperRole /
             # thinkingFormat 等缺失会让 pi 发出的请求被网关 400 拒绝。
-            if p.get("compat"):
-                entry["compat"] = copy.deepcopy(p["compat"])
+            if conn.get("compat"):
+                entry["compat"] = copy.deepcopy(conn["compat"])
             pi_models_by_id = {
                 m.get("id"): m
                 for m in (previous.get("models") if isinstance(previous, dict) else None) or []
                 if isinstance(m, dict)
             }
             entry["models"] = []
-            for m in p.get("models", []):
+            for m in conn["models"]:
                 old = pi_models_by_id.get(m["id"]) or {}
                 item = dict(old)
                 item.update(
@@ -1028,7 +1513,7 @@ class Hub:
                         item[key] = copy.deepcopy(m[key])
                 entry["models"].append(item)
             providers[pid] = entry
-            auth[pid] = {"type": "api_key", "key": p["apiKey"]}
+            auth[pid] = {"type": "api_key", "key": conn["apiKey"]}
 
         # 多 agent 模型同步：只有显式配置了 modelSync 才动 settings.json 的默认模型，
         # 否则保留用户自己挑的 defaultProvider / defaultModel。
@@ -1072,11 +1557,12 @@ class Hub:
         for pid, p in self.providers_for("mcode").items():
             if not p.get("enabled", True):
                 continue
+            conn = agent_connection(p, "mcode")
             key = pid if pid in ("deepseek", "stepfun") else (
                 "volcano" if pid == "firework" else pid
             )
             models_entry = {}
-            for m in p.get("models", []):
+            for m in conn["models"]:
                 mod: dict[str, Any] = {
                     "name": m.get("name", m["id"]),
                     "attachment": "image" in m.get("input", []),
@@ -1097,11 +1583,11 @@ class Hub:
                 "name": p.get("displayName") or p.get("name"),
                 "kind": "custom",
                 "enabled": True,
-                "api": p.get("api", "openai-completions"),
+                "api": conn["api"],
                 "options": {
-                    "baseURL": p["baseUrl"],
+                    "baseURL": conn["baseUrl"],
                     "authMode": "api-key",
-                    "apiKey": p["apiKey"],
+                    "apiKey": conn["apiKey"],
                 },
                 "models": models_entry,
             }
@@ -1142,9 +1628,10 @@ class Hub:
         for pid, p in self.providers_for("zcode").items():
             if not p.get("enabled", True):
                 continue
+            conn = agent_connection(p, "zcode")
             zid = id_map.get(pid, pid)
             zname = name_map.get(pid, p.get("displayName") or p.get("name"))
-            model_ids = [m["id"] for m in p.get("models", [])]
+            model_ids = [m["id"] for m in conn["models"]]
 
             existing = by_id.get(zid) or by_name.get(zname)
             api_type = "openai-responses" if pid == "firework" else "openai-chat-completions"
@@ -1167,8 +1654,8 @@ class Hub:
                 by_id[zid] = existing
 
             cfg_inner.setdefault("group", "standard-personal")
-            cfg_inner["access"] = {"type": "api-key", "apiKey": p["apiKey"]}
-            cfg_inner["api"] = {"type": api_type, "baseUrl": p["baseUrl"]}
+            cfg_inner["access"] = {"type": "api-key", "apiKey": conn["apiKey"]}
+            cfg_inner["api"] = {"type": api_type, "baseUrl": conn["baseUrl"]}
             cfg_inner["personalModelIds"] = model_ids
             cfg_inner["modelOrder"] = model_ids
             if zid not in order:
@@ -1298,47 +1785,55 @@ class Hub:
 
     # ---- claude (Claude Code) ----
     def push_claude(self) -> None:
-        """直接配置 Claude Code；绝不隐式写入其他工具的数据库。"""
-        settings_path = HOME / ".claude" / "settings.json"
-        anthropic_providers = {
-            pid: p
-            for pid, p in self.providers_for("claude").items()
-            if p.get("enabled", True) and p.get("anthropicBaseUrl")
-        }
-        if not anthropic_providers:
-            return
+        """直接配置 Claude Code；绝不隐式写入其他工具的数据库。
 
-        claude_cfg = (self.cfg.get("sync", {}).get("targets", {}).get("claude") or {})
-        active = claude_cfg.get("activeProvider") or "deepseek"
+        Claude Code 与其它 Agent 走同一套规则：只有 modelSync 为它解析出主模型
+        时才写入 ~/.claude/settings.json 的 ANTHROPIC_*；没有配置就保持现状。
+        连接走 ``agents.claude``（缺省时用 anthropicBaseUrl 兼容字段），透传字段也是
+        该连接自己的 env / settings。
+
+        平台级特性开关（featureEnv）属于 Claude Code 本身，即使没有选定模型也会
+        写入，否则「切到别的供应商后特性丢失」的事故会重演。
+        """
+        settings_path = HOME / ".claude" / "settings.json"
+        tiers = agent_model_tiers(self.cfg, "claude")
+        main = tiers.get("model")
         # 平台级特性开关：不属于任何 provider，切换 provider 不收回
-        feature_env = claude_cfg.get("featureEnv") or {}
-        if active not in anthropic_providers:
-            active = next(iter(anthropic_providers))
-        # modelSync 指向的供应商若具备 Anthropic 端点，就以它为准：跨客户端同步
-        # 一次选定同一个模型，Claude Code 不应该还停在平台配置里的旧供应商。
-        # 编译只读取 Hub 配置；每次按同样的 modelSync 优先级解析，不隐式回写。
-        synced = resolve_agent_model(self.cfg, "claude")
-        if synced and synced["provider"] in anthropic_providers and synced["provider"] != active:
-            active = synced["provider"]
-        # 1) ~/.claude/settings.json — 只改 env 中的 ANTHROPIC_*，保留 hooks/permissions 等
+        feature_env = (self.cfg.get("sync", {}).get("targets", {}).get("claude") or {}).get("featureEnv") or {}
+        if not main and not feature_env:
+            return
         if settings_path.exists():
             backup_file(settings_path)
             data = load_json(settings_path, default={}) or {}
         else:
             data = {"$schema": "https://json.schemastore.org/claude-code-settings.json"}
         env = data.setdefault("env", {})
-        p = anthropic_providers[active]
-        if not isinstance(p.get("apiKey"), str) or not p["apiKey"].strip():
-            raise ValueError(f"Claude 供应商 {active} 缺少 apiKey；Codex 环境变量引用不适用于此适配器")
-        cm = p.get("claudeModels") or {}
-        tiers = agent_model_tiers(self.cfg, "claude")
+        if main is None:
+            # 没有选定模型：只补平台特性开关，不猜供应商，也不动任何 ANTHROPIC_* 键
+            for k, v in self._feature_env_values(feature_env).items():
+                env[k] = v
+            data["env"] = env
+            save_json(settings_path, data)
+            return
 
+        active = main["provider"]
+        anthropic_providers = claude_providers(self.providers)
+        p = anthropic_providers.get(active)
+        if p is None:
+            raise ValueError(f"Claude 供应商 {active} 没有可用的 Anthropic 连接")
+        conn = agent_connection(p, "claude")
+        if not conn["baseUrl"].strip():
+            raise ValueError(f"Claude 供应商 {active} 缺少 Anthropic 端点")
+        if not conn["apiKey"].strip():
+            raise ValueError(f"Claude 供应商 {active} 缺少 apiKey；Codex 环境变量引用不适用于此适配器")
+        # 1) ~/.claude/settings.json — 只改 env 中的 ANTHROPIC_*，保留 hooks/permissions 等
+        #    （载入与备份已在上面的 featureEnv 分支之前完成）
         def tier_model(tier: str):
-            """档位模型：活跃供应商的 claudeModels 优先，其次 modelSync 解析结果。"""
+            """档位模型：只有 modelSync 显式指定过的档位才写。"""
             resolved = tiers.get(tier)
             return resolved["model"] if resolved else None
 
-        main_model = tiers.get("model", {}).get("model") or cm.get("model")
+        main_model = tiers.get("model", {}).get("model")
         # 模型别名
         model_map = {
             "ANTHROPIC_MODEL": main_model,
@@ -1352,14 +1847,15 @@ class Hub:
             "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": tier_model("fable"),
             "CLAUDE_CODE_SUBAGENT_MODEL": tier_model("subagent"),
         }
-        # 自定义供应商：声明式透传任意 env 变量 (CLAUDE_CODE_*、ENABLE_TOOL_SEARCH 等)
+        env = data.setdefault("env", {})
+        # 自定义供应商：连接上声明式透传任意 env 变量 (CLAUDE_CODE_*、ENABLE_TOOL_SEARCH 等)
         extra_env = {
-            k: v for k, v in (p.get("claudeEnv") or {}).items()
+            k: v for k, v in conn["env"].items()
             if k not in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL")
         }
         written_env = {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}
-        env["ANTHROPIC_AUTH_TOKEN"] = p["apiKey"]
-        env["ANTHROPIC_BASE_URL"] = p["anthropicBaseUrl"]
+        env["ANTHROPIC_AUTH_TOKEN"] = conn["apiKey"]
+        env["ANTHROPIC_BASE_URL"] = conn["baseUrl"]
         for k, v in model_map.items():
             if v:
                 env[k] = v
@@ -1367,11 +1863,12 @@ class Hub:
         for k, v in extra_env.items():
             env[k] = v
             written_env.add(k)
-        # hub 自己管理的 env 键命名空间（闭集）：固定别名 + 各 provider 声明的 claudeEnv。
-        # 用它来收回残留：hub 声明过的键就归 hub 管，用户手工加的键不在其中，永不受影响。
+        # hub 自己管理的 env 键命名空间（闭集）：固定别名 + 各 provider 的 Claude 连接
+        # 声明过的 env。用它来收回残留：hub 声明过的键就归 hub 管，用户手工加的键
+        # 不在其中，永不受影响。
         owned_env = {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", *model_map}
         for q in anthropic_providers.values():
-            owned_env.update(k for k in (q.get("claudeEnv") or {})
+            owned_env.update(k for k in agent_connection(q, "claude")["env"]
                              if k not in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"))
         # 切换 provider 时收回上一个 provider 写入、当前 provider 未声明的 env 键：
         # 否则切到不声明 fable 的供应商后，ANTHROPIC_DEFAULT_FABLE_MODEL 还留着上一家的模型名。
@@ -1379,30 +1876,30 @@ class Hub:
             if k not in written_env:
                 env.pop(k, None)
         data["env"] = env
-        # 平台级特性开关最后写入：即使某个 provider 的 claudeEnv 声明过同名键、
-        # 刚才被 owned_env 收回，这里也按平台配置补齐，切换 provider 不丢特性。
+        # 平台级特性开关最后写入：即使某个连接的 env 声明过同名键、刚才被 owned_env
+        # 收回，这里也按平台配置补齐，切换 provider 不丢特性。
         for k, v in self._feature_env_values(feature_env).items():
             env[k] = v
 
-        # 自定义供应商：声明式透传任意顶层 settings 字段
+        # 自定义供应商：连接上声明式透传任意顶层 settings 字段
         # (model / effortLevel / permissions / includeCoAuthoredBy / skipDangerousModePermissionPrompt ...)
         settings_map = {
-            k: v for k, v in (p.get("claudeSettings") or {}).items()
+            k: v for k, v in conn["settings"].items()
             if k not in ("env", "$schema")
         }
-        # model 有两个来源：claudeModels.model（→ env.ANTHROPIC_MODEL）和
-        # claudeSettings.model（→ 顶层 model）。同时声明时以 claudeModels 为准，
+        # model 有两个来源：modelSync 主模型（→ env.ANTHROPIC_MODEL）和
+        # 连接 settings 里的 model（→ 顶层 model）。同时声明时以 modelSync 为准，
         # 否则出现「切换了模型但顶层 model 还指着旧型号」的漂移。
         if main_model and "model" in settings_map:
             settings_map["model"] = main_model
-        # 顶层键同理：任一 provider 声明过的键都归 hub 管，切换时收回未声明的，
-        # 避免残留上一家的 model / effortLevel。用户从未被任何 provider 声明过的
-        # 键（hooks / statusLine / modelSettings …）不在命名空间里，永不受影响。
+        # 顶层键同理：任一 provider 的 Claude 连接声明过的键都归 hub 管，切换时收回
+        # 未声明的，避免残留上一家的 model / effortLevel。用户从未被任何 provider
+        # 声明过的键（hooks / statusLine / modelSettings …）不在命名空间里，永不受影响。
         # 注意 env / $schema 不能进这个命名空间——它们由 settings_map 的过滤条件始终排除，
         # 一旦进来就会被下面这段循环误删。
         owned_keys = set()
         for q in anthropic_providers.values():
-            owned_keys.update((q.get("claudeSettings") or {}).keys())
+            owned_keys.update(agent_connection(q, "claude")["settings"].keys())
         for k in owned_keys:
             if k not in settings_map:
                 data.pop(k, None)
@@ -1425,11 +1922,16 @@ class Hub:
         if mode == "third-party":
             if tier is None:
                 raise ValueError("Codex 第三方模式需要选择模型")
-            provider = self.providers_for("codex").get(tier["provider"])
-            if not isinstance(provider, dict) or provider.get("enabled", True) is False:
+            entry = self.providers_for("codex").get(tier["provider"])
+            if not isinstance(entry, dict) or entry.get("enabled", True) is False:
                 raise ValueError("Codex 选定的供应商未启用或不适用于此平台")
-            if not any(m.get("id") == tier["model"] for m in provider.get("models", [])):
-                raise ValueError("Codex 选定的模型不在供应商模型列表中")
+            conn = agent_connection(entry, "codex")
+            if not any(m.get("id") == tier["model"] for m in conn["models"]):
+                raise ValueError("Codex 选定的模型不在该供应商的 Codex 连接模型列表中")
+            # codex_config 只认归一化后的连接形状：端点、协议与授权三者缺一不可
+            provider = dict(entry, baseUrl=conn["baseUrl"], api=conn["api"],
+                            apiKeyEnv=conn["apiKeyEnv"], openaiApiKey=conn["apiKey"],
+                            codexWireApi="responses")
         text = config_path.read_text(encoding="utf-8")
         saved = load_json(state_path)
         rendered, next_state = compile_config(text, saved, mode, provider, tier)
@@ -1569,13 +2071,14 @@ class Hub:
                 for pid, p in self.providers_for("cc-switch").items():
                     if not p.get("enabled", True):
                         continue
+                    conn = agent_connection(p, app_type)
                     display = p.get("displayName") or p.get("name")
                     if app_type == "pi":
                         row_name = pid if pid != "firework" else "volcano"
                         settings_config = {
-                            "baseUrl": p["baseUrl"],
-                            "api": p.get("api", "openai-completions"),
-                            "apiKey": p["apiKey"],
+                            "baseUrl": conn["baseUrl"],
+                            "api": conn["api"],
+                            "apiKey": conn["apiKey"],
                             "models": [
                                 {
                                     "id": m["id"],
@@ -1585,7 +2088,7 @@ class Hub:
                                     "contextWindow": m.get("contextWindow", 128000),
                                     "maxTokens": m.get("maxTokens", 32768),
                                 }
-                                for m in p.get("models", [])
+                                for m in conn["models"]
                             ],
                         }
                     else:
@@ -1594,11 +2097,11 @@ class Hub:
                             "name": row_name,
                             "kind": "custom",
                             "enabled": True,
-                            "api": p.get("api", "openai-completions"),
+                            "api": conn["api"],
                             "options": {
-                                "baseURL": p["baseUrl"],
+                                "baseURL": conn["baseUrl"],
                                 "authMode": "api-key",
-                                "apiKey": p["apiKey"],
+                                "apiKey": conn["apiKey"],
                             },
                             "models": {
                                 m["id"]: {
@@ -1616,7 +2119,7 @@ class Hub:
                                         "output": ["text"],
                                     },
                                 }
-                                for m in p.get("models", [])
+                                for m in conn["models"]
                             },
                         }
                     cur.execute(
@@ -1692,17 +2195,24 @@ class Hub:
                         "models": [],
                     }
                 else:
+                    # 写回真正持有该端点的那一层：agents.<agent> 覆盖或顶层默认连接
+                    override = (providers[pid].get("agents") or {}).get("pi")
+                    override = override if isinstance(override, dict) else {}
+                    target = override if override.get("baseUrl") else providers[pid]
                     if entry.get("apiKey"):
-                        providers[pid]["apiKey"] = entry["apiKey"]
+                        target["apiKey"] = entry["apiKey"]
                     if entry.get("baseUrl"):
-                        providers[pid]["baseUrl"] = entry["baseUrl"]
+                        target["baseUrl"] = entry["baseUrl"]
         elif agent == "dsh":
             imported = HOME / ".dsh" / "settings.yaml.imported"
             if imported.exists():
                 data = parse_yaml(imported.read_text(encoding="utf-8")) or {}
                 for pid, entry in ((data.get("llm-pi-ai") or {}).get("providers") or {}).items():
                     if pid in providers and entry.get("baseURL"):
-                        providers[pid]["baseUrl"] = entry["baseURL"]
+                        override = (providers[pid].get("agents") or {}).get("dsh")
+                        override = override if isinstance(override, dict) else {}
+                        target = override if override.get("baseUrl") else providers[pid]
+                        target["baseUrl"] = entry["baseURL"]
         elif agent == "claude":
             settings_path = HOME / ".claude" / "settings.json"
             if settings_path.exists():
@@ -1711,17 +2221,22 @@ class Hub:
                 token = env.get("ANTHROPIC_AUTH_TOKEN")
                 base = env.get("ANTHROPIC_BASE_URL")
                 if token and base:
-                    # 反查哪个 provider 的 anthropicBaseUrl 匹配
+                    # 反查哪个 provider 的 Claude 连接端点匹配（连接可能来自
+                    # agents.claude 覆盖，也可能是旧的 anthropicBaseUrl）
                     for pid, p in providers.items():
-                        if p.get("anthropicBaseUrl") == base and token == p.get("apiKey"):
-                            # 已匹配，无需改
-                            break
-                    else:
-                        # base 能对上但 key 变了 → 更新 key
-                        for pid, p in providers.items():
-                            if p.get("anthropicBaseUrl") == base:
-                                p["apiKey"] = token
-                                break
+                        conn = agent_connection(p, "claude")
+                        override = (p.get("agents") or {}).get("claude")
+                        override = override if isinstance(override, dict) else {}
+                        if conn["baseUrl"] != base:
+                            continue
+                        if conn["apiKey"] == token:
+                            break  # 已匹配，无需改
+                        # base 能对上但 key 变了 → 写回真正持有该端点的那一层
+                        if override.get("baseUrl") == base:
+                            override["apiKey"] = token
+                        else:
+                            p["apiKey"] = token
+                        break
         disk["providers"] = providers
         disk["updatedAt"] = now_iso()
         # pull 只更新 apiKey/baseUrl，绝不允许模型列表变少
@@ -1884,15 +2399,24 @@ class Hub:
                 p = expand(f)
                 status_parts.append(f"{'✓' if p.exists() else '✗'} {p.name}")
             extra = ""
+            if tname == "codex":
+                extra = f"  mode={tcfg.get('mode', 'official')}"
             if tname == "claude":
-                active = tcfg.get("activeProvider", "?")
-                extra = f"  active={active}"
-                # 仅 anthropic 可用
-                caps = [pid for pid, p in self.providers.items() if p.get("anthropicBaseUrl")]
-                extra += f"  anthropic-capable={','.join(caps) or 'none'}"
+                caps = claude_providers(self.providers)
+                extra = f"  claude-ready={','.join(caps) or 'none'}"
             if tcfg.get("aliasOf"):
                 extra += f"  (alias of {tcfg['aliasOf']})"
             lines.append(f"  {tname:12} enabled={en}  {', '.join(status_parts)}{extra}")
+        lines.append("")
+        lines.append("按 Agent 的连接 (agents.<agent> 覆盖默认连接):")
+        for pid, p in self.providers.items():
+            parts = []
+            for name in AGENT_CONNECTION_TARGETS:
+                conn = agent_connection(p, name)
+                mark = "*" if name in provider_agents(p) else " "
+                parts.append(f"{mark}{name}={'✓' if agent_connection_ready(p, name) else '—'}"
+                             f"/{len(conn['models'])}模型")
+            lines.append(f"  {pid:12} {'  '.join(parts)}")
         # 检查 qwen-token-plan 是否残留
         lines.append("")
         lines.append("qwen-token-plan 残留检查:")
@@ -2073,10 +2597,10 @@ def cmd_model(hub: Hub, args) -> int:
     只改配置，不写客户端；需要再执行 `hub push` 才落到各 agent。
     """
     targets = args.target or []
-    canonical = {("dsh" if t == "dsh-desktop" else t) for t in targets}
-    unknown = sorted(canonical - {"pi", "dsh", "claude"})
+    canonical = {canonical_target(t) for t in targets}
+    unknown = sorted(canonical - {"pi", "dsh", "claude", "codex"})
     if unknown:
-        print(f"未知目标: {', '.join(unknown)}（可用: pi / dsh / claude，缺省表示全局）", file=sys.stderr)
+        print(f"未知目标: {', '.join(unknown)}（可用: pi / dsh / claude / codex，缺省表示全局）", file=sys.stderr)
         return 1
     pid = args.provider
     if pid not in hub.providers:
@@ -2179,6 +2703,105 @@ def cmd_save_gold(hub: Hub, _args) -> int:
     return 0
 
 
+def cmd_migrate_agents(hub: Hub, _args) -> int:
+    """把旧版扁平字段迁移成「默认连接 + agents.<agent> 覆盖」。
+
+    - ``anthropicBaseUrl`` → ``agents.claude.baseUrl``（协议记为 anthropic-messages）
+    - ``claudeEnv`` / ``claudeSettings`` → ``agents.claude.env`` / ``settings``
+    - ``claudeModels`` → ``modelSync.overrides.claude``（主模型 + 各档位）与
+      ``agents.claude.models``（该 Anthropic 端点上的模型目录）
+    - ``openaiApiKey`` / ``apiKeyEnv`` / ``codexWireApi`` → ``agents.codex``
+    - 删除 ``sync.targets.claude.activeProvider``：Claude Code 与其它 Agent 一样，
+      只认 modelSync 解析结果
+
+    重复执行是幂等的；写入前照例备份 providers.json。
+    """
+    disk = load_json(HUB_CONFIG, default=None)
+    if not isinstance(disk, dict):
+        disk = copy.deepcopy(hub.cfg)
+    before = copy.deepcopy(disk)
+    providers = disk.setdefault("providers", {})
+    targets = disk.setdefault("sync", {}).setdefault("targets", {})
+    active = (targets.get("claude") or {}).get("activeProvider")
+    active = active if isinstance(active, str) and active in providers else None
+
+    def legacy_tier_models(p: dict) -> list[dict]:
+        out, seen = [], set()
+        for value in (p.get("claudeModels") or {}).values():
+            if isinstance(value, str) and value.strip() and value not in seen:
+                seen.add(value)
+                out.append({"id": value, "name": value})
+        return out
+
+    for pid, p in providers.items():
+        agents = p.setdefault("agents", {}) if isinstance(p, dict) else {}
+        if not isinstance(p, dict):
+            continue
+        migrated = []
+        base = p.get("anthropicBaseUrl")
+        if isinstance(base, str) and base.strip():
+            claude = agents.setdefault("claude", {})
+            claude.setdefault("baseUrl", base)
+            claude["api"] = "anthropic-messages"
+            migrated.append("agents.claude.baseUrl")
+        if isinstance(p.get("claudeEnv"), dict):
+            agents.setdefault("claude", {}).setdefault("env", copy.deepcopy(p["claudeEnv"]))
+            migrated.append("agents.claude.env")
+        if isinstance(p.get("claudeSettings"), dict):
+            agents.setdefault("claude", {}).setdefault("settings", copy.deepcopy(p["claudeSettings"]))
+            migrated.append("agents.claude.settings")
+        # claudeModels：活跃供应商的档位搬进 modelSync，模型 ID 进入 Claude 连接目录
+        if isinstance(p.get("claudeModels"), dict) and pid == active:
+            models = legacy_tier_models(p)
+            if models:
+                existing = [m.get("id") for m in agents.setdefault("claude", {}).get("models", [])]
+                for m in models:
+                    if m["id"] not in existing:
+                        agents["claude"].setdefault("models", []).append(m)
+                migrated.append("agents.claude.models")
+            overrides = disk.setdefault("modelSync", {}).setdefault("overrides", {})
+            claude_override = overrides.setdefault("claude", {})
+            tiers = claude_override.setdefault("tiers", {})
+            for key, value in p["claudeModels"].items():
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                tiers.setdefault(key, {"provider": pid, "model": value.strip()})
+            if not claude_override.get("model"):
+                main = p["claudeModels"].get("model") or p["claudeModels"].get("sonnet")
+                if isinstance(main, str) and main.strip():
+                    claude_override["provider"] = pid
+                    claude_override["model"] = main.strip()
+            migrated.append("modelSync.overrides.claude")
+        codex_keys = [k for k in ("openaiApiKey", "apiKeyEnv", "codexWireApi") if p.get(k)]
+        if codex_keys:
+            codex = agents.setdefault("codex", {})
+            if p.get("openaiApiKey"):
+                codex.setdefault("apiKey", p["openaiApiKey"])
+            if p.get("apiKeyEnv"):
+                codex.setdefault("apiKeyEnv", p["apiKeyEnv"])
+            if p.get("codexWireApi") == "responses":
+                codex.setdefault("api", "openai-responses")
+            migrated.append("agents.codex")
+        for field in ("anthropicBaseUrl", "claudeEnv", "claudeSettings", "claudeModels",
+                      "openaiApiKey", "apiKeyEnv", "codexWireApi"):
+            p.pop(field, None)
+        if not agents:
+            p.pop("agents", None)
+        if migrated:
+            print(console_safe(f"  ✓ {pid}: {', '.join(sorted(set(migrated)))}"))
+    if active:
+        (targets.get("claude") or {}).pop("activeProvider", None)
+        print(console_safe(f"  ✓ sync.targets.claude.activeProvider({active}) 已移除"))
+    disk["updatedAt"] = now_iso()
+    assert_expected_model_changes(before, disk)
+    hub.cfg = disk
+    hub.providers = disk["providers"]
+    backup_file(HUB_CONFIG)
+    save_json(HUB_CONFIG, disk)
+    print("已迁移为「默认连接 + agents.<agent>」结构。下一步: hub push  # 或在工作台「平台同步」里执行同步")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_stdio()
     parser = argparse.ArgumentParser(prog="hub", description="Agent Hub 统一 provider 同步")
@@ -2200,10 +2823,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("backup", help="备份目标配置")
     sub.add_parser("save-gold", help="将当前模型列表存为黄金模板")
     sub.add_parser("restore-gold", help="从黄金模板恢复模型列表")
+    sub.add_parser("migrate-agents", help="把旧的扁平字段迁移成 agents.<agent> 连接结构")
     p_model = sub.add_parser("model", help="设置多 agent 使用的模型（写入 modelSync）")
     p_model.add_argument("provider", help="供应商 ID")
     p_model.add_argument("model", help="模型 ID")
-    p_model.add_argument("--target", action="append", choices=["pi", "dsh", "dsh-desktop", "claude"],
+    p_model.add_argument("--target", action="append", choices=["pi", "dsh", "dsh-desktop", "claude", "codex"],
                          help="只对指定客户端生效；不传表示全局主模型")
     p_model.add_argument("--reasoning-effort", choices=list(REASONING_EFFORTS),
                          help="推理强度（可选）")
@@ -2222,6 +2846,7 @@ def main(argv: list[str] | None = None) -> int:
         "backup": cmd_backup,
         "save-gold": cmd_save_gold,
         "restore-gold": cmd_restore_gold,
+        "migrate-agents": cmd_migrate_agents,
         "model": cmd_model,
     }
     return dispatch[args.cmd](hub, args)
