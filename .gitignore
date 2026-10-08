@@ -20,3 +20,6 @@ _tmp_*
 .idea/
 Thumbs.db
 desktop.ini
+
+# ZCode 工具在本仓库的会话状态
+.zcode/
