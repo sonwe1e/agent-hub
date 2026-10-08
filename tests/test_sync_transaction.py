@@ -122,15 +122,15 @@ class SafeSyncTransactionTests(unittest.TestCase):
         self.assertFalse(engine.HUB_BACKUP.exists())
 
     def test_digit_leading_strings_are_not_treated_as_numbers(self):
-        """UUID 形态的密钥（3fa85f64-...）按 YAML 规范就是字符串。
+        """UUID 形态的密钥（形如 3fa85f64-…，示例值非真实凭据）按 YAML 规范就是字符串。
 
         真实事故：Firework 的 API Key 以数字开头，保守校验把它判成“歧义标量”，
         导致含该密钥的 dsh 同步整组被拒绝。真正必须加引号的是进制、科学计数法
         与六十进制这类会被读成数值的形态。
         """
         subset = transaction._yaml_subset
-        self.assertEqual(subset("key: 3fa85f64-5717-4562-b3fc-2c963f66afa6")["key"],
-                         "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+        fake_uuid_key = "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        self.assertEqual(subset(f"key: {fake_uuid_key}")["key"], fake_uuid_key)
         self.assertEqual(subset("key: 1")["key"], 1)
         self.assertEqual(subset("key: 1.5")["key"], 1.5)
         for ambiguous in ("007", "0x1F", "1e5", "1:2:3", "-1", "yes"):

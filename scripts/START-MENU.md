@@ -11,7 +11,7 @@
 
 ## 当前已完成
 
-个人开始菜单目录：
+个人开始菜单目录（`%USERPROFILE%` 即当前用户主目录）：
 
 `%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs`
 
