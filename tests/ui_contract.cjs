@@ -20,7 +20,7 @@ source = source.slice(0, source.lastIndexOf('state.page = PAGES[location.hash.sl
 vm.runInContext(source, context);
 const run = text => vm.runInContext(text, context);
 run(`state.providers = {gateway: {name: 'Gateway', enabled: true, models: [{id:'gpt-test'}]}};
-state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:['gateway'],agentCapable:{pi:['gateway'],dsh:['gateway'],claude:['gateway'],codex:['gateway']},connections:{gateway:{pi:{ready:true,overridden:false,modelCount:1},dsh:{ready:true,overridden:false,modelCount:1},claude:{ready:true,overridden:false,modelCount:1},codex:{ready:true,overridden:false,modelCount:1}}},lastResults:[]};
+state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:['gateway'],agentCapable:{pi:['gateway'],dsh:['gateway'],zcode:['gateway'],claude:['gateway'],codex:['gateway']},connections:{gateway:{pi:{ready:true,overridden:false,modelCount:1},dsh:{ready:true,overridden:false,modelCount:1},zcode:{ready:true,overridden:false,modelCount:1},claude:{ready:true,overridden:false,modelCount:1},codex:{ready:true,overridden:false,modelCount:1}}},lastResults:[]};
 state.targetDraft={codex:true,pi:true};
 state.modelSync={modelSync:{default:{provider:'gateway',model:'gpt-test'}},resolved:{codex:{provider:'gateway',model:'gpt-test'}},options:{},optionsByTarget:{}};
 ensureModelSyncDraft();`);
@@ -28,10 +28,10 @@ let passed = 0;
 const test = async (name, task) => { await task(); passed++; console.log(`PASS ${name}`); };
 (async () => {
   await test('new supplier targets are explicit and focus on core agents', () => {
-    assert.equal(run('DEFAULT_PROVIDER_TARGETS.join(",")'), 'pi,dsh,claude,codex');
-    const selected = { has: () => false, getAll: () => ['pi', 'dsh', 'claude', 'codex'] };
+    assert.equal(run('DEFAULT_PROVIDER_TARGETS.join(",")'), 'pi,dsh,zcode,claude,codex');
+    const selected = { has: () => false, getAll: () => ['pi', 'dsh', 'zcode', 'claude', 'codex'] };
     context.selected = selected;
-    assert.equal(run('providerTargetsFromForm(selected).join(",")'), 'pi,dsh,claude,codex');
+    assert.equal(run('providerTargetsFromForm(selected).join(",")'), 'pi,dsh,zcode,claude,codex');
     const all = { has: () => true, getAll: () => [] };
     context.all = all;
     assert.equal(run('providerTargetsFromForm(all).length'), 0);
@@ -43,6 +43,12 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     const html = run(`clientRow('codex','Codex')`);
     assert.match(html, /恢复.*官方 model/);
     assert.doesNotMatch(html, /只登记|ms-client readonly|data-action="ms-override"/);
+  });
+  await test('ZCode has a model sync row and connection override', () => {
+    const html = run(`clientRow('zcode','ZCode')`);
+    assert.match(html, /data-client="zcode"/);
+    assert.match(html, /ZCode/);
+    assert.match(run(`AGENT_OVERRIDES.map(x=>x[0]).join(',')`), /zcode/);
   });
   await test('third-party opt-in is explicit and override is editable', () => {
     run(`state.codexMode='third-party';state.codexOptIn=false`);

@@ -331,6 +331,32 @@ class SafeSyncTransactionTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(manifest_path.parent.stat().st_mode), 0o700)
 
+    def test_zcode_preview_apply_restore_only_changes_native_provider_config(self):
+        from test_zcode import zcode_document
+        cfg = self.config(["zcode"])
+        cfg["sync"]["targets"]["zcode"]["files"] = ["~/do-not-touch.json"]
+        self.save(cfg)
+        zcode = self.home / ".zcode" / "v2" / "provider_config.json"
+        zcode.parent.mkdir(parents=True)
+        original = json.dumps(zcode_document()).encode("utf-8")
+        zcode.write_bytes(original)
+        (self.home / "do-not-touch.json").write_bytes(b"unparseable sentinel")
+        before = self.native_files()
+
+        plan = transaction.preview(engine.Hub(), ["zcode"])
+        self.assertEqual(before, self.native_files())
+        self.assertNotIn("test-not-a-real-key", json.dumps(plan))
+        self.assertEqual([file["path"] for file in plan["files"]], [str(zcode)])
+        result = transaction.apply(engine.Hub(), plan["planId"])
+        self.assertEqual(result["results"], ["  ✓ zcode"])
+        selection = json.loads(zcode.read_text(encoding="utf-8"))["config"]["defaultModelSelection"]
+        self.assertEqual(selection["providerId"], "deepseek")
+        self.assertEqual(selection["modelId"], "deepseek/model-1")
+        self.assertEqual((self.home / "do-not-touch.json").read_bytes(), b"unparseable sentinel")
+        transaction.restore(engine.Hub(), result["transactionId"])
+        self.assertEqual(zcode.read_bytes(), original)
+        self.assertEqual(self.native_files(), before)
+
     def test_restore_respects_platform_permission_semantics(self):
         """Windows 比较只读位；POSIX 的任何权限位变化仍拒绝恢复。"""
         plan = transaction.preview(engine.Hub(), ["pi"])

@@ -223,6 +223,9 @@ def _model_count(cfg: Any, pid: str) -> int:
 AGENT_MODEL_TIERS: dict[str, tuple[str, ...]] = {
     "pi": ("agent",),
     "dsh": ("agent", "subagent"),
+    # ZCode 持久化一个主模型选择；它的 provider / model 目录由同一份
+    # agents.zcode 连接提供。
+    "zcode": ("agent",),
     # Claude Code 的主模型档位叫 model（→ ANTHROPIC_MODEL）；agent 是 pi/dsh/codex
     # 的叫法，这里不重复解析，避免同一选择出现两个档位。
     "claude": ("model", "opus", "sonnet", "haiku", "fable", "subagent"),
@@ -236,7 +239,13 @@ CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", 
 # Claude Code 连接默认只走 Anthropic Messages；Codex 第三方只走 Responses。
 AGENT_DEFAULT_API = {"claude": "anthropic-messages", "codex": "openai-responses"}
 # 每个供应商在这几个 Agent 上的连接会被界面与状态展示（含未声明天认的默认连接）。
-AGENT_CONNECTION_TARGETS = ("pi", "dsh", "claude", "codex")
+AGENT_CONNECTION_TARGETS = ("pi", "dsh", "zcode", "claude", "codex")
+ZCODE_API_TYPES = {
+    "openai-completions": "openai-chat-completions",
+    "openai-chat-completions": "openai-chat-completions",
+    "openai-responses": "openai-responses",
+    "anthropic-messages": "anthropic-messages",
+}
 
 
 def canonical_target(target: str) -> str:
@@ -329,6 +338,8 @@ def agent_connection_ready(provider: dict, target: str) -> bool:
         return conn["api"] == "anthropic-messages"
     if canonical == "codex":
         return conn["api"] == "openai-responses"
+    if canonical == "zcode":
+        return conn["api"] in ZCODE_API_TYPES
     return True
 
 
@@ -1268,9 +1279,17 @@ class DshModelPlan:
     def __init__(self, hub: "Hub") -> None:
         self.providers = hub.providers_for("dsh")
         self.config = hub.cfg
+        # Dsh treats models: [] as the entire installed provider catalog.
+        # Remove empty Hub routes from every persisted layer instead of sending
+        # an empty list or merely omitting it from the newly generated blocks.
+        self.empty_routes = {
+            pid for pid, p in hub.providers.items()
+            if provider_targets(p, "dsh") and agent_connection_ready(p, "dsh")
+            and not agent_connection(p, "dsh")["models"]
+        }
         self.routes: dict[str, str] = {}
         for pid, p in self.providers.items():
-            if not p.get("enabled", True):
+            if not p.get("enabled", True) or pid in self.empty_routes:
                 continue
             conn = agent_connection(p, "dsh")
             if not conn["baseUrl"]:
@@ -1324,7 +1343,7 @@ class DshModelPlan:
         pid, mid = tier["provider"], tier["model"]
         if pid not in self.routes:
             raise ValueError(f"modelSync 指向的供应商 {pid} 未启用或未同步到 dsh")
-        if not any(m.get("id") == mid for m in self.providers[pid].get("models", [])):
+        if not any(m.get("id") == mid for m in agent_connection(self.providers[pid], "dsh")["models"]):
             raise ValueError(f"modelSync 指向的模型 {mid} 不在 {pid} 的模型库里，未写入 dsh")
         return {"provider": self.routes[pid], "model": mid,
                 "reasoningEffort": tier.get("reasoningEffort")}
@@ -1680,26 +1699,46 @@ class Hub:
             r for r in model_rules if "qwen-token" not in (r.get("providerId") or "")
         ]
 
-        # zcode 映射: firework→火山, 其余同名
+        # zcode 映射: firework→火山, 其余同名。ZCode 自带的 provider ID
+        # 可能与 Hub ID 不同（例如火山的固定 UUID），所以默认模型选择
+        # 也必须通过同一张映射表落盘。
         name_map = {"firework": "火山", "openrouter": "OpenRouter", "deepseek": "DeepSeek", "stepfun": "StepFun"}
         id_map = {"firework": "a4d4d39c-5404-48db-b49a-e46d34df4525"}
+        zcode_ids: dict[str, str] = {}
 
         for pid, p in self.providers_for("zcode").items():
             if not p.get("enabled", True):
                 continue
             conn = agent_connection(p, "zcode")
-            zid = id_map.get(pid, pid)
+            requested_zid = id_map.get(pid, pid)
             zname = name_map.get(pid, p.get("displayName") or p.get("name"))
-            model_ids = [m["id"] for m in conn["models"]]
+            model_entries = [m for m in conn["models"]
+                             if isinstance(m, dict) and isinstance(m.get("id"), str)
+                             and m["id"].strip()]
+            model_ids = [m["id"] for m in model_entries]
 
-            existing = by_id.get(zid) or by_name.get(zname)
-            api_type = "openai-responses" if pid == "firework" else "openai-chat-completions"
+            existing = by_id.get(requested_zid) or by_name.get(zname)
+            # If a user already renamed/re-keyed a ZCode provider, retain its
+            # native ID so a later sync does not create a duplicate provider.
+            zid = ((existing.get("providerId") or requested_zid)
+                   if isinstance(existing, dict) else requested_zid)
+            zcode_ids[pid] = zid
+            api_type = ZCODE_API_TYPES[conn["api"]]
+            override = (p.get("agents") or {}).get("zcode") or {}
+            explicit_api = bool(override.get("api"))
+            if pid == "firework" and not explicit_api and conn["api"] == "openai-completions":
+                api_type = "openai-responses"
             # 保留原有 api type 偏好
+            previous_model_ids: set[str] = set()
             if existing:
                 old_api = ((existing.get("config") or {}).get("api") or {}).get("type")
-                if old_api:
+                if old_api and not explicit_api:
                     api_type = old_api
                 cfg_inner = existing.setdefault("config", {})
+                previous_model_ids = {
+                    model_id for model_id in (cfg_inner.get("personalModelIds") or [])
+                    if isinstance(model_id, str)
+                }
             else:
                 cfg_inner = {}
                 existing = {
@@ -1711,7 +1750,10 @@ class Hub:
                     existing["templateId"] = pid
                 rules.append(existing)
                 by_id[zid] = existing
+                by_name[zname] = existing
 
+            existing["providerId"] = zid
+            existing["providerName"] = zname
             cfg_inner.setdefault("group", "standard-personal")
             cfg_inner["access"] = {"type": "api-key", "apiKey": conn["apiKey"]}
             cfg_inner["api"] = {"type": api_type, "baseUrl": conn["baseUrl"]}
@@ -1720,31 +1762,56 @@ class Hub:
             if zid not in order:
                 order.append(zid)
 
-            # 模型规则
-            for m in p.get("models", []):
+            # Hub 管理的旧个人模型规则如果已经从该连接移除，也一并收回；
+            # 其它 ZCode 内置/手工规则保留，避免刷新供应商时误删原生目录。
+            if previous_model_ids:
+                model_rules[:] = [
+                    r for r in model_rules
+                    if not (isinstance(r, dict) and r.get("providerId") == zid
+                            and r.get("modelId") in previous_model_ids
+                            and r.get("modelId") not in model_ids)
+                ]
+
+            # 模型规则按 zcode 连接的模型库同步，而不是顶层默认连接的库。
+            for m in model_entries:
                 mr = next(
-                    (x for x in model_rules if x.get("modelId") == m["id"] and x.get("providerId") == zid),
+                    (x for x in model_rules if isinstance(x, dict)
+                     and x.get("modelId") == m["id"] and x.get("providerId") == zid),
                     None,
                 )
                 if not mr:
                     mr = {"modelId": m["id"], "providerId": zid, "config": {}}
                     model_rules.append(mr)
-                mr["config"] = {
-                    "properties": {
-                        "contextWindow": m.get("contextWindow", 128000),
-                        **(
-                            {"inputFormat": {"supportsImage": "image" in m.get("input", [])}}
-                            if "image" in m.get("input", [])
-                            else {}
-                        ),
-                    }
-                }
+                properties = mr.setdefault("config", {}).setdefault("properties", {})
+                properties["contextWindow"] = m.get("contextWindow", 128000)
+                if "input" in m:
+                    properties.setdefault("inputFormat", {})["supportsImage"] = "image" in m["input"]
+
+        # modelSync 显式解析出 ZCode 主模型时，写入 ZCode 当前版本使用的
+        # config.defaultModelSelection。没有 modelSync 时保留用户现有选择，
+        # 这样仅同步供应商目录不会悄悄改动 ZCode 的当前会话入口。
+        selection = resolve_agent_model(self.cfg, "zcode")
+        if selection:
+            pid = selection["provider"]
+            zid = zcode_ids.get(pid)
+            if not zid:
+                raise ValueError(f"modelSync 指向的供应商 {pid} 未启用或未同步到 zcode")
+            conn = agent_connection(self.providers[pid], "zcode")
+            if not any(isinstance(m, dict) and m.get("id") == selection["model"]
+                       for m in conn["models"]):
+                raise ValueError(f"modelSync 指向的模型 {selection['model']} 不在 {pid} 的 zcode 模型库里，未写入 zcode")
+            chosen = {"providerId": zid, "modelId": selection["model"]}
+            effort = selection.get("reasoningEffort")
+            if effort:
+                chosen["options"] = {"reasoningLevel": effort}
+            cfg["defaultModelSelection"] = chosen
 
         save_json(path, data)
 
     # ---- dsh ----
     def push_dsh(self) -> None:
         plan = DshModelPlan(self)
+        selection = plan.selection()
 
         # 1) credentials.yaml — 只补/更新 apiKeyEnv 对应的 refs，其它凭据原样保留
         cred_path = HOME / ".dsh" / ".credentials.yaml"
@@ -1771,7 +1838,7 @@ class Hub:
             data = parse_yaml(imported.read_text(encoding="utf-8")) or {}
             llm = data.setdefault("llm-pi-ai", {}).setdefault("providers", {})
             for rid in list(llm.keys()):
-                if "qwen-token" in rid:
+                if "qwen-token" in rid or rid in plan.empty_routes:
                     llm.pop(rid)
             llm.update(copy.deepcopy(blocks))
             data["llm-pi-ai"]["providers"] = llm
@@ -1791,13 +1858,12 @@ class Hub:
                         cfg = item.setdefault("config", {})
                         providers = cfg.setdefault("providers", {})
                         for rid in list(providers.keys()):
-                            if "qwen-token" in rid:
+                            if "qwen-token" in rid or rid in plan.empty_routes:
                                 providers.pop(rid)
                         providers.update(copy.deepcopy(blocks))
                         cfg["providers"] = providers
 
                 # 主 agent 默认模型：只有配置了 modelSync 才接管，否则保持用户当前选择
-                selection = plan.selection()
                 if selection:
                     block = _dsh_ensure_block(
                         items, "agent-default-model", "@deepseek-ai/dsh-agent-default-model",
@@ -1830,7 +1896,7 @@ class Hub:
             if isinstance(existing, dict):
                 merged_providers = (existing.get("llm-pi-ai") or {}).get("providers") or {}
                 for rid in list(merged_providers.keys()):
-                    if "qwen-token" in rid:
+                    if "qwen-token" in rid or rid in plan.empty_routes:
                         merged_providers.pop(rid)
                 merged_providers.update(copy.deepcopy(blocks))
                 existing.setdefault("llm-pi-ai", {})["providers"] = merged_providers
@@ -2427,7 +2493,8 @@ class Hub:
             lines.append(f"已移除: {', '.join(removed.keys())}")
         lines.append("")
         lines.append("多 agent 模型 (modelSync):")
-        for target, label in (("pi", "pi"), ("dsh", "dsh / dsh 桌面版"), ("claude", "Claude Code")):
+        for target, label in (("pi", "pi"), ("dsh", "dsh / dsh 桌面版"),
+                              ("zcode", "ZCode"), ("claude", "Claude Code")):
             tiers = agent_model_tiers(self.cfg, target)
             main = tiers.get("agent") or tiers.get("model")
             if not main:
@@ -2657,9 +2724,9 @@ def cmd_model(hub: Hub, args) -> int:
     """
     targets = args.target or []
     canonical = {canonical_target(t) for t in targets}
-    unknown = sorted(canonical - {"pi", "dsh", "claude", "codex"})
+    unknown = sorted(canonical - {"pi", "dsh", "zcode", "claude", "codex"})
     if unknown:
-        print(f"未知目标: {', '.join(unknown)}（可用: pi / dsh / claude / codex，缺省表示全局）", file=sys.stderr)
+        print(f"未知目标: {', '.join(unknown)}（可用: pi / dsh / zcode / claude / codex，缺省表示全局）", file=sys.stderr)
         return 1
     pid = args.provider
     if pid not in hub.providers:
@@ -2668,7 +2735,6 @@ def cmd_model(hub: Hub, args) -> int:
     if hub.providers[pid].get("enabled") is False:
         print(f"供应商已停用: {pid}", file=sys.stderr)
         return 1
-    known = {m.get("id") for m in hub.providers[pid].get("models") or []}
     entry = {"provider": pid, "model": args.model}
     if args.reasoning_effort:
         entry["reasoningEffort"] = args.reasoning_effort
@@ -2679,6 +2745,16 @@ def cmd_model(hub: Hub, args) -> int:
         if pid not in hub.providers:
             print(f"供应商已被其它进程删除: {pid}", file=sys.stderr)
             return 1
+    # 平台覆盖按该 Agent 自己的连接模型库判断；全局模型仍按默认连接
+    # 兼容旧命令行为。手填模型只给出提示，不阻止写入。
+    known = set()
+    if canonical:
+        for target in canonical:
+            known.update(m.get("id") for m in agent_connection(hub.providers[pid], target)["models"]
+                         if isinstance(m, dict))
+    else:
+        known.update(m.get("id") for m in hub.providers[pid].get("models") or []
+                     if isinstance(m, dict))
     sync = hub.cfg.setdefault("modelSync", {})
     if canonical:
         overrides = sync.setdefault("overrides", {})
@@ -2886,7 +2962,7 @@ def main(argv: list[str] | None = None) -> int:
     p_model = sub.add_parser("model", help="设置多 agent 使用的模型（写入 modelSync）")
     p_model.add_argument("provider", help="供应商 ID")
     p_model.add_argument("model", help="模型 ID")
-    p_model.add_argument("--target", action="append", choices=["pi", "dsh", "dsh-desktop", "claude", "codex"],
+    p_model.add_argument("--target", action="append", choices=["pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"],
                          help="只对指定客户端生效；不传表示全局主模型")
     p_model.add_argument("--reasoning-effort", choices=list(REASONING_EFFORTS),
                          help="推理强度（可选）")

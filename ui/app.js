@@ -34,7 +34,7 @@ $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 const PAGES = { models: ["模型库", "管理可用模型，让每个 Agent 都用上合适的模型。"], providers: ["供应商", "连接你的模型服务，所有平台共用一份配置。"], sync: ["平台同步", "将本地配置写入多个平台，每次同步都有迹可循。"] };
 const TARGETS = {
   pi: ["pi", "pi", "模型、授权与默认设置"], mcode: ["mcode", "mc", "MiniMax 自定义供应商"],
-  zcode: ["zcode", "zc", "供应商规则与模型配置"], dsh: ["dsh", "ds", "CLI 与桌面版共用配置"],
+  zcode: ["ZCode", "zc", "供应商规则与模型配置"], dsh: ["dsh", "ds", "CLI 与桌面版共用配置"],
   "dsh-desktop": ["dsh 桌面版", "ds", "随 dsh 一起同步，无需重复选择"],
   claude: ["Claude Code", "cc", "Anthropic 环境变量与模型别名"],
   "cc-switch": ["cc-switch", "cs", "多客户端供应商数据库"], omp: ["omp", "om", "Agent 模型配置"],
@@ -42,22 +42,24 @@ const TARGETS = {
 };
 const palette = [["#f0edff", "#9984cd"], ["#fff1e9", "#c99b7b"], ["#edf3ff", "#84a0cf"], ["#edf7f3", "#80af9b"]];
 // 供应商表单里的平台多选：顺序固定，便于用户按习惯找到目标平台。
-const PROVIDER_TARGETS = [["pi", "pi"], ["dsh", "dsh"], ["dsh-desktop", "dsh 桌面版"], ["claude", "Claude Code"], ["cc-switch", "cc-switch（旧版，不自动写入）"], ["mcode", "mcode"], ["zcode", "zcode"], ["omp", "omp"], ["codex", "Codex"]];
-const DEFAULT_PROVIDER_TARGETS = ["pi", "dsh", "claude", "codex"];
+const PROVIDER_TARGETS = [["pi", "pi"], ["dsh", "dsh"], ["dsh-desktop", "dsh 桌面版"], ["zcode", "ZCode"], ["claude", "Claude Code"], ["cc-switch", "cc-switch（旧版，不自动写入）"], ["mcode", "mcode"], ["omp", "omp"], ["codex", "Codex"]];
+const DEFAULT_PROVIDER_TARGETS = ["pi", "dsh", "zcode", "claude", "codex"];
 // 可以按 Agent 覆盖连接的目标：端点 / 密钥 / 协议 / 模型都可以只为某个 Agent 配。
 // 同一个网关给不同 Agent 发不同 key 时，各自的模型集合也可以不同。
 const AGENT_OVERRIDES = [
   ["pi", "pi", "OpenAI 兼容端点"],
   ["dsh", "dsh（含桌面版）", "OpenAI 兼容端点"],
+  ["zcode", "ZCode", "Chat Completions / Responses / Anthropic 端点"],
   ["claude", "Claude Code", "Anthropic Messages 端点"],
   ["codex", "Codex", "Responses 端点（第三方线路）"],
 ];
-const AGENT_APIS = { claude: ["anthropic-messages"], codex: ["openai-responses"] };
-const AGENT_LABEL = { pi: "pi", dsh: "dsh", claude: "Claude", codex: "Codex" };
+const AGENT_APIS = { claude: ["anthropic-messages"], codex: ["openai-responses"],
+  zcode: ["openai-completions", "openai-chat-completions", "openai-responses", "anthropic-messages"] };
+const AGENT_LABEL = { pi: "pi", dsh: "dsh", zcode: "ZCode", claude: "Claude", codex: "Codex" };
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 // 模型同步卡片里的客户端行；dsh-desktop 与 dsh 共用配置，不接受单独 override。
-const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["claude", "Claude Code"], ["codex", "Codex"]];
+const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["zcode", "ZCode"], ["claude", "Claude Code"], ["codex", "Codex"]];
 const CLAUDE_TIERS = [["opus", "opus 档位"], ["sonnet", "sonnet 档位"], ["haiku", "haiku 档位"], ["subagent", "subagent 档位"]];
 const state = {
   providers: {}, status: null, page: "models", busy: false, loaded: false,
@@ -105,16 +107,18 @@ const tokens = n => n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(2)}M` : n >= 10
 const enabledProviders = () => Object.entries(state.providers).filter(([, p]) => p.enabled !== false).map(([pid]) => pid);
 // 供应商在用的模型 ID（默认连接）：models / options 里的条目可能是对象也可能是字符串。
 const modelIds = list => (list || []).map(item => (typeof item === "string" ? item : item && item.id)).filter(Boolean);
-const providerModels = pid => {
+const providerModels = (pid, target) => {
   const p = state.providers[pid] || {};
-  const ids = new Set([...modelIds(p.models), p.agentModel].filter(Boolean));
+  const override = target ? p.agents?.[target] : null;
+  const source = Array.isArray(override?.models) ? override.models : p.models;
+  const ids = new Set([...modelIds(source), ...(!target ? [p.agentModel] : [])].filter(Boolean));
   return [...ids].sort();
 };
 // 模型候选 = 该 Agent 连接上的远端选项与本地模型库；没有 target 时退到总览选项。
 // 同一供应商给不同 Agent 配不同 key 时，各自连接的模型集合本就不同。
 const knownModels = (pid, target) => new Set([
-  ...(pid ? modelIds((target && state.modelSync?.optionsByTarget?.[target]?.[pid]) || state.modelSync?.options?.[pid]) : []),
-  ...(pid ? providerModels(pid) : []),
+  ...(pid ? modelIds(target ? state.modelSync?.optionsByTarget?.[target]?.[pid] : state.modelSync?.options?.[pid]) : []),
+  ...(pid ? providerModels(pid, target) : []),
 ]);
 const modelChoices = (pid, target) => [...knownModels(pid, target)].sort();
 const cleanEntry = entry => {
@@ -127,7 +131,7 @@ const cleanEntry = entry => {
 // 磁盘上还没有 modelSync 时，用后端解析出来的实际值给全局行做初始值。
 const resolvedSeed = () => {
   const resolved = state.modelSync?.resolved || {};
-  for (const target of ["claude", "pi", "dsh", "dsh-desktop"]) {
+  for (const target of ["claude", "pi", "dsh", "dsh-desktop", "zcode"]) {
     const entry = resolved[target];
     if (entry?.provider && entry?.model) return { provider: entry.provider, model: entry.model };
   }
@@ -202,7 +206,7 @@ function renderModelSyncCard() {
 }
 async function saveModelSync() {
   const draft = ensureModelSyncDraft();
-  const scopes = [["clients", "codex", ""], ["clients", "pi", ""], ["clients", "dsh", ""], ["clients", "claude", ""], ["tiers", "claude", "opus"], ["tiers", "claude", "sonnet"], ["tiers", "claude", "haiku"], ["tiers", "claude", "subagent"]];
+  const scopes = [["clients", "codex", ""], ["clients", "pi", ""], ["clients", "dsh", ""], ["clients", "zcode", ""], ["clients", "claude", ""], ["tiers", "claude", "opus"], ["tiers", "claude", "sonnet"], ["tiers", "claude", "haiku"], ["tiers", "claude", "subagent"]];
   // 界面上填了 provider 却没填模型（或反过来）的行无法写入，先拦下来。
   for (const [scope, target, tier] of scopes) {
     const entry = scope === "tiers" ? draft.overrides?.claude?.tiers?.[tier] : draft.overrides?.[target];
@@ -563,7 +567,7 @@ function modelSyncCard() {
   const defaultProvider = draft.default?.provider || "";
   const defaultModel = draft.default?.model || "";
   const dirty = modelSyncDirty();
-  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）、Claude Code 与显式选择第三方线路的 Codex；改完保存，预览后再应用。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
+  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）、ZCode、Claude Code 与显式选择第三方线路的 Codex；改完保存，预览后再应用。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
   if (warn) {
     return `${header}<div class="notice warn" id="modelsync-warning">${icon("alert")}<div><strong>模型设置接口不可用</strong><br />${esc(warn)}<br />下面的选择会先留在页面上，但无法保存或读取解析结果；确认服务已更新后点右侧按钮重试。</div><div class="actions"><button class="small" type="button" data-action="reload-modelsync">${icon("refresh")}重新读取</button></div></div><div class="ms-global"><div class="ms-global-note">${icon("info")}<div>接口 <span class="mono">GET /api/modelsync</span> 暂时不可用，解析状态无法展示；供应商与模型下拉仍可正常使用。</div></div></div><div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；客户端文件需先预览并确认应用。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write disabled>保存模型设置</button></div></div>`;
   }
@@ -582,6 +586,7 @@ function modelSyncCard() {
     <div class="ms-clients">
       ${clientRow("pi", "pi")}
       ${clientRow("dsh", "dsh（含桌面版）")}
+      ${clientRow("zcode", "ZCode")}
       ${claudeRow()}
       ${clientRow("codex", "Codex")}
     </div>
@@ -755,7 +760,7 @@ function openProvider(pid) {
     <div class="form-grid">
       <label class="field"><span>供应商 ID <b class="required">*</b></span><input name="id" value="${esc(pid || "")}" placeholder="例如 my_plan" pattern="[a-zA-Z0-9][a-zA-Z0-9_\\-]*" required ${edit ? "readonly" : ""} /><small>用于各客户端的配置映射</small></label>
       <label class="field"><span>显示名称 <b class="required">*</b></span><input name="displayName" value="${esc(p.displayName || p.name || "")}" placeholder="例如 My Coding Plan" required /></label>
-      <label class="field full"><span>默认连接 Base URL</span><input name="baseUrl" type="url" value="${esc(p.baseUrl || "")}" placeholder="https://api.example.com/v1" ${p.anthropicBaseUrl || agents.claude?.baseUrl ? "" : "required"} /><small>OpenAI 兼容端点；只给 Claude Code 用时可留空，改在下面的 Claude 连接里。</small></label>
+      <label class="field full"><span>默认连接 Base URL</span><input name="baseUrl" type="url" value="${esc(p.baseUrl || "")}" placeholder="https://api.example.com/v1" ${p.anthropicBaseUrl || AGENT_OVERRIDES.some(([name]) => agents[name]?.baseUrl) ? "" : "required"} /><small>默认服务端点；只给一个 Agent 用时可留空，改在下面的对应连接里。</small></label>
       <label class="field full"><span>默认 API Key</span><div class="password-wrap"><input name="apiKey" type="password" value="${esc(p.apiKey || "")}" placeholder="输入 API 密钥；或在下方为单个 Agent 配置专用 Key" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">${icon("eye")}</button></div><small>保存在本机 providers.json 中，请勿共享配置文件。</small></label>
       <label class="field full"><span>默认 API 协议</span><select name="api">${protocols.map(v => `<option value="${v}" ${v === (p.api || protocols[0]) ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       ${edit ? `<label class="check-label full"><input name="enabled" type="checkbox" ${p.enabled !== false ? "checked" : ""} />启用供应商，供平台同步使用</label>` : ""}
@@ -823,7 +828,7 @@ async function submitEditor(event) {
   let payload;
   if (editor.type === "provider") {
     if (!value("baseUrl") && !AGENT_OVERRIDES.some(([name]) => value(`agent-${name}-baseUrl`)) && !value("anthropicBaseUrl")) {
-      $("#editor-error").textContent = "请填写默认 Base URL，或在「按 Agent 覆盖」里为 Claude Code 配置 Anthropic 端点。";
+      $("#editor-error").textContent = "请填写默认 Base URL，或在「按 Agent 覆盖」里为需要的 Agent 配置端点。";
       $("#editor-error").hidden = false;
       return;
     }

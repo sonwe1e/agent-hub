@@ -71,9 +71,9 @@ class ModelSyncAPITests(unittest.TestCase):
         result = server.api_modelsync()
         self.assertEqual(result["modelSync"], self.config()["modelSync"])
         self.assertTrue(result["configured"])
-        # 五个目标都必须出现，顺序与界面展示顺序一致
+        # 六个目标都必须出现，顺序与界面展示顺序一致
         self.assertEqual(list(result["resolved"]),
-                         ["pi", "dsh", "dsh-desktop", "claude", "codex"])
+                         ["pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"])
         # pi 的 agent 档拿到全局主模型
         self.assertEqual(result["resolved"]["pi"]["model"], "deepseek/model-1")
         self.assertEqual(result["resolved"]["pi"]["provider"], "deepseek")
@@ -81,16 +81,18 @@ class ModelSyncAPITests(unittest.TestCase):
         # dsh-desktop 跟随 dsh；codex 现在是正式目标，同样吃全局默认
         self.assertEqual(result["resolved"]["dsh-desktop"], result["resolved"]["dsh"])
         self.assertEqual(result["resolved"]["dsh"]["model"], "deepseek/model-1")
+        self.assertEqual(result["resolved"]["zcode"]["model"], "deepseek/model-1")
         self.assertEqual(result["resolved"]["codex"]["model"], "deepseek/model-1")
         self.assertEqual(result["resolved"]["codex"]["provider"], "deepseek")
         # claude 的档位由 hub.py 决定（是否吃全局默认是它的策略）；这里只验证透传
         self.assertEqual(result["resolved"]["claude"],
                          engine.agent_model_tiers(self.config(), "claude").get("model"))
         # 档位明细使用 hub.py 的界面视图（claude 不含内部 agent 档与历史 fable 档）
-        self.assertEqual(set(result["tiers"]), {"pi", "dsh", "dsh-desktop", "claude", "codex"})
+        self.assertEqual(set(result["tiers"]), {"pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"})
         self.assertEqual(result["tiers"]["pi"], {"agent": result["resolved"]["pi"]})
         self.assertEqual(result["tiers"]["dsh"], engine.agent_model_tiers_public(self.config(), "dsh"))
         self.assertEqual(result["tiers"]["dsh-desktop"], result["tiers"]["dsh"])
+        self.assertEqual(result["tiers"]["zcode"], engine.agent_model_tiers_public(self.config(), "zcode"))
         self.assertEqual(result["tiers"]["codex"], engine.agent_model_tiers_public(self.config(), "codex"))
         self.assertEqual(result["tiers"]["claude"],
                          engine.agent_model_tiers_public(self.config(), "claude"))
@@ -154,8 +156,8 @@ class ModelSyncAPITests(unittest.TestCase):
     # -- PUT 拒绝路径 --
     def test_put_rejects_unknown_target(self):
         before = server.HUB_CONFIG.read_bytes()
-        # codex 从 v2 起是正式目标，不再属于未知目标
-        for target in ("mcode", "zcode", "cc-switch", "omp", "dsh_desktop", "unknown"):
+        # codex / zcode 从 v2 起是正式目标，不再属于未知目标
+        for target in ("mcode", "cc-switch", "omp", "dsh_desktop", "unknown"):
             with self.subTest(target=target), self.assertRaises(ValueError) as ctx:
                 self.put({"overrides": {target: entry()}})
             self.assertIn("未知的 modelSync 目标", str(ctx.exception))
@@ -365,6 +367,7 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(status["modelSync"], self.config()["modelSync"])
         self.assertEqual(status["modelSyncResolved"]["pi"]["model"], "deepseek/model-1")
         self.assertEqual(status["modelSyncResolved"]["dsh-desktop"], status["modelSyncResolved"]["dsh"])
+        self.assertEqual(status["modelSyncResolved"]["zcode"]["model"], "deepseek/model-1")
         self.assertEqual(status["modelSyncResolved"]["codex"]["model"], "deepseek/model-1")
         # codex 现在是正式写入目标（只写 model_provider/model 与 custom 段），
         # 不再是只读。
@@ -401,6 +404,7 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(status["agentCapable"]["claude"], ["deepseek", "openrouter"])
         self.assertEqual(status["agentCapable"]["codex"], ["deepseek", "openrouter"])
         self.assertEqual(status["agentCapable"]["pi"], ["deepseek", "stepfun", "openrouter", "firework"])
+        self.assertEqual(status["agentCapable"]["zcode"], ["deepseek", "stepfun", "openrouter", "firework"])
         # 连接概况：未声明 Claude 连接的供应商显示未就绪
         self.assertTrue(status["connections"]["deepseek"]["claude"]["ready"])
         self.assertFalse(status["connections"]["stepfun"]["claude"]["ready"])

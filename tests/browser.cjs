@@ -93,7 +93,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     });
     await step('add and configure supplier without changing its models', async () => {
       await main.locator('[data-action="add-provider"]').click();
-      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['pi', 'dsh', 'claude', 'codex']);
+      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['pi', 'dsh', 'zcode', 'claude', 'codex']);
       assert.equal(await dialog.locator('[name=allTargets]').isChecked(), false);
       await dialog.locator('[name=id]').fill('new-provider');
       await dialog.locator('[name=displayName]').fill('New Provider');
@@ -102,7 +102,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await submit.click();
       await waitSaved();
       assert.equal(Object.keys(await config()).length, 5);
-      assert.deepEqual((await config())['new-provider'].targets, ['pi', 'dsh', 'claude', 'codex']);
+      assert.deepEqual((await config())['new-provider'].targets, ['pi', 'dsh', 'zcode', 'claude', 'codex']);
       await go('providers');
       await main.locator('[data-action="edit-provider"][data-pid="deepseek"]').click();
       await dialog.locator('[name=displayName]').fill('DeepSeek Updated');
@@ -182,6 +182,55 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await page.waitForFunction(() => !document.body.classList.contains('busy'));
       assert.equal((await config()).deepseek.models.length, 7);
       assert.equal((await config()).openrouter.models.length, 6);
+    });
+    await step('ZCode-only connection and isolated model selection', async () => {
+      await go('providers');
+      await main.locator('[data-action="add-provider"]').first().click();
+      await dialog.locator('[name=id]').fill('zcode-plan');
+      await dialog.locator('[name=displayName]').fill('ZCode Plan');
+      await dialog.locator('summary').filter({ hasText: '高级设置' }).click();
+      for (const checkbox of await dialog.locator('[name=targets]').all()) await checkbox.uncheck();
+      await dialog.locator('[name=targets][value=zcode]').check();
+      await dialog.locator('[data-agent-section=zcode] > summary').click();
+      await dialog.locator('[name="agent-zcode-baseUrl"]').fill('https://zcode.example/api');
+      await dialog.locator('[name="agent-zcode-apiKey"]').fill('zcode-test-key');
+      await dialog.locator('[name="agent-zcode-api"]').selectOption('anthropic-messages');
+      assert.equal(await dialog.locator('[name=baseUrl]').evaluate(input => input.required), false);
+      await submit.click();
+      await waitSaved();
+      let plan = (await config())['zcode-plan'];
+      assert.equal(plan.baseUrl, '');
+      assert.deepEqual(plan.targets, ['zcode']);
+      assert.equal(plan.agents.zcode.api, 'anthropic-messages');
+      assert.equal(plan.agents.zcode.apiKey, 'zcode-test-key');
+
+      await main.locator('[data-action="provider-models"][data-pid="zcode-plan"]').click();
+      await main.locator('[data-action="add-model"]').first().click();
+      await dialog.locator('[name=agent]').selectOption('zcode');
+      await dialog.locator('[name=id]').fill('zcode-only');
+      await submit.click();
+      await waitSaved();
+      await main.locator('[data-action="add-model"]').first().click();
+      await dialog.locator('[name=id]').fill('default-only');
+      await submit.click();
+      await waitSaved();
+      plan = (await config())['zcode-plan'];
+      assert.deepEqual(plan.models.map(model => model.id), ['default-only']);
+      assert.deepEqual(plan.agents.zcode.models.map(model => model.id), ['zcode-only']);
+
+      await go('sync');
+      await main.locator('[data-action="ms-override"][data-target="zcode"]').click();
+      await main.locator('#ms-provider-clients-zcode').selectOption('zcode-plan');
+      const choices = await main.locator('#ms-model-clients-zcode option').evaluateAll(options => options.map(option => option.value));
+      assert.ok(choices.includes('zcode-only'));
+      assert.ok(!choices.includes('default-only'));
+      await main.locator('#ms-model-clients-zcode').selectOption('zcode-only');
+      await main.locator('[data-action="save-modelsync"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const modelsync = await (await page.request.get(`${url}/api/modelsync`)).json();
+      assert.equal(modelsync.modelSync.overrides.zcode.provider, 'zcode-plan');
+      assert.equal(modelsync.resolved.zcode.model, 'zcode-only');
+      await page.screenshot({ path: path.join(artifacts, 'zcode-model-selection.png'), fullPage: true });
     });
     await step('sync draft protection and linked alias targets', async () => {
       await go('sync');

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import sys
@@ -17,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 # 整个目录可以任意搬迁（例如从 ~/.agent-hub 移到 G:\workspaces\agent-hub）。
 HUB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HUB_DIR))
-from hub import (Hub, HUB_CONFIG, ModelLossError, assert_expected_model_changes, backup_file,
+from hub import (Hub, HUB_CONFIG, ModelLossError, ZCODE_API_TYPES, assert_expected_model_changes, backup_file,
                  agent_connection, agent_connection_ready, agent_connections,
                  canonical_target, provider_targets,
                  configure_stdio, expand, file_hash, load_json, save_json, now_iso, target_files)  # noqa: E402
@@ -39,16 +40,17 @@ SUPPORTED_TARGETS = {"pi", "mcode", "zcode", "dsh", "dsh-desktop", "claude", "cc
 PREVIEW_TARGETS = SUPPORTED_TARGETS - {"cc-switch"}
 PROTOCOLS = {"openai-completions", "openai-responses", "openai-chat-completions", "anthropic-messages"}
 # 每个 Agent 连接允许的协议：Claude Code 只走 Anthropic Messages，Codex 第三方只走 Responses。
-AGENT_APIS = {"claude": {"anthropic-messages"}, "codex": {"openai-responses"}}
+AGENT_APIS = {"claude": {"anthropic-messages"}, "codex": {"openai-responses"},
+              "zcode": set(ZCODE_API_TYPES)}
 # providers.json 里可以按 Agent 覆盖连接的目标名（dsh-desktop 归一化成 dsh）。
-AGENT_CONNECTION_KEYS = ("pi", "dsh", "claude", "codex")
+AGENT_CONNECTION_KEYS = ("pi", "dsh", "zcode", "claude", "codex")
 
 # modelSync 可写的目标 -> 落盘时使用的键。dsh 桌面版与 CLI 共用同一份配置，
 # 写入时归一化成 dsh，避免出现两份互相漂移的覆盖。
 MODELSYNC_TARGETS = {"pi": "pi", "dsh": "dsh", "dsh-desktop": "dsh",
-                     "claude": "claude", "codex": "codex"}
+                     "zcode": "zcode", "claude": "claude", "codex": "codex"}
 # status / GET 需要给出解析结果的目标，顺序即界面展示顺序。
-MODELSYNC_RESOLVED_TARGETS = ("pi", "dsh", "dsh-desktop", "claude", "codex")
+MODELSYNC_RESOLVED_TARGETS = ("pi", "dsh", "dsh-desktop", "zcode", "claude", "codex")
 # 已经没有只读目标：codex 从 v2 起只写 model_provider / model 与 [model_providers.custom]，
 # ChatGPT 登录态仍然由 Codex 自己维护。
 MODELSYNC_READONLY_TARGETS: set[str] = set()
@@ -88,16 +90,15 @@ def _validate_provider(p: dict) -> None:
     # agents 先校验：后面的判定都建立在「每条覆盖都是对象」之上
     _validate_agents(p.get("agents"))
     agents = p.get("agents") if isinstance(p.get("agents"), dict) else {}
-    claude_override = agents.get("claude")
-    claude_override = claude_override if isinstance(claude_override, dict) else {}
     targets = p.get("targets")
     claude_only = (isinstance(targets, list) and bool(targets)
                    and all(canonical_target(target) == "claude" for target in targets))
-    has_claude_connection = bool(str(claude_override.get("baseUrl") or "").strip())
+    has_agent_connection = any(str(block.get("baseUrl") or "").strip()
+                               for block in agents.values())
     if not isinstance(p.get("baseUrl"), str):
         raise ValueError("baseUrl 必须是字符串")
-    if not p["baseUrl"].strip() and not (has_claude_connection or (claude_only and p.get("anthropicBaseUrl"))):
-        raise ValueError("baseUrl 不能为空；只给 Claude Code 用的供应商可只配置 Claude 连接或 anthropicBaseUrl")
+    if not p["baseUrl"].strip() and not (has_agent_connection or (claude_only and p.get("anthropicBaseUrl"))):
+        raise ValueError("baseUrl 不能为空；可在「按 Agent 覆盖」里为需要的 Agent 配置端点")
     for field in ("apiKey", "openaiApiKey", "apiKeyEnv"):
         if p.get(field) is not None and not isinstance(p[field], str):
             raise ValueError(f"{field} 必须是字符串或 null")
@@ -646,13 +647,16 @@ def _normalize_model(body: dict) -> dict:
 
 
 def _connection_models(h: Hub, pid: str, agent: str | None) -> list[dict]:
-    """某个连接上的模型列表：agent 为空表示默认连接。"""
+    """某个连接待编辑的模型列表；继承库在首次编辑时复制为独立库。"""
     p = _provider(h, pid)
     if agent:
         name = canonical_target(agent)
         if name not in AGENT_CONNECTION_KEYS:
             raise ValueError(f"未知的连接: {agent}")
-        return agent_connection(p, name)["models"]
+        override = p.setdefault("agents", {}).setdefault(name, {})
+        if not isinstance(override.get("models"), list):
+            override["models"] = copy.deepcopy(agent_connection(p, name)["models"])
+        return override["models"]
     return p.get("models") or []
 
 
