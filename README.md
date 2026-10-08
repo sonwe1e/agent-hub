@@ -13,6 +13,7 @@
 3. 添加或检测该 Plan 的模型（检测时可选对哪条连接执行），在「平台同步」中选择全局主模型；需要差异时再为单个 Agent 单独指定。
 4. 选择要更新的 Agent，生成预览并确认应用。以后 Plan 的地址、密钥或模型变动，只改这一条供应商并再次同步。
 5. Codex 可选「官方线路」或支持 Responses 的第三方 Plan。首次切到第三方前，在 Codex 内准备好官方配置；Hub 会保存并在切回时恢复官方模型、provider 和推理强度，保留原生登录态。
+6. ZCode 同样有「官方模式 / 第三方模式」：官方模式只维护供应商目录、不碰默认模型选择；第三方模式才把 `defaultModelSelection` 切到 Hub 选的模型，切回官方时恢复接管前保存的选择。
 
 其他订阅在这里指提供兼容 API 地址与密钥的 Coding Plan。Claude Code、pi、dsh 的原生账号订阅登录态不由 Hub 复制或转换。cc-switch 数据库目标不参与工作台的安全预览同步。
 
@@ -112,8 +113,8 @@ G:\workspaces\agent-hub\hub.cmd backup
 
 ### 多 agent 模型同步
 
-「多 agent 使用的模型」卡片选一次主模型，同步后由兼容该供应商的平台各自采用；ZCode 会写入自己的 provider/model 选择，Codex 仅在明确选择第三方线路时跟随。
-Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reasoning_effort` 和 `[model_providers.agent_hub]` 段；切回官方线路会恢复首次切换前保存的值。ChatGPT 登录态由 Codex 自己维护。
+「多 agent 使用的模型」卡片选一次主模型，同步后由兼容该供应商的平台各自采用；ZCode 仅在第三方模式下写入自己的 provider/model 选择（官方模式保留当前默认模型），Codex 仅在明确选择第三方线路时跟随。
+Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reasoning_effort` 和 `[model_providers.agent_hub]` 段；切回官方线路会恢复首次切换前保存的值。ChatGPT 登录态由 Codex 自己维护。双模式的设计原则见「ZCode」一节的对照表。
 
 | 客户端 | 主模型落到哪里 | 子 agent / 档位落到哪里 |
 |--------|----------------|--------------------------|
@@ -393,6 +394,36 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 - 不读取安装版本或运行真实 Codex。兼容目标依据 2026-10-05 官方文档；启用后请在自己的客户端检查当前配置和选中模型。
 
 官方参考：[配置字段](https://learn.chatgpt.com/docs/config-file/config-reference)、[profile 迁移](https://learn.chatgpt.com/docs/config-file/config-advanced)、[原生认证](https://learn.chatgpt.com/docs/auth)。
+
+## ZCode
+
+ZCode 与 Codex 一样有官方账号模式，但原生配置形态不同：Codex 是「单一 `model_provider` 指针」，
+ZCode 是「供应商目录 + `defaultModelSelection` 指针」。Hub 对两者采用同一套设计原则，
+按各自形态落地：
+
+| 设计原则 | Codex | ZCode |
+|----------|-------|-------|
+| 模式门控（缺省 official，绝不隐式接管） | `sync.targets.codex.mode` | `sync.targets.zcode.mode` |
+| 接管前快照、归还时恢复 | model / model_provider / reasoning_effort → `~/.codex/.agent-hub-state.json` | `defaultModelSelection`（含「没有选择」）→ `~/.zcode/v2/.agent-hub-state.json` |
+| 永不触碰登录态 | `auth.json` | `~/.zcode/v2/credentials.json` |
+| 外部编辑 fail-closed，仅显式预览 reconcile | 是 | 是 |
+| 用户已自行切走时 | 保留当前官方配置为新基线 | 保留当前选择为新基线，不复活旧快照 |
+| 官方模式下第三方配置的去留 | 移除 `[model_providers.agent_hub]` | **保留** Hub 维护的个人供应商目录（见下） |
+
+ZCode 的差异点与理由：
+
+- **官方模式仍维护供应商目录**。`provider_config.json` 本来就是多供应商目录，Hub 写入的
+  个人供应商规则与官方账号共存；官方模式下它们留在目录里，用户可随时在 ZCode 内手动选用，
+  反复切换也不会造成目录抖动。Codex 的 `agent_hub` 表是切换用的临时块，恢复官方时移除。
+- **第三方模式才写默认选择**。modelSync 为 ZCode 解析出主模型（全局或 `overrides.zcode`）
+  且模式为 third-party 时，写入 `config.defaultModelSelection`（`reasoningEffort` →
+  `options.reasoningLevel`）；没有解析结果时保留用户当前选择——只同步目录不动会话入口。
+- **首次接管前快照**：把当前 `defaultModelSelection`（含键不存在这一状态）存入
+  `~/.zcode/v2/.agent-hub-state.json`；切回官方时原样恢复，接管期间写入的选择不残留。
+- **外部编辑防护**：接管期间用户在 ZCode 内改了默认选择，自动同步 / CLI push / watch 一律
+  拒绝覆盖并提示；只有同步页生成的新预览（显式 reconcile）才会按 Hub 选择重新设置，
+  或在官方模式下直接接受用户的选择作为新基线。
+- 损坏的托管记录（版本不符、快照形状不对）会拒绝同步并指向备份，不做猜测性修复。
 
 ## Claude Code
 

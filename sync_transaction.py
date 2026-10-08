@@ -29,7 +29,7 @@ from typing import Any
 TARGET_FILES = {
     "pi": (".pi/agent/models.json", ".pi/agent/auth.json", ".pi/agent/settings.json"),
     "mcode": (".minimax/config.yaml",),
-    "zcode": (".zcode/v2/provider_config.json",),
+    "zcode": (".zcode/v2/provider_config.json", ".zcode/v2/.agent-hub-state.json"),
     "dsh": (".dsh/.credentials.yaml", ".dsh/settings.yaml.imported",
             ".dsh/profiles/desktop/cordis.patch.yml", ".dsh/settings.yaml"),
     "claude": (".claude/settings.json",),
@@ -494,7 +494,7 @@ def _prune_plans() -> None:
         _PLANS.popitem(last=False)
 
 
-def _compile(engine: Path, root: Path, targets: list[str], *, reconcile_codex=False) -> list[str]:
+def _compile(engine: Path, root: Path, targets: list[str], *, reconcile=False) -> list[str]:
     # Keep API tokens and other user environment credentials out of the child.
     env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT", "WINDIR", "SYSTEMDRIVE", "TEMP", "TMP")
            if key in os.environ}
@@ -502,7 +502,7 @@ def _compile(engine: Path, root: Path, targets: list[str], *, reconcile_codex=Fa
                CODEX_HOME=str(root / "home" / ".codex"), PYTHONUTF8="1")
     try:
         result = subprocess.run([sys.executable, "-I", str(Path(__file__).absolute()), "--compile",
-                                 str(engine), str(root), json.dumps(targets), json.dumps(reconcile_codex)],
+                                 str(engine), str(root), json.dumps(targets), json.dumps(reconcile)],
                                 env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TransactionError("Isolated native configuration compilation did not finish") from exc
@@ -515,7 +515,7 @@ def _compile(engine: Path, root: Path, targets: list[str], *, reconcile_codex=Fa
     return report.get("warnings", [])
 
 
-def preview(hub, only: list[str] | None = None, *, reconcile_codex=False) -> dict:
+def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
     cfg = copy.deepcopy(hub.cfg)
     _validate_config(cfg)
     targets = _select(cfg, only)
@@ -550,7 +550,7 @@ def preview(hub, only: list[str] | None = None, *, reconcile_codex=False) -> dic
             if original is not None:
                 dest.write_bytes(original)
                 dest.chmod(0o600)
-        warnings.extend(_compile(engine, root, targets, reconcile_codex=reconcile_codex))
+        warnings.extend(_compile(engine, root, targets, reconcile=reconcile))
         allowed = set(relative_files)
         # This walk is confined to newly-created scratch files, never the user's HOME.
         for path in (root / "home").rglob("*"):
@@ -784,7 +784,7 @@ def restore(hub, transaction_id: str) -> dict:
         return result
 
 
-def _worker(engine: Path, root: Path, targets: list[str], *, reconcile_codex=False) -> int:
+def _worker(engine: Path, root: Path, targets: list[str], *, reconcile=False) -> int:
     """Child-only global path patching; never imported/executed by the web process."""
     # Defense in depth: existing adapters do not use the network or execute tools.
     def guard(event, args):
@@ -821,7 +821,9 @@ def _worker(engine: Path, root: Path, targets: list[str], *, reconcile_codex=Fal
     try:
         for target in targets:
             if target == "codex":
-                hub.push_codex(reconcile=reconcile_codex, warnings=warnings)
+                hub.push_codex(reconcile=reconcile, warnings=warnings)
+            elif target == "zcode":
+                hub.push_zcode(reconcile=reconcile, warnings=warnings)
             elif target == "pi":
                 hub.push_pi(warnings=warnings)
             else:
@@ -848,4 +850,4 @@ def _worker(engine: Path, root: Path, targets: list[str], *, reconcile_codex=Fal
 
 if __name__ == "__main__" and len(sys.argv) == 6 and sys.argv[1] == "--compile":
     sys.exit(_worker(Path(sys.argv[2]), Path(sys.argv[3]), json.loads(sys.argv[4]),
-                     reconcile_codex=json.loads(sys.argv[5]) is True))
+                     reconcile=json.loads(sys.argv[5]) is True))

@@ -387,7 +387,7 @@ def api_status() -> dict:
             "enabled": t.get("enabled", False), "aliasOf": t.get("aliasOf"),
             "notes": t.get("notes"),
             "supported": name in PREVIEW_TARGETS, "files": files,
-            "mode": t.get("mode", "official") if name == "codex" else None,
+            "mode": t.get("mode", "official") if name in ("codex", "zcode") else None,
             "readonly": name not in PREVIEW_TARGETS,
         }
     model_sync = _modelsync_block(h.cfg)
@@ -481,7 +481,7 @@ def api_preview(body: dict) -> dict:
         selected = _selected_targets(h, body)
         # User-triggered preview is an explicit new intent. Reconcile only here;
         # legacy /sync, CLI push, and watch must not silently take over edits.
-        plan = h.preview_push(only=selected, reconcile_codex=True)
+        plan = h.preview_push(only=selected, reconcile=True)
         # A preview is metadata only. Never expose generated config bytes or keys.
         return {"planId": plan["planId"], "targets": plan["targets"],
                 "files": [{"path": f["path"], "action": f["action"]}
@@ -543,8 +543,9 @@ def api_update_targets(body: dict) -> dict:
             if unknown:
                 raise ValueError("未知的平台设置字段")
             if "mode" in update:
-                if name != "codex" or update["mode"] not in ("official", "third-party"):
-                    raise ValueError("Codex mode 必须是 official 或 third-party")
+                if name not in ("codex", "zcode") or update["mode"] not in ("official", "third-party"):
+                    label = "Codex" if name == "codex" else "ZCode"
+                    raise ValueError(f"{label} mode 必须是 official 或 third-party")
                 proposed[name]["mode"] = update["mode"]
         for name, t in proposed.items():
             if t.get("aliasOf"):

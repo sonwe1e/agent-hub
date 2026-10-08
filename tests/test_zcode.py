@@ -53,6 +53,12 @@ class ZCodeTests(unittest.TestCase):
         self.path = self.home / ".zcode" / "v2" / "provider_config.json"
         self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps(zcode_document()), encoding="utf-8")
+        # 本类测试关注目录与连接语义：固定 third-party，使 modelSync 解析出的
+        # 默认选择照旧写入（official/third-party 门控见 ZCodeModeTests）。
+        cfg = self.config()
+        cfg["sync"]["targets"]["zcode"]["mode"] = "third-party"
+        self.save(cfg)
+        self.state_path = self.home / ".zcode" / "v2" / ".agent-hub-state.json"
 
     def config(self) -> dict:
         return json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
@@ -158,7 +164,9 @@ class ZCodeTests(unittest.TestCase):
             ("anthropic-messages", "anthropic-messages"),
         ):
             with self.subTest(protocol=protocol):
+                # 每轮都回到未接管状态：原生文档与托管状态文件一起重置
                 self.path.write_text(json.dumps(zcode_document()), encoding="utf-8")
+                self.state_path.unlink(missing_ok=True)
                 server.api_update_provider("firework", {"agents": {"zcode": {
                     "baseUrl": "https://zcode.example/api",
                     "apiKey": "zcode-test-key",
@@ -277,6 +285,158 @@ class ZCodeTests(unittest.TestCase):
                 else:
                     self.assertEqual(own_models[0]["name"], "ZCode-specific name")
                     self.assertEqual(own_models[1:], default_models[1:])
+
+
+class ZCodeModeTests(unittest.TestCase):
+    """official / third-party 双模式：快照、恢复、外部编辑 fail-closed 与 reconcile。
+
+    不预设 mode（缺省按 official 处理），逐测试显式切换。
+    """
+
+    def setUp(self):
+        context = isolated()
+        self.home = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+        self.path = self.home / ".zcode" / "v2" / "provider_config.json"
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps(zcode_document()), encoding="utf-8")
+        self.state_path = self.home / ".zcode" / "v2" / ".agent-hub-state.json"
+
+    def config(self) -> dict:
+        return json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+
+    def save(self, cfg: dict) -> None:
+        engine.save_json(server.HUB_CONFIG, cfg)
+
+    def read_zcode(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def read_state(self) -> dict:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def set_mode(self, mode: str) -> None:
+        cfg = self.config()
+        cfg["sync"]["targets"]["zcode"]["mode"] = mode
+        self.save(cfg)
+
+    def takeover(self) -> dict:
+        """切到 third-party 并同步一次，返回 Hub 写入的默认选择。"""
+        self.set_mode("third-party")
+        engine.Hub().push_zcode()
+        return self.read_zcode()["config"]["defaultModelSelection"]
+
+    def test_absent_mode_defaults_to_official_and_preserves_selection(self):
+        original = copy.deepcopy(zcode_document()["config"]["defaultModelSelection"])
+        engine.Hub().push_zcode()
+        self.assertEqual(self.read_zcode()["config"]["defaultModelSelection"], original)
+        self.assertFalse(self.state_path.exists())
+
+    def test_official_mode_still_maintains_hub_catalog(self):
+        self.set_mode("official")
+        engine.Hub().push_zcode()
+        rule = next(r for r in self.read_zcode()["config"]["providerConfigRules"]["providerRules"]
+                    if r["providerId"] == FIREWORK_ZCODE_ID)
+        self.assertEqual(rule["config"]["access"]["apiKey"], "test-not-a-real-key")
+        self.assertEqual(rule["config"]["personalModelIds"],
+                         [f"firework/model-{i + 1}" for i in range(7)])
+        self.assertFalse(self.state_path.exists())
+
+    def test_third_party_takeover_snapshots_selection_and_writes_hub_choice(self):
+        chosen = self.takeover()
+        self.assertEqual(chosen, {"providerId": "deepseek", "modelId": "deepseek/model-1",
+                                  "options": {"reasoningLevel": "medium"}})
+        state = self.read_state()
+        self.assertTrue(state["active"])
+        self.assertEqual(state["official"], {
+            "present": True,
+            "value": copy.deepcopy(zcode_document()["config"]["defaultModelSelection"]),
+        })
+        self.assertEqual(state["selectionHash"], engine.fingerprint(chosen))
+
+    def test_takeover_without_selection_snapshots_absent_and_official_removes_key(self):
+        data = self.read_zcode()
+        data["config"].pop("defaultModelSelection")
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.takeover()
+        self.assertEqual(self.read_state()["official"], {"present": False, "value": None})
+        self.set_mode("official")
+        engine.Hub().push_zcode()
+        self.assertNotIn("defaultModelSelection", self.read_zcode()["config"])
+        self.assertEqual(self.read_state(), {"version": 1, "active": False})
+
+    def test_third_party_repeat_sync_is_stable(self):
+        self.takeover()
+        document = self.path.read_bytes()
+        state = self.state_path.read_bytes()
+        engine.Hub().push_zcode()
+        self.assertEqual(self.path.read_bytes(), document)
+        self.assertEqual(self.state_path.read_bytes(), state)
+
+    def test_external_selection_change_fails_closed_then_reconciles(self):
+        self.takeover()
+        data = self.read_zcode()
+        data["config"]["defaultModelSelection"] = {"providerId": "manual-provider",
+                                                   "modelId": "manual-model"}
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "外部更改"):
+            engine.Hub().push_zcode()
+        self.assertEqual(self.path.read_bytes(), before)
+        warnings: list[str] = []
+        engine.Hub().push_zcode(reconcile=True, warnings=warnings)
+        self.assertTrue(any("ZCode" in w for w in warnings))
+        self.assertEqual(self.read_zcode()["config"]["defaultModelSelection"], {
+            "providerId": "deepseek", "modelId": "deepseek/model-1",
+            "options": {"reasoningLevel": "medium"},
+        })
+
+    def test_official_restores_snapshot_and_keeps_hub_catalog(self):
+        self.takeover()
+        self.set_mode("official")
+        engine.Hub().push_zcode()
+        data = self.read_zcode()["config"]
+        self.assertEqual(data["defaultModelSelection"],
+                         zcode_document()["config"]["defaultModelSelection"])
+        self.assertEqual(self.read_state(), {"version": 1, "active": False})
+        rule = next(r for r in data["providerConfigRules"]["providerRules"]
+                    if r["providerId"] == FIREWORK_ZCODE_ID)
+        self.assertEqual(rule["config"]["access"]["apiKey"], "test-not-a-real-key")
+
+    def test_official_accepts_external_switch_as_new_baseline(self):
+        self.takeover()
+        manual = {"providerId": "manual-provider", "modelId": "manual-model"}
+        data = self.read_zcode()
+        data["config"]["defaultModelSelection"] = manual
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        self.set_mode("official")
+        warnings: list[str] = []
+        engine.Hub().push_zcode(warnings=warnings)
+        # 用户已自行改选：保留当前选择，不复活旧快照
+        self.assertEqual(self.read_zcode()["config"]["defaultModelSelection"], manual)
+        self.assertEqual(self.read_state(), {"version": 1, "active": False})
+        self.assertTrue(any("外部更改" in w for w in warnings))
+
+    def test_invalid_mode_is_rejected(self):
+        self.set_mode("bogus")
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "ZCode mode"):
+            engine.Hub().push_zcode()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_corrupt_state_is_rejected(self):
+        self.takeover()
+        state = self.read_state()
+        state["official"] = "garbage"
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "托管记录无效"):
+            engine.Hub().push_zcode()
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_unrecoverable_state_version_is_rejected(self):
+        self.state_path.write_text(json.dumps({"version": 2, "active": True}), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "恢复记录无效"):
+            engine.Hub().push_zcode()
 
 
 if __name__ == "__main__":

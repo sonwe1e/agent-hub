@@ -20,8 +20,8 @@ source = source.slice(0, source.lastIndexOf('state.page = PAGES[location.hash.sl
 vm.runInContext(source, context);
 const run = text => vm.runInContext(text, context);
 run(`state.providers = {gateway: {name: 'Gateway', enabled: true, models: [{id:'gpt-test'}]}};
-state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:['gateway'],agentCapable:{pi:['gateway'],dsh:['gateway'],zcode:['gateway'],claude:['gateway'],codex:['gateway']},connections:{gateway:{pi:{ready:true,overridden:false,modelCount:1},dsh:{ready:true,overridden:false,modelCount:1},zcode:{ready:true,overridden:false,modelCount:1},claude:{ready:true,overridden:false,modelCount:1},codex:{ready:true,overridden:false,modelCount:1}}},lastResults:[]};
-state.targetDraft={codex:true,pi:true};
+state.status = {targets:{codex:{enabled:true,supported:true,mode:'official'},zcode:{enabled:true,supported:true,mode:'official'},pi:{enabled:true,supported:true}},anthropicCapable:['gateway'],agentCapable:{pi:['gateway'],dsh:['gateway'],zcode:['gateway'],claude:['gateway'],codex:['gateway']},connections:{gateway:{pi:{ready:true,overridden:false,modelCount:1},dsh:{ready:true,overridden:false,modelCount:1},zcode:{ready:true,overridden:false,modelCount:1},claude:{ready:true,overridden:false,modelCount:1},codex:{ready:true,overridden:false,modelCount:1}}},lastResults:[]};
+state.targetDraft={codex:true,zcode:true,pi:true};
 state.modelSync={modelSync:{default:{provider:'gateway',model:'gpt-test'}},resolved:{codex:{provider:'gateway',model:'gpt-test'}},options:{},optionsByTarget:{}};
 ensureModelSyncDraft();`);
 let passed = 0;
@@ -50,8 +50,22 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.match(html, /ZCode/);
     assert.match(run(`AGENT_OVERRIDES.map(x=>x[0]).join(',')`), /zcode/);
   });
+  await test('ZCode official mode keeps catalog but explains no default takeover', () => {
+    const html = run(`clientRow('zcode','ZCode')`);
+    assert.match(html, /id="zcode-mode"/);
+    assert.match(html, /官方模式/);
+    assert.match(html, /个人供应商目录/);
+    assert.match(html, /credentials\.json.*永不触碰/);
+    assert.doesNotMatch(html, /id="zcode-optin"/);
+  });
+  await test('ZCode third-party mode requires its own opt-in', () => {
+    run(`state.clientMode.zcode='third-party'`);
+    const html = run(`clientRow('zcode','ZCode')`);
+    assert.match(html, /id="zcode-optin" type="checkbox"\s*\//);
+    assert.match(html, /data-action="ms-override"/);
+  });
   await test('third-party opt-in is explicit and override is editable', () => {
-    run(`state.codexMode='third-party';state.codexOptIn=false`);
+    run(`state.clientMode.codex='third-party';state.clientOptIn.codex=false`);
     const html = run(`clientRow('codex','Codex')`);
     assert.match(html, /id="codex-optin" type="checkbox"\s*\//);
     assert.match(html, /data-action="ms-override"/);
@@ -76,8 +90,11 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
   await test('mode changes invalidate preview and clear consent', () => {
     listeners.get('change')({target:{id:'codex-mode',value:'official',dataset:{},classList:{contains:()=>false}}});
     assert.equal(run('state.preview'), null);
-    assert.equal(run('state.codexOptIn'), false);
+    assert.equal(run('state.clientOptIn.codex'), false);
     assert.equal(node('#sync-preview').hidden, true);
+    listeners.get('change')({target:{id:'zcode-mode',value:'third-party',dataset:{},classList:{contains:()=>false}}});
+    assert.equal(run('state.clientMode.zcode'), 'third-party');
+    assert.equal(run('state.clientOptIn.zcode'), false);
   });
   await test('platform selection changes invalidate preview', () => {
     run(`state.preview={planId:'plan'}`);
@@ -86,7 +103,7 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.equal(run('state.targetDraft.pi'), false);
   });
   await test('unsaved model-only overrides protect refresh and navigation', () => {
-    run(`state.loaded=true; state.targetDraft.pi=true; state.codexMode='official';`);
+    run(`state.loaded=true; state.targetDraft.pi=true; state.clientMode.codex='official'; state.clientMode.zcode='official';`);
     assert.equal(run('targetDirty()'), true);
     run(`state.modelSyncDraft=null;state.modelSyncDraftKey='';ensureModelSyncDraft()`);
     assert.equal(run('targetDirty()'), false);
@@ -95,13 +112,19 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     toast=(message)=>messages.push(message);
     api=async(method,path,body)=>{requests.push({method,path,body});return {planId:'test-plan',targets:['codex'],files:[],warnings:[]}};`);
   await test('third-party preview blocked until explicit consent', async () => {
-    run(`state.codexMode='third-party';state.codexOptIn=false`);
+    run(`state.clientMode.codex='third-party';state.clientOptIn.codex=false`);
     await run(`runSync()`);
     assert.equal(run('requests.length'), 0);
     assert.match(run('messages.at(-1)'), /先勾选/);
   });
+  await test('ZCode third-party preview blocked until its own consent', async () => {
+    run(`state.clientMode.codex='official';state.clientMode.zcode='third-party';state.clientOptIn.zcode=false`);
+    await run(`runSync()`);
+    assert.equal(run('requests.length'), 0);
+    assert.match(run('messages.at(-1)'), /先勾选 ZCode/);
+  });
   await test('generating preview never invokes apply', async () => {
-    run(`state.codexOptIn=true`);
+    run(`state.clientMode.zcode='official';state.clientOptIn.codex=true`);
     await run(`runSync()`);
     assert.equal(run('requests.length'), 1);
     assert.equal(run('requests[0].path'), '/api/preview');

@@ -219,6 +219,9 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       assert.deepEqual(plan.agents.zcode.models.map(model => model.id), ['zcode-only']);
 
       await go('sync');
+      // 官方模式下 ZCode 不展示覆盖行；先切第三方模式并勾选确认，顺带覆盖模式 UI
+      await main.locator('#zcode-mode').selectOption('third-party');
+      await main.locator('#zcode-optin').check();
       await main.locator('[data-action="ms-override"][data-target="zcode"]').click();
       await main.locator('#ms-provider-clients-zcode').selectOption('zcode-plan');
       const choices = await main.locator('#ms-model-clients-zcode option').evaluateAll(options => options.map(option => option.value));

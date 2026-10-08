@@ -60,11 +60,32 @@ const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ult
 const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 // 模型同步卡片里的客户端行；dsh-desktop 与 dsh 共用配置，不接受单独 override。
 const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["zcode", "ZCode"], ["claude", "Claude Code"], ["codex", "Codex"]];
+// 有「官方 / 第三方」双模式的客户端：默认模型选择的接管与归还。
+// official = 不写默认选择（ZCode 仍维护供应商目录；Codex 恢复官方基线）；
+// third-party = 按 Hub 模型设置写入，需要显式 opt-in。
+const MODE_CLIENTS = {
+  codex: {
+    label: "Codex", lineLabel: "Codex 请求线路", noun: "线路",
+    officialOption: "官方 · 恢复原模型与推理强度", thirdPartyOption: "第三方 · 使用 Hub 模型设置",
+    officialTag: "官方线路",
+    optInText: "我明确选择第三方线路，Codex 请求将发送到所选供应商",
+    officialNote: "同步时恢复 Hub 首次切换第三方前保存的官方 model、model_provider 和 reasoning effort；没有保存记录时仅接受现有官方配置；现有第三方线路会拒绝恢复，需先在 Codex 中恢复官方配置。不会更改 auth.json 登录态。",
+    officialKeepNote: "第三方模型覆盖保留在 Hub 中，官方模式不会将这些模型写入 Codex。",
+  },
+  zcode: {
+    label: "ZCode", lineLabel: "ZCode 默认模型", noun: "模式",
+    officialOption: "官方 · 保留当前默认模型", thirdPartyOption: "第三方 · 使用 Hub 模型设置",
+    officialTag: "官方模式",
+    optInText: "我明确选择第三方模式，ZCode 默认模型将切换到所选供应商",
+    officialNote: "官方模式仍会把 Hub 供应商维护进 ZCode 的个人供应商目录，但不会更改默认模型选择；若 Hub 之前接管过默认选择，将恢复接管前保存的选择。ZCode 账号登录（credentials.json）永不触碰。",
+    officialKeepNote: "模型覆盖保留在 Hub 中，官方模式不会更改 ZCode 的默认模型选择；供应商目录照常维护。",
+  },
+};
 const CLAUDE_TIERS = [["opus", "opus 档位"], ["sonnet", "sonnet 档位"], ["haiku", "haiku 档位"], ["subagent", "subagent 档位"]];
 const state = {
   providers: {}, status: null, page: "models", busy: false, loaded: false,
   filters: { query: "", provider: "all", agent: "all", capability: "all" }, modelPage: 1, selection: new Set(),
-  providerQuery: "", targetDraft: {}, codexMode: "official", codexOptIn: false, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [],
+  providerQuery: "", targetDraft: {}, clientMode: { codex: "official", zcode: "official" }, clientOptIn: { codex: false, zcode: false }, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [],
   modelSync: null, modelSyncError: "", modelSyncLoading: false, modelSyncDraft: null, modelSyncDraftKey: "", modelSyncCustom: {}, modelSyncOpen: new Set(),
   discoverAgent: "",
 };
@@ -93,7 +114,7 @@ const parseJsonField = (raw, label) => {
 };
 const effectiveTargets = () => Object.entries(state.status?.targets || {}).filter(([, t]) => t.supported && !t.aliasOf);
 const enabledCount = () => effectiveTargets().filter(([, t]) => t.enabled).length;
-const targetDirty = () => effectiveTargets().some(([n, t]) => state.targetDraft[n] !== t.enabled) || state.codexMode !== (state.status?.targets?.codex?.mode || "official") || (state.loaded && modelSyncDirty());
+const targetDirty = () => effectiveTargets().some(([n, t]) => state.targetDraft[n] !== t.enabled) || Object.keys(MODE_CLIENTS).some(name => state.clientMode[name] !== (state.status?.targets?.[name]?.mode || "official")) || (state.loaded && modelSyncDirty());
 const formSnapshot = () => JSON.stringify([...new FormData($("#editor-form")).entries()]);
 const editorDirty = () => state.editor && state.editor.type !== "discover" && formSnapshot() !== state.editorSnapshot;
 const dateLabel = value => {
@@ -298,8 +319,10 @@ async function refreshAfterWrite(message) {
 
 function resetTargetDraft() {
   state.targetDraft = Object.fromEntries(effectiveTargets().map(([n, t]) => [n, t.enabled]));
-  state.codexMode = state.status?.targets?.codex?.mode || "official";
-  state.codexOptIn = state.codexMode === "third-party";
+  for (const name of Object.keys(MODE_CLIENTS)) {
+    state.clientMode[name] = state.status?.targets?.[name]?.mode || "official";
+    state.clientOptIn[name] = state.clientMode[name] === "third-party";
+  }
   invalidatePreview();
   // 多 agent 模型设置的草稿从后端最新数据重建，未保存的改动在此丢弃。
   state.modelSyncDraft = null;
@@ -523,9 +546,10 @@ function clientRow(name, label) {
   const entry = draft.overrides?.[name] || {};
   const resolved = modelSyncResolved(name);
   const codex = name === "codex";
-  const mode = codex ? `<div class="codex-mode"><label class="field"><span>Codex 请求线路</span><select id="codex-mode" aria-label="Codex 请求线路" ${state.status?.targets?.codex ? "" : "disabled"}><option value="official" ${state.codexMode === "official" ? "selected" : ""}>官方 · 恢复原模型与推理强度</option><option value="third-party" ${state.codexMode === "third-party" ? "selected" : ""}>第三方 · 使用 Hub 模型设置</option></select></label>${state.codexMode === "third-party" ? `<label class="check-label codex-optin"><input id="codex-optin" type="checkbox" ${state.codexOptIn ? "checked" : ""} />我明确选择第三方线路，Codex 请求将发送到所选供应商</label>` : `<p class="ms-client-note">同步时恢复 Hub 首次切换第三方前保存的官方 model、model_provider 和 reasoning effort；没有保存记录时仅接受现有官方配置；现有第三方线路会拒绝恢复，需先在 Codex 中恢复官方配置。不会更改 auth.json 登录态。</p>`}</div>` : "";
-  if (codex && state.codexMode !== "third-party") {
-    return `<div class="ms-client" data-client="codex"><div class="ms-client-head"><strong>Codex</strong><span class="tag green">官方线路</span></div>${mode}<p class="ms-client-note">第三方模型覆盖保留在 Hub 中，官方模式不会将这些模型写入 Codex。${state.status?.targets?.codex ? "勾选 Codex 平台后预览并应用，线路才会生效。" : "当前未配置 Codex 同步目标。"}</p></div>`;
+  const modeful = MODE_CLIENTS[name];
+  const mode = modeful ? `<div class="codex-mode"><label class="field"><span>${esc(modeful.lineLabel)}</span><select id="${name}-mode" aria-label="${esc(modeful.lineLabel)}" ${state.status?.targets?.[name] ? "" : "disabled"}><option value="official" ${state.clientMode[name] === "official" ? "selected" : ""}>${esc(modeful.officialOption)}</option><option value="third-party" ${state.clientMode[name] === "third-party" ? "selected" : ""}>${esc(modeful.thirdPartyOption)}</option></select></label>${state.clientMode[name] === "third-party" ? `<label class="check-label codex-optin"><input id="${name}-optin" type="checkbox" ${state.clientOptIn[name] ? "checked" : ""} />${esc(modeful.optInText)}</label>` : `<p class="ms-client-note">${esc(modeful.officialNote)}</p>`}</div>` : "";
+  if (modeful && state.clientMode[name] !== "third-party") {
+    return `<div class="ms-client" data-client="${esc(name)}"><div class="ms-client-head"><strong>${esc(modeful.label)}</strong><span class="tag green">${esc(modeful.officialTag)}</span></div>${mode}<p class="ms-client-note">${esc(modeful.officialKeepNote)}${state.status?.targets?.[name] ? `勾选 ${esc(modeful.label)} 平台后预览并应用，设置才会生效。` : `当前未配置 ${esc(modeful.label)} 同步目标。`}</p></div>`;
   }
   const overridden = !!(entry.model || entry.provider || entry.reasoningEffort);
   const body = overridden
@@ -622,11 +646,12 @@ function updateModelSyncUI() {
 }
 async function saveTargets() {
   if (!targetDirty() && !modelSyncDirty()) return;
-  if (state.codexMode === "third-party" && !state.codexOptIn) throw new Error("请先勾选 Codex 第三方线路确认，或改回官方线路。");
+  const unconfirmed = Object.keys(MODE_CLIENTS).filter(name => state.clientMode[name] === "third-party" && !state.clientOptIn[name]);
+  if (unconfirmed.length) { const m = MODE_CLIENTS[unconfirmed[0]]; throw new Error(`请先勾选 ${m.label} 第三方${m.noun}确认，或改回官方${m.noun}。`); }
   // 平台设置与模型设置写在不同接口；这里顺手把未保存的模型设置一起落盘，避免随后的 reload 丢掉它。
   if (modelSyncDirty() && !state.modelSyncError) await saveModelSync();
   const updates = Object.fromEntries(effectiveTargets().map(([name]) => [name, { enabled: state.targetDraft[name] }]));
-  if (updates.codex) updates.codex.mode = state.codexMode;
+  for (const name of Object.keys(MODE_CLIENTS)) if (updates[name]) updates[name].mode = state.clientMode[name];
   await api("PUT", "/api/targets", { targets: updates });
   // 先更新本地基线，reload 就不会误保留已经保存的草稖。
   for (const [name, value] of Object.entries(updates)) Object.assign(state.status.targets[name], value);
@@ -653,7 +678,8 @@ function renderPreview() {
 async function runSync(detect = false) {
   const selected = Object.entries(state.targetDraft).filter(([, enabled]) => enabled).map(([name]) => name);
   if (!selected.length) { toast("请至少选择一个同步平台", "error"); return; }
-  if (state.codexMode === "third-party" && !state.codexOptIn) { toast("请先勾选 Codex 第三方线路确认，或改回官方线路。", "error"); $("#codex-optin")?.focus(); return; }
+  const unconfirmedSync = Object.keys(MODE_CLIENTS).filter(name => state.clientMode[name] === "third-party" && !state.clientOptIn[name]);
+  if (unconfirmedSync.length) { const m = MODE_CLIENTS[unconfirmedSync[0]]; toast(`请先勾选 ${m.label} 第三方${m.noun}确认，或改回官方${m.noun}。`, "error"); $(`#${unconfirmedSync[0]}-optin`)?.focus(); return; }
   if (detect && !await confirmDialog("检测并预览客户端变更？", "这不是从客户端导入配置。仍将以 Hub 配置为准生成预览，确认应用后才会写入已选平台。", [], "生成预览", false)) return;
   await busy("正在生成同步预览…", async () => {
     invalidatePreview();
@@ -1063,10 +1089,14 @@ document.addEventListener("change", event => {
   if (el.name === "allTargets" && state.editor?.type === "provider") {
     $("#editor-form").querySelectorAll('[name="targets"]').forEach(input => { input.disabled = el.checked; });
   }
-  if (el.id === "codex-mode") {
-    invalidatePreview(); state.codexMode = el.value; state.codexOptIn = false; renderModelSyncCard(); updateTargetDraftUI();
+  if (el.id.endsWith("-mode")) {
+    const name = el.id.slice(0, -5);
+    if (MODE_CLIENTS[name]) { invalidatePreview(); state.clientMode[name] = el.value; state.clientOptIn[name] = false; renderModelSyncCard(); updateTargetDraftUI(); }
   }
-  if (el.id === "codex-optin") { invalidatePreview(); state.codexOptIn = el.checked; updateTargetDraftUI(); }
+  if (el.id.endsWith("-optin")) {
+    const name = el.id.slice(0, -6);
+    if (MODE_CLIENTS[name]) { invalidatePreview(); state.clientOptIn[name] = el.checked; updateTargetDraftUI(); }
+  }
   if (el.id === "agent-filter") { state.filters.agent = el.value; state.modelPage = 1; renderModelRows(); }
   if (el.id === "discover-agent") { state.discoverAgent = el.value; discover(state.editor?.pid); }
   if (el.classList.contains("discover-check")) updateDiscoverSelection();

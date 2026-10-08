@@ -334,9 +334,11 @@ class SafeSyncTransactionTests(unittest.TestCase):
     def test_zcode_preview_apply_restore_only_changes_native_provider_config(self):
         from test_zcode import zcode_document
         cfg = self.config(["zcode"])
+        cfg["sync"]["targets"]["zcode"]["mode"] = "third-party"
         cfg["sync"]["targets"]["zcode"]["files"] = ["~/do-not-touch.json"]
         self.save(cfg)
         zcode = self.home / ".zcode" / "v2" / "provider_config.json"
+        zcode_state = self.home / ".zcode" / "v2" / ".agent-hub-state.json"
         zcode.parent.mkdir(parents=True)
         original = json.dumps(zcode_document()).encode("utf-8")
         zcode.write_bytes(original)
@@ -346,15 +348,21 @@ class SafeSyncTransactionTests(unittest.TestCase):
         plan = transaction.preview(engine.Hub(), ["zcode"])
         self.assertEqual(before, self.native_files())
         self.assertNotIn("test-not-a-real-key", json.dumps(plan))
-        self.assertEqual([file["path"] for file in plan["files"]], [str(zcode)])
+        # 首次第三方接管：原生目录 + 托管状态文件（快照），其它文件不碰
+        self.assertEqual(sorted(file["path"] for file in plan["files"]),
+                         sorted([str(zcode), str(zcode_state)]))
         result = transaction.apply(engine.Hub(), plan["planId"])
         self.assertEqual(result["results"], ["  ✓ zcode"])
         selection = json.loads(zcode.read_text(encoding="utf-8"))["config"]["defaultModelSelection"]
         self.assertEqual(selection["providerId"], "deepseek")
         self.assertEqual(selection["modelId"], "deepseek/model-1")
+        state = json.loads(zcode_state.read_text(encoding="utf-8"))
+        self.assertTrue(state["active"])
+        self.assertNotIn("test-not-a-real-key", zcode_state.read_text(encoding="utf-8"))
         self.assertEqual((self.home / "do-not-touch.json").read_bytes(), b"unparseable sentinel")
         transaction.restore(engine.Hub(), result["transactionId"])
         self.assertEqual(zcode.read_bytes(), original)
+        self.assertFalse(zcode_state.exists())
         self.assertEqual(self.native_files(), before)
 
     def test_restore_respects_platform_permission_semantics(self):

@@ -18,6 +18,7 @@ class PreviewContractTests(unittest.TestCase):
         status = server.api_status()
         self.assertFalse(status['targets']['pi']['enabled'])
         self.assertEqual(status['targets']['codex']['mode'], 'official')
+        self.assertEqual(status['targets']['zcode']['mode'], 'official')
         self.assertFalse(status['targets']['codex']['readonly'])
         with self.assertRaises(ValueError):
             server.api_preview({'targets': ['pi']})
@@ -34,7 +35,7 @@ class PreviewContractTests(unittest.TestCase):
 
     def test_codex_mode_is_explicit_and_invalid_mode_is_atomic(self):
         before = server.HUB_CONFIG.read_bytes()
-        for target, mode in [('codex', 'custom'), ('pi', 'third-party'), ('codex', True)]:
+        for target, mode in [('codex', 'custom'), ('zcode', 'custom'), ('pi', 'third-party'), ('codex', True)]:
             with self.subTest(target=target, mode=mode), self.assertRaises(ValueError):
                 server.api_update_targets({'targets': {'pi': {'enabled': False}, target: {'mode': mode}}})
             self.assertEqual(before, server.HUB_CONFIG.read_bytes())
@@ -42,6 +43,12 @@ class PreviewContractTests(unittest.TestCase):
         self.assertEqual(server.api_status()['targets']['codex']['mode'], 'third-party')
         server.api_update_targets({'targets': {'codex': {'mode': 'official'}}})
         self.assertEqual(server.api_status()['targets']['codex']['mode'], 'official')
+
+    def test_zcode_mode_is_accepted_and_reported(self):
+        server.api_update_targets({'targets': {'zcode': {'enabled': True, 'mode': 'third-party'}}})
+        self.assertEqual(server.api_status()['targets']['zcode']['mode'], 'third-party')
+        server.api_update_targets({'targets': {'zcode': {'mode': 'official'}}})
+        self.assertEqual(server.api_status()['targets']['zcode']['mode'], 'official')
 
     def test_codex_provider_responses_and_env_round_trip(self):
         server.api_add_provider({'id': 'env-gateway', 'name': 'Gateway',
@@ -87,7 +94,7 @@ class PreviewContractTests(unittest.TestCase):
         with patch.object(engine.Hub, 'preview_push', return_value=plan, create=True) as preview, \
              patch.object(engine.Hub, 'apply_preview', create=True) as apply:
             result = server.api_preview({'targets': ['dsh', 'dsh-desktop']})
-        preview.assert_called_once_with(only=['dsh'], reconcile_codex=True)
+        preview.assert_called_once_with(only=['dsh'], reconcile=True)
         apply.assert_not_called()
         self.assertNotIn('secret-key', json.dumps(result))
         self.assertEqual(result['files'], [{'path': '/temporary/client.json', 'action': 'update'}])

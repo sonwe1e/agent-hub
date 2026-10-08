@@ -149,6 +149,12 @@ def load_json(path: Path, default: Any = None) -> Any:
     return json.loads(strip_json_comments(path.read_text(encoding="utf-8")))
 
 
+def fingerprint(value: Any) -> str:
+    """托管记录比对用的稳定摘要；与 codex_config.fingerprint 同规则。"""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+
 def save_json(path: Path, data: Any, indent: int = 2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # 保护: 写 providers.json 前若模型数量大幅减少则先快照
@@ -1454,9 +1460,9 @@ class Hub:
         }
 
     # -- push adapters --
-    def preview_push(self, only: list[str] | None = None, *, reconcile_codex=False) -> dict:
+    def preview_push(self, only: list[str] | None = None, *, reconcile=False) -> dict:
         from sync_transaction import preview
-        return preview(self, only, reconcile_codex=reconcile_codex)
+        return preview(self, only, reconcile=reconcile)
 
     def apply_preview(self, plan_id: str) -> dict:
         from sync_transaction import apply
@@ -1673,10 +1679,30 @@ class Hub:
         path.write_text(dump_yaml(data) + "\n", encoding="utf-8")
 
     # ---- zcode ----
-    def push_zcode(self) -> None:
+    def push_zcode(self, *, reconcile: bool = False, warnings: list | None = None) -> None:
         path = HOME / ".zcode" / "v2" / "provider_config.json"
         if not path.exists():
             raise FileNotFoundError(path)
+        # 与 Codex 相同的双模式门控：official 恢复 Hub 接管前的默认选择，
+        # third-party 才写 defaultModelSelection。缺省按 official 处理，
+        # 旧配置不会在升级后被隐式接管。
+        target_cfg = self.cfg.get("sync", {}).get("targets", {}).get("zcode") or {}
+        mode = target_cfg.get("mode", "official")
+        if mode not in ("official", "third-party"):
+            raise ValueError("ZCode mode 必须是 official 或 third-party")
+        state_path = HOME / ".zcode" / "v2" / ".agent-hub-state.json"
+        saved = load_json(state_path)
+        if saved is not None and (not isinstance(saved, dict) or saved.get("version") != 1):
+            raise ValueError("ZCode 恢复记录无效，请先检查备份")
+        active = bool(saved and saved.get("active"))
+        if active:
+            official_saved = saved.get("official")
+            if (not isinstance(official_saved, dict) or set(official_saved) != {"present", "value"}
+                    or not isinstance(official_saved.get("present"), bool)
+                    or (official_saved["present"] and not isinstance(official_saved.get("value"), dict))
+                    or not isinstance(saved.get("selectionHash"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", saved["selectionHash"])):
+                raise ValueError("ZCode 托管记录无效，请先检查备份")
         backup_file(path)
         data = load_json(path) or {}
         cfg = data.setdefault("config", {})
@@ -1787,11 +1813,27 @@ class Hub:
                 if "input" in m:
                     properties.setdefault("inputFormat", {})["supportsImage"] = "image" in m["input"]
 
-        # modelSync 显式解析出 ZCode 主模型时，写入 ZCode 当前版本使用的
-        # config.defaultModelSelection。没有 modelSync 时保留用户现有选择，
-        # 这样仅同步供应商目录不会悄悄改动 ZCode 的当前会话入口。
-        selection = resolve_agent_model(self.cfg, "zcode")
-        if selection:
+        # 默认模型选择：official/third-party 双模式。third-party 下 modelSync
+        # 显式解析出主模型才写 config.defaultModelSelection（没有 modelSync 时
+        # 保留用户现有选择，仅同步供应商目录不改动 ZCode 的当前会话入口）。
+        # 首次写入前把当前选择（含「没有选择」）快照进 state 文件；official
+        # 恢复快照。外部改过选择时 fail-closed，只有显式预览 reconcile。
+        live_selection = cfg.get("defaultModelSelection")
+        next_state = saved
+        selection = resolve_agent_model(self.cfg, "zcode") if mode == "third-party" else None
+        if mode == "official":
+            if active:
+                if fingerprint(live_selection) == saved["selectionHash"]:
+                    # Hub 写入的选择还在：恢复接管前的快照，缺省恢复成缺省
+                    if saved["official"]["present"]:
+                        cfg["defaultModelSelection"] = copy.deepcopy(saved["official"]["value"])
+                    else:
+                        cfg.pop("defaultModelSelection", None)
+                elif warnings is not None:
+                    # 用户已在 ZCode 内自行改选：保留当前选择作为新基线，不复活旧快照
+                    warnings.append("ZCode: 默认模型选择已在外部更改；保留当前选择，不再恢复接管前的快照。")
+                next_state = {"version": 1, "active": False}
+        elif selection:
             pid = selection["provider"]
             zid = zcode_ids.get(pid)
             if not zid:
@@ -1804,9 +1846,24 @@ class Hub:
             effort = selection.get("reasoningEffort")
             if effort:
                 chosen["options"] = {"reasoningLevel": effort}
-            cfg["defaultModelSelection"] = chosen
+            if active:
+                official_next = saved["official"]
+                if fingerprint(live_selection) != saved["selectionHash"]:
+                    if not reconcile:
+                        raise ValueError("ZCode 默认模型选择已在外部更改；请在同步页生成新预览并确认应用，自动同步不会覆盖外部编辑")
+                    if warnings is not None:
+                        warnings.append("ZCode: 检测到默认模型选择被外部更改。本次预览将按 Hub 选择重新设置；确认应用前不会写入。")
+            else:
+                official_next = {"present": isinstance(live_selection, dict),
+                                 "value": copy.deepcopy(live_selection) if isinstance(live_selection, dict) else None}
+            if cfg.get("defaultModelSelection") != chosen:
+                cfg["defaultModelSelection"] = chosen
+            next_state = {"version": 1, "active": True, "official": official_next,
+                          "selectionHash": fingerprint(chosen)}
 
         save_json(path, data)
+        if next_state != saved:
+            save_json(state_path, next_state)
 
     # ---- dsh ----
     def push_dsh(self) -> None:
