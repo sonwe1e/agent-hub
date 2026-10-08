@@ -112,17 +112,18 @@ G:\workspaces\agent-hub\hub.cmd backup
 
 ### 多 agent 模型同步
 
-「多 agent 使用的模型」卡片选一次主模型，同步后由兼容该供应商的平台各自采用；Codex 仅在明确选择第三方线路时跟随。
+「多 agent 使用的模型」卡片选一次主模型，同步后由兼容该供应商的平台各自采用；ZCode 会写入自己的 provider/model 选择，Codex 仅在明确选择第三方线路时跟随。
 Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reasoning_effort` 和 `[model_providers.agent_hub]` 段；切回官方线路会恢复首次切换前保存的值。ChatGPT 登录态由 Codex 自己维护。
 
 | 客户端 | 主模型落到哪里 | 子 agent / 档位落到哪里 |
 |--------|----------------|--------------------------|
 | pi | `~/.pi/agent/settings.json` 的 `defaultProvider` + `defaultModel` | pi 没有子代理概念，只写主模型 |
 | dsh 桌面版 | `profiles/desktop/cordis.patch.yml` 的 `agent-default-model` | 同文件 `subagent-model-selection-settings.allowedModels`（子代理可选模型） |
+| ZCode | `~/.zcode/v2/provider_config.json` 的 `config.defaultModelSelection` | ZCode provider 规则中的 `personalModelIds` / `modelOrder` |
 | Claude Code | `~/.claude/settings.json` 的 `env.ANTHROPIC_MODEL` | `ANTHROPIC_DEFAULT_OPUS/SONNET/HAIKU_MODEL` 与 `CLAUDE_CODE_SUBAGENT_MODEL` |
 | Codex 桌面版 / CLI | `~/.codex/config.toml` 的 `model_provider` + `model` | 同文件 `[model_providers.agent_hub]`（base_url / wire_api / 授权）；`auth.json` 的登录态不碰 |
 
-模型下拉只列出**该 Agent 连接上**的模型：`agents.claude` 与 `agents.codex` 各有自己的模型库。
+模型下拉只列出**该 Agent 连接上**的模型：`agents.claude`、`agents.codex` 与 `agents.zcode` 各有自己的模型库。
 
 `providers.json` 里的结构（也可以用命令行 `hub model` 改）：
 
@@ -132,10 +133,11 @@ Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reason
   "overrides": {
     "pi":  { "provider": "stepfun", "model": "step-5-preview" },   // 只改 pi
     "dsh": { "provider": "firework", "model": "glm-5.3" },
+    "zcode": { "provider": "openrouter", "model": "anthropic/stealth/space-bunny-alpha[1m]" },
     "codex": { "provider": "tokenfree", "model": "gpt-6-astra", "reasoningEffort": "ultra" },
     "claude": {
-      "provider": "tokenfree", "model": "claude-opus-5-5",
-      "tiers": { "opus": { "provider": "tokenfree", "model": "claude-opus-5-5" } }
+      "provider": "tokenfree-claude", "model": "claude-opus-5-5",
+      "tiers": { "opus": { "provider": "tokenfree-claude", "model": "claude-opus-5-5" } }
     }
   }
 }
@@ -170,7 +172,8 @@ Codex 线路用 `none / minimal / low / medium / high / xhigh / max / ultra`（`
 G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-flash                     # 全局主模型
 G:\workspaces\agent-hub\hub.cmd model firework glm-5.3 --target dsh              # 只改 dsh
 G:\workspaces\agent-hub\hub.cmd model tokenfree gpt-6-astra --target codex --reasoning-effort ultra
-G:\workspaces\agent-hub\hub.cmd model tokenfree claude-opus-5-5 --target claude  # 只改 Claude Code
+G:\workspaces\agent-hub\hub.cmd model tokenfree-claude claude-opus-5-5 --target claude  # 只改 Claude Code
+G:\workspaces\agent-hub\hub.cmd model openrouter anthropic/stealth/space-bunny-alpha[1m] --target zcode  # 只改 ZCode
 G:\workspaces\agent-hub\hub.cmd push                                            # 再同步到各客户端
 ```
 
@@ -263,7 +266,8 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
     "firework":  { /* 火山网关，dsh 路由名 firework */ },
     "deepseek":  { /* DeepSeek 官方 */ },
     "openrouter":{ /* 聚合网关 */ },
-    "tokenfree": { /* 一个供应商多条连接，见下 */ }
+    "tokenfree":        { /* 自定义网关 OpenAI 线（gpt-*），见下 */ },
+    "tokenfree-claude": { /* 同一网关的 Anthropic 线（claude-*），独立供应商 */ }
   },
   "modelSync": { /* 多 agent 模型选择，见上一节 */ },
   "removedProviders": { /* 已删除记录，防止复活 */ },
@@ -283,14 +287,6 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
   "apiKey": "sk-openai-key",
   "api": "openai-completions",
   "agents": {
-    "claude": {
-      "baseUrl": "https://api.tokenfree.shop/v1",        // Anthropic Messages 端点
-      "api": "anthropic-messages",                       // 缺省即此值
-      "apiKey": "sk-anthropic-key",                      // 这个 key 拉出 claude-* 模型
-      "models": [ { "id": "claude-opus-5-5", ... } ],    // 该连接自己的模型库
-      "env": { "ENABLE_TOOL_SEARCH": "true" },           // 原样写入 settings.json 的 env
-      "settings": { "effortLevel": "high" }              // 原样写入 settings.json 顶层
-    },
     "codex": {
       "baseUrl": "https://api.tokenfree.shop/v1",
       "api": "openai-responses",                          // Codex 第三方只接受 Responses
@@ -305,17 +301,26 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
 }
 ```
 
+**什么时候拆成两个供应商**：`agents.<agent>` 适合「同一协议线内」的差异（换 key、换端点、
+各自模型库）。如果一个网关的两条线协议完全不同（比如 Anthropic Messages 与 OpenAI
+Responses/Completions 各发一把 key、各有一套模型库），建议拆成两个独立供应商条目
+（如 `tokenfree` 与 `tokenfree-claude`），各自 `targets` 限定平台，模型管理与检测更清晰。
+Anthropic 线的 `baseUrl` 填不带 `/v1` 的前缀——Claude Code 会自行追加 `/v1/messages`。
+
 | 字段 | 作用 |
 |------|------|
 | `baseUrl` / `apiKey` / `apiKeyEnv` / `api` | 覆盖该 Agent 的端点、密钥与协议 |
 | `models` | 该连接自己的模型库；**没有这一项就沿用默认连接的模型** |
 | `env` / `settings` | 仅 `claude`：原样写入 `~/.claude/settings.json` 的 env 与顶层字段 |
 
+首次在某个 Agent 连接上添加或编辑模型时，Hub 会把继承的模型库复制为该连接的独立模型库；后续修改只作用于该连接。
+
 **连接是否就绪**决定供应商能否进入某个平台的同步：
 
 | Agent | 要求 |
 |-------|------|
-| pi / dsh / mcode / zcode / omp / cc-switch | 有 OpenAI 兼容端点（默认或该 Agent 覆盖） |
+| pi / dsh / mcode / omp / cc-switch | 有 OpenAI 兼容端点（默认或该 Agent 覆盖） |
+| ZCode | 有 Chat Completions、Responses 或 Anthropic Messages 端点（默认或 `agents.zcode` 覆盖） |
 | Claude Code | 有 Anthropic Messages 端点（`agents.claude.baseUrl`，或旧 `anthropicBaseUrl`，或整个 provider 就是 `anthropic-messages`） |
 | Codex 第三方 | 端点的协议是 `openai-responses` |
 
@@ -339,7 +344,8 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 | `firework` | firework | volcano | 火山 | firework | —（没有 Claude 连接） | 不写入 |
 | `deepseek` | deepseek | deepseek | DeepSeek | deepseek | `agents.claude` → `/anthropic` | —（协议不是 responses） |
 | `openrouter` | openrouter | openrouter | OpenRouter | openrouter | `agents.claude` → `/api` + 模型库 | `agents.codex` → responses |
-| `tokenfree` | tokenfree（默认连接模型库） | tokenfree | — | tokenfree | `agents.claude` → `/v1/messages` + `env` / `settings` 透传 | `agents.codex` → `/v1/responses` + 另一个 key |
+| `tokenfree` | tokenfree（默认连接模型库） | tokenfree | — | tokenfree | —（Claude 线在独立供应商） | `agents.codex` → `/v1/responses` |
+| `tokenfree-claude` | — | — | — | — | 顶层 `anthropic-messages` → `/v1/messages` + `env` / `settings` 透传 | — |
 
 > 命名差异是各 agent 的历史习惯，同步引擎会自动映射。
 >
@@ -399,6 +405,10 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 ## dsh 桌面版
 
 - 与 dsh CLI 共用 `~/.dsh`。桌面 profile 在 `profiles/desktop/`。
+- dsh 会把供应商的 `models: []` 回退成内置全部模型。Hub 同步时只启用该 dsh
+  连接模型库非空的供应商，并从三层配置中移除没有选模型的 Hub 路由，保留已存凭据。
+  因此 OpenRouter 没有选模型时不会自动展开整个目录；添加模型后再同步即可恢复。
+  显式的 `agents.dsh.models: []` 同样表示该连接未选模型，不继承默认连接的模型库。
 - 同步写入：`settings.yaml`（Models 页用户层）、`settings.yaml.imported`、`cordis.patch.yml`、`.credentials.yaml`。
 - `cordis.patch.yml` 里 `llm-pi-ai.providers` 已有该段才会更新；hub 不会凭空新建这一段。
 - 配了「多 agent 模型」后，还会更新 `agent-default-model`（主 agent 模型）与
@@ -423,12 +433,12 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 ## 约定
 
 - **Codex 的 ChatGPT 登录态**完全不在本工具管理范围：`auth.json` 不读不写，恢复官方模式会同时恢复 provider、model、effort。
-- pi / dsh / claude / codex 是主要目标；mcode / zcode / omp / cc-switch 适配器保留，不主动写入。
+- pi / dsh / ZCode / claude / codex 是主要目标；mcode / omp / cc-switch 适配器保留，不主动写入。
 - **qwen-token-plan-cn** 已过期并删除；qwen 系列模型仍可通过 firework（火山）使用。
 - 每次写入前会把原文件备份到 `backups/`，可随时回滚。
 - 修改 `providers.json` 的连接或模型后，运行 `hub push` 即可全局生效。
 - 需要自动同步时运行 `hub watch`，它会轮询各 agent 配置哈希，变更后重新对齐。
-- 多 agent 模型：`hub model <provider> <model>` 改配置（`--target pi/dsh/claude/codex`），`hub push` 落到客户端。
+- 多 agent 模型：`hub model <provider> <model>` 改配置（`--target pi/dsh/zcode/claude/codex`），`hub push` 落到客户端。
 - 旧版扁平字段（`anthropicBaseUrl` / `claudeModels` / `claudeEnv` / `claudeSettings` /
   `openaiApiKey` / `apiKeyEnv` / `codexWireApi` / `sync.targets.claude.activeProvider`）仍可读取，
   `hub migrate-agents` 会搬进 `agents.<agent>` 与 modelSync（可重复执行）。
@@ -478,7 +488,7 @@ $py = "$env:USERPROFILE\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\pytho
 
 - Web UI 的同步流程为「保存 Hub 选择 → 预览 → 应用」。预览只列目标、文件动作和警告，不回传配置正文或密钥。预览在内存中保留 15 分钟，重启服务后需要重新生成。
 - CLI 可先 `python hub.py preview codex`，确认后 `python hub.py push codex`。CLI push 会重新编译、校验并检查源文件；预览 ID 不跨 CLI 进程保存。
-- 只有 `enabled: true` 的目标参与同步；缺失的目标、缺失的 enabled、空的显式目标选择不会默认为全选。Claude 同步不会打开 cc-switch 数据库。示例关闭了 legacy mcode/zcode/omp/cc-switch。
+- 只有 `enabled: true` 的目标参与同步；缺失的目标、缺失的 enabled、空的显式目标选择不会默认为全选。Claude 同步不会打开 cc-switch 数据库。示例仍关闭 legacy mcode/omp/cc-switch；需要 ZCode 时启用 `sync.targets.zcode`，并在模型同步卡片中选择 ZCode。
 - 每次先在隔离临时目录编译全部选中目标；任何配置错误都会阻止整组原生文件写入。应用前核对源文件未变，再建立 `backups/transactions/<id>/manifest.json` 和逐文件原始备份，原子替换文件。可捕获的中途写入错误会回滚已经写入的文件；回滚本身失败会报出事务和未恢复文件。
 - Web UI 可恢复最近一次事务；CLI 用 `python hub.py restore-transaction <id>`。恢复也会建立反向事务。应用后被外部修改的文件不会被强行恢复，请先人工核对。
 - **不是跨进程数据库事务**：原生客户端可能在多文件替换之间读到中间状态；建议关闭相关客户端再应用。进程被强杀或断电后，`committing`/`prepared` 清单、`.write-lock` 和备份会保留，需要人工核对并恢复；不要直接删除仍在运行的进程的锁。
