@@ -258,6 +258,13 @@ ZCODE_API_REVERSE = {
     "openai-responses": "openai-responses",
     "anthropic-messages": "anthropic-messages",
 }
+KNOWN_API_TYPES = ("openai-completions", "openai-chat-completions",
+                   "openai-responses", "anthropic-messages")
+
+
+def _import_api(value: Any) -> str:
+    """客户端原生配置里的协议字段归一化到 Hub 词表；不认识的按 OpenAI 兼容处理。"""
+    return value if isinstance(value, str) and value in KNOWN_API_TYPES else "openai-completions"
 
 
 def canonical_target(target: str) -> str:
@@ -1877,40 +1884,89 @@ class Hub:
         if next_state != saved:
             save_json(state_path, next_state)
 
-    def zcode_import_candidates(self) -> list[dict]:
-        """读取 ~/.zcode/v2/provider_config.json 里 Hub 尚未管理的个人供应商。
+    # ---- 反向同步：从各客户端原生配置读取供应商（导入候选） ----
+    IMPORT_TARGETS = ("zcode", "pi", "dsh", "codex", "claude")
 
-        反向同步的读取侧：ZCode 的 provider 目录往往是用户最先配好的地方，
-        这里把它还原成 Hub 供应商形状（端点 / 密钥 / 协议 / 模型库），导入后
-        即可同步给 pi / dsh / Claude Code 等其它平台。只认个人目录里的
-        api-key 条目；OAuth/订阅登录与内置条目不属于 Hub 的密钥模型，跳过。
+    def _import_index(self) -> tuple[set[str], set[str], set[tuple[str, str]]]:
+        """Hub 已管理供应商的索引：ID、名称（含各客户端历史别名）、(端点, 密钥) 对。
+
+        读取侧用它判断「这条原生配置是否已被 Hub 管理」：任一维度命中即跳过，
+        避免把 Hub 自己写进客户端的供应商再导回来。
+        """
+        pids: set[str] = set()
+        names: set[str] = set()
+        pairs: set[tuple[str, str]] = set()
+        legacy = {"firework": "火山", "openrouter": "OpenRouter", "deepseek": "DeepSeek", "stepfun": "StepFun"}
+        for pid, p in self.providers.items():
+            pids.add(pid)
+            names.add(pid.casefold())
+            for label in (p.get("displayName"), p.get("name")):
+                if isinstance(label, str) and label.strip():
+                    names.add(label.casefold())
+            alias = legacy.get(pid)
+            if alias:
+                names.add(alias.casefold())
+            for target in AGENT_CONNECTION_TARGETS:
+                conn = agent_connection(p, target)
+                if conn["baseUrl"].strip() and conn["apiKey"].strip():
+                    pairs.add((conn["baseUrl"].rstrip("/").casefold(), conn["apiKey"]))
+        return pids, names, pairs
+
+    def import_candidates(self, target: str) -> list[dict]:
+        """读取某个客户端原生配置里 Hub 尚未管理的供应商，作为导入候选。
+
+        读取器只负责「把原生形状还原成端点/密钥/协议/模型库」；是否已管理、
+        ID 去重由这里统一判定。导入后走正常同步即可写到其它平台。
+        """
+        readers = {
+            "zcode": self._import_candidates_zcode,
+            "pi": self._import_candidates_pi,
+            "dsh": self._import_candidates_dsh,
+            "codex": self._import_candidates_codex,
+            "claude": self._import_candidates_claude,
+        }
+        reader = readers.get(target)
+        if reader is None:
+            raise ValueError(f"不支持从 {target} 读取供应商；可选：{'、'.join(self.IMPORT_TARGETS)}")
+        pids, names, pairs = self._import_index()
+        candidates: list[dict] = []
+        for item in reader():
+            base = str(item.get("baseUrl") or "").strip()
+            key = str(item.get("apiKey") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if not base or not name:
+                continue
+            if name.casefold() in names or item.get("id") in pids:
+                continue
+            if key and (base.rstrip("/").casefold(), key) in pairs:
+                continue
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or f"{target}-provider"
+            pid, n = slug, 2
+            while pid in pids:
+                pid, n = f"{slug}-{n}", n + 1
+            pids.add(pid)
+            item["id"] = pid
+            item["modelCount"] = len(item.get("models") or [])
+            candidates.append(item)
+        return candidates
+
+    def _import_candidates_zcode(self) -> list[dict]:
+        """~/.zcode/v2/provider_config.json 的个人供应商目录（api-key 条目）。
+
+        OAuth/订阅登录与内置条目不属于 Hub 的密钥模型，跳过。
         """
         path = HOME / ".zcode" / "v2" / "provider_config.json"
         data = load_json(path) or {}
         config = data.get("config") or {}
         rules = (config.get("providerConfigRules") or {}).get("providerRules") or []
         model_rules = (config.get("modelConfigRules") or {}).get("providerModelRules") or []
-        name_map = {"firework": "火山", "openrouter": "OpenRouter", "deepseek": "DeepSeek", "stepfun": "StepFun"}
-        known_ids: set[str] = set()
-        known_names: set[str] = set()
-        for pid, p in self.providers.items():
-            known_ids.add(pid)
-            known_names.add(pid.casefold())
-            for label in (p.get("displayName"), p.get("name")):
-                if isinstance(label, str) and label.strip():
-                    known_names.add(label.casefold())
-            legacy = name_map.get(pid)
-            if legacy:
-                known_names.add(legacy.casefold())
-        candidates: list[dict] = []
+        out: list[dict] = []
         for rule in rules:
             if not isinstance(rule, dict):
                 continue
-            zid = rule.get("providerId")
-            name = rule.get("providerName") or zid
+            name = rule.get("providerName") or rule.get("providerId")
             cfg = rule.get("config") or {}
-            group = cfg.get("group") or "standard-personal"
-            if group != "standard-personal":
+            if (cfg.get("group") or "standard-personal") != "standard-personal":
                 continue
             access = cfg.get("access") or {}
             if access.get("type") != "api-key":
@@ -1918,12 +1974,10 @@ class Hub:
             api = cfg.get("api") or {}
             wire = ZCODE_API_REVERSE.get(api.get("type"))
             base_url = api.get("baseUrl") if isinstance(api.get("baseUrl"), str) else ""
-            if not wire or not base_url.strip():
-                continue
-            if zid in known_ids or (isinstance(name, str) and name.casefold() in known_names):
+            if not wire or not base_url.strip() or not isinstance(name, str):
                 continue
             rule_models = [r for r in model_rules
-                           if isinstance(r, dict) and r.get("providerId") == zid]
+                           if isinstance(r, dict) and r.get("providerId") == rule.get("providerId")]
             disabled = {r.get("modelId") for r in rule_models
                         if (r.get("config") or {}).get("enabled") is False}
             properties = {r.get("modelId"): (r.get("config") or {}).get("properties") or {}
@@ -1940,15 +1994,113 @@ class Hub:
                     "input": ["text", "image"] if (props.get("inputFormat") or {}).get("supportsImage") else ["text"],
                     "reasoning": True,
                 })
-            slug = re.sub(r"[^a-z0-9]+", "-", str(name or zid or "zcode").lower()).strip("-") or "zcode-provider"
-            pid, n = slug, 2
-            while pid in known_ids:
-                pid, n = f"{slug}-{n}", n + 1
-            known_ids.add(pid)
-            candidates.append({"id": pid, "name": str(name or zid), "baseUrl": base_url,
-                               "apiKey": access.get("apiKey") if isinstance(access.get("apiKey"), str) else "",
-                               "api": wire, "modelCount": len(models), "models": models})
-        return candidates
+            out.append({"name": name, "baseUrl": base_url,
+                        "apiKey": access.get("apiKey") if isinstance(access.get("apiKey"), str) else "",
+                        "api": wire, "models": models})
+        return out
+
+    def _import_candidates_pi(self) -> list[dict]:
+        """~/.pi/agent/models.json 里用户自配的供应商（Hub 写入的会按索引跳过）。"""
+        data = load_json(HOME / ".pi" / "agent" / "models.json") or {}
+        out: list[dict] = []
+        for pid, entry in (data.get("providers") or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            base = entry.get("baseUrl")
+            key = entry.get("apiKey")
+            if not isinstance(base, str) or not base.strip() or not isinstance(key, str) or not key.strip():
+                continue
+            models = []
+            for m in entry.get("models") or []:
+                if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m["id"].strip():
+                    continue
+                inputs = [v for v in (m.get("input") or ["text"]) if isinstance(v, str)] or ["text"]
+                models.append({"id": m["id"], "name": m.get("name") or m["id"],
+                               "contextWindow": m.get("contextWindow", 128000),
+                               "maxTokens": m.get("maxTokens", 32768),
+                               "input": inputs, "reasoning": bool(m.get("reasoning", True))})
+            out.append({"name": entry.get("name") or pid, "baseUrl": base, "apiKey": key,
+                        "api": _import_api(entry.get("api")), "models": models})
+        return out
+
+    def _import_candidates_dsh(self) -> list[dict]:
+        """dsh 三层配置的 llm-pi-ai.providers；密钥经 apiKeyEnv 从 .credentials.yaml 解析。"""
+        routes: dict[str, dict] = {}
+        for name in ("settings.yaml.imported", "settings.yaml"):
+            path = HOME / ".dsh" / name
+            if not path.exists():
+                continue
+            data = parse_yaml(path.read_text(encoding="utf-8")) or {}
+            for rid, route in ((data.get("llm-pi-ai") or {}).get("providers") or {}).items():
+                if isinstance(route, dict):
+                    routes[rid] = route
+        refs: dict = {}
+        cred_path = HOME / ".dsh" / ".credentials.yaml"
+        if cred_path.exists():
+            refs = (parse_yaml(cred_path.read_text(encoding="utf-8")) or {}).get("refs") or {}
+        out: list[dict] = []
+        for rid, route in routes.items():
+            base = route.get("baseURL") or route.get("baseUrl")
+            if not isinstance(base, str) or not base.strip():
+                continue
+            env = route.get("apiKeyEnv")
+            key = refs.get(env, "") if isinstance(env, str) else ""
+            models = []
+            for m in route.get("models") or []:
+                if not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m["id"].strip():
+                    continue
+                inputs = [v for v in (m.get("input") or ["text"]) if isinstance(v, str)] or ["text"]
+                models.append({"id": m["id"], "name": m.get("name") or m["id"],
+                               "contextWindow": m.get("contextWindow", 128000),
+                               "maxTokens": m.get("maxTokens", 32768),
+                               "input": inputs, "reasoning": True})
+            out.append({"name": route.get("displayName") or rid, "baseUrl": base,
+                        "apiKey": key if isinstance(key, str) else "",
+                        "apiKeyEnv": env if not key and isinstance(env, str) and env.strip() else "",
+                        "api": _import_api(route.get("api")), "models": models})
+        return out
+
+    def _import_candidates_codex(self) -> list[dict]:
+        """~/.codex/config.toml 的 [model_providers.*] 自定义网关（不含 agent_hub 与内置）。"""
+        import tomllib
+        path = HOME / ".codex" / "config.toml"
+        if not path.exists():
+            return []
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError:
+            return []
+        out: list[dict] = []
+        for name, block in (data.get("model_providers") or {}).items():
+            if name in ("agent_hub", "openai") or not isinstance(block, dict):
+                continue
+            base = block.get("base_url")
+            if not isinstance(base, str) or not base.strip():
+                continue
+            api = "openai-responses" if block.get("wire_api") == "responses" else "openai-completions"
+            env_key = block.get("env_key")
+            literal = block.get("experimental_bearer_token")
+            key, env = "", ""
+            if isinstance(env_key, str) and env_key.strip():
+                env = env_key.strip()
+                key = os.environ.get(env, "")
+            elif isinstance(literal, str):
+                key = literal.strip()
+            out.append({"name": block.get("name") or name, "baseUrl": base, "apiKey": key,
+                        "apiKeyEnv": env if not key else "", "api": api, "models": []})
+        return out
+
+    def _import_candidates_claude(self) -> list[dict]:
+        """Claude Code 当前激活的 ANTHROPIC_* 线路（官方线路没有可导入的网关信息）。"""
+        env = (load_json(HOME / ".claude" / "settings.json") or {}).get("env") or {}
+        base = env.get("ANTHROPIC_BASE_URL")
+        token = env.get("ANTHROPIC_AUTH_TOKEN")
+        if (not isinstance(base, str) or not base.strip()
+                or not isinstance(token, str) or not token.strip()
+                or base.rstrip("/").casefold() == "https://api.anthropic.com"):
+            return []
+        return [{"name": "Claude Code 当前线路", "baseUrl": base, "apiKey": token,
+                 "api": "anthropic-messages", "models": []}]
 
     # ---- dsh ----
     def push_dsh(self) -> None:

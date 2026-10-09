@@ -423,14 +423,22 @@ ZCode 的差异点与理由：
   或在官方模式下直接接受用户的选择作为新基线。
 - 损坏的托管记录（版本不符、快照形状不对）会拒绝同步并指向备份，不做猜测性修复。
 
-### 从 ZCode 导入供应商（反向同步）
+### 从客户端导入供应商（反向同步）
 
-ZCode 的个人供应商目录往往是新网关最先配好的地方。「供应商」页的**从 ZCode 导入**会扫描
-`~/.zcode/v2/provider_config.json`，把 Hub 尚未管理的 api-key 供应商（端点、密钥、协议、
-模型库及其上下文/多模态属性）还原成 Hub 供应商形状，勾选导入后即可在「平台同步」里推送给
-pi / dsh / Claude Code 等其它平台。只读个人目录里的 api-key 条目；OAuth/订阅登录、内置
-条目、已被 Hub 管理或同名的供应商不会出现。API：`GET /api/import/zcode` 扫描、
-`POST /api/import/zcode` 导入。
+任何一个平台里新配的供应商都能读回 Hub，再写到其它平台。「供应商」页的**从客户端导入**
+会扫描所选平台的原生配置，把 Hub 尚未管理的 api-key 供应商（端点、密钥、协议、模型库）
+还原成 Hub 供应商形状，勾选导入后即可在「平台同步」里推送给其它所有平台：
+
+| 平台 | 读取位置 | 说明 |
+|------|----------|------|
+| ZCode | `~/.zcode/v2/provider_config.json` | 个人供应商目录；模型库含上下文/多模态属性 |
+| pi | `~/.pi/agent/models.json` | 用户自配供应商 |
+| dsh | `settings.yaml(.imported)` 三层 | 密钥经 `apiKeyEnv` 从 `.credentials.yaml` 解析，解析不到则保留引用 |
+| Codex | `~/.codex/config.toml` 的 `[model_providers.*]` | 不含 Hub 自己的 `agent_hub` 块；`env_key` 可解析时取值，否则保留引用 |
+| Claude Code | `settings.json` 的 `ANTHROPIC_*` | 当前激活线路（官方线路除外） |
+
+已被 Hub 管理的条目（按 ID、名称、端点+密钥对判定）与 OAuth/订阅登录不会出现。
+API：`GET /api/import/<platform>` 扫描、`POST /api/import/<platform>` 导入。
 
 ## Claude Code
 

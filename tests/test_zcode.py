@@ -477,7 +477,7 @@ class ZCodeImportTests(unittest.TestCase):
         self.path.write_text(json.dumps(document), encoding="utf-8")
 
     def test_candidates_skip_managed_and_restore_hub_shape(self):
-        candidates = engine.Hub().zcode_import_candidates()
+        candidates = engine.Hub().import_candidates("zcode")
         # 火山 = Hub 已管理的 firework（按名称映射跳过）；同名/OAuth 条目跳过
         self.assertEqual([c["id"] for c in candidates], ["atria"])
         only = candidates[0]
@@ -489,12 +489,12 @@ class ZCodeImportTests(unittest.TestCase):
         self.assertEqual(only["models"][1]["input"], ["text", "image"])
 
     def test_scan_endpoint_lists_candidates(self):
-        result = server.api_import_zcode_scan()
+        result = server.api_import_scan("zcode")
         self.assertEqual([c["id"] for c in result["candidates"]], ["atria"])
 
     def test_import_then_sync_reaches_other_platforms(self):
-        items = engine.Hub().zcode_import_candidates()
-        result = server.api_import_zcode_apply({"items": items})
+        items = engine.Hub().import_candidates("zcode")
+        result = server.api_import_apply("zcode", {"items": items})
         self.assertEqual(result["imported"], ["atria"])
         provider = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))["providers"]["atria"]
         self.assertEqual(provider["baseUrl"], "https://api.atria.example/v1")
@@ -507,7 +507,7 @@ class ZCodeImportTests(unittest.TestCase):
 
     def test_import_rejects_invalid_or_duplicate_ids(self):
         with self.assertRaises(ValueError):
-            server.api_import_zcode_apply({"items": [{"id": "deepseek", "name": "dup"}]})
+            server.api_import_apply("zcode", {"items": [{"id": "deepseek", "name": "dup"}]})
 
 
 if __name__ == "__main__":

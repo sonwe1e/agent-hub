@@ -85,7 +85,7 @@ const CLAUDE_TIERS = [["opus", "opus 档位"], ["sonnet", "sonnet 档位"], ["ha
 const state = {
   providers: {}, status: null, page: "models", busy: false, loaded: false,
   filters: { query: "", provider: "all", agent: "all", capability: "all" }, modelPage: 1, selection: new Set(),
-  providerQuery: "", targetDraft: {}, clientMode: { codex: "official", zcode: "official" }, clientOptIn: { codex: false, zcode: false }, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [], importCandidates: null,
+  providerQuery: "", targetDraft: {}, clientMode: { codex: "official", zcode: "official" }, clientOptIn: { codex: false, zcode: false }, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [], importCandidates: null, importTarget: "zcode",
   modelSync: null, modelSyncError: "", modelSyncLoading: false, modelSyncDraft: null, modelSyncDraftKey: "", modelSyncCustom: {}, modelSyncOpen: new Set(),
   discoverAgent: "",
 };
@@ -410,7 +410,7 @@ function renderSelection() {
 }
 
 function renderProviders() {
-  $("#content").innerHTML = heading(`<button data-action="import-zcode">${icon("download")}从 ZCode 导入</button><button class="primary" data-action="add-provider">${icon("plus")}添加供应商</button>`) + stats() + `<div class="filter-bar" style="padding:0;border:0"><div class="search-box">${icon("search")}<input type="search" id="provider-search" placeholder="搜索供应商名称或 ID…" aria-label="搜索供应商" value="${esc(state.providerQuery)}" /></div><span class="filter-summary">密钥不在列表中展示</span></div><div class="provider-grid" id="provider-cards"></div><div class="hint-line">${icon("info")}模型检测只查询远端列表，不会删除或覆盖已配置的模型。</div>`;
+  $("#content").innerHTML = heading(`<button data-action="import-client">${icon("download")}从客户端导入</button><button class="primary" data-action="add-provider">${icon("plus")}添加供应商</button>`) + stats() + `<div class="filter-bar" style="padding:0;border:0"><div class="search-box">${icon("search")}<input type="search" id="provider-search" placeholder="搜索供应商名称或 ID…" aria-label="搜索供应商" value="${esc(state.providerQuery)}" /></div><span class="filter-summary">密钥不在列表中展示</span></div><div class="provider-grid" id="provider-cards"></div><div class="hint-line">${icon("info")}模型检测只查询远端列表，不会删除或覆盖已配置的模型。</div>`;
   renderProviderCards();
 }
 function renderProviderCards() {
@@ -845,37 +845,40 @@ function updateDiscoverSelection() {
   $("#discover-all").disabled = !visible.length;
 }
 
-// ---- 从 ZCode 导入供应商（反向同步的读取侧）----
-function importListHtml(candidates) {
+// ---- 从客户端导入供应商（反向同步的读取侧：任一平台的新供应商都可读取并写入其它平台）----
+const IMPORT_CLIENTS = [["zcode", "ZCode"], ["pi", "pi"], ["dsh", "dsh"], ["codex", "Codex"], ["claude", "Claude Code"]];
+function importListHtml(candidates, client) {
   if (!candidates.length) {
-    return `<div class="notice">${icon("info")}ZCode 个人供应商目录里没有 Hub 尚未管理的 api-key 供应商。先在 ZCode 里添加后，再回来扫描。</div>`;
+    return `<div class="notice">${icon("info")}${client} 的原生配置里没有 Hub 尚未管理的供应商。先在该客户端里添加（或确认未被 Hub 覆盖）后，再回来扫描。</div>`;
   }
-  return `<p class="form-intro">扫描 ~/.zcode/v2/provider_config.json 的个人供应商目录；勾选后写入 Hub，随后即可在「平台同步」里推送给 pi / dsh / Claude Code 等其它平台。OAuth/订阅登录与内置条目不会出现在这里。</p>
-  <div class="discover-list">${candidates.map((c, index) => `<label class="discover-row"><input class="import-check" type="checkbox" data-index="${index}" checked /><div><div><strong>${esc(c.name)}</strong> <span class="tag">${esc(c.api)}</span></div><div class="mono" title="${esc(c.baseUrl)}">${esc(c.baseUrl)}</div></div><span class="tag purple">${c.modelCount} 个模型</span></label>`).join("")}</div>`;
+  return `<p class="form-intro">来自 ${esc(client)} 的原生配置；勾选后写入 Hub，随后即可在「平台同步」里推送给其它所有平台。OAuth/订阅登录与 Hub 已管理的条目不会出现在这里。</p>
+  <div class="discover-list">${candidates.map((c, index) => `<label class="discover-row"><input class="import-check" type="checkbox" data-index="${index}" checked /><div><div><strong>${esc(c.name)}</strong> <span class="tag">${esc(c.api)}</span>${c.apiKeyEnv ? `<span class="tag" title="密钥经环境变量 ${esc(c.apiKeyEnv)} 引用">env</span>` : ""}</div><div class="mono" title="${esc(c.baseUrl)}">${esc(c.baseUrl)}</div></div><span class="tag purple">${c.modelCount} 个模型</span></label>`).join("")}</div>`;
 }
 function updateImportSelection() {
   const checked = $$(".import-check:checked").length;
-  const button = $('#import-footer [data-action="import-zcode-apply"]');
+  const button = $('#import-footer [data-action="import-apply"]');
   if (button) { button.disabled = !checked; button.innerHTML = `${icon("download")}导入 ${checked} 个供应商`; }
 }
-async function openImportDialog() {
-  await busy("正在扫描 ZCode 供应商…", async () => {
-    const result = await api("GET", "/api/import/zcode");
+async function scanImportClient(target) {
+  state.importTarget = target;
+  await busy("正在扫描供应商…", async () => {
+    const result = await api("GET", `/api/import/${encodeURIComponent(target)}`);
     state.importCandidates = result.candidates || [];
   });
-  $("#import-body").innerHTML = importListHtml(state.importCandidates);
+  const client = (IMPORT_CLIENTS.find(([name]) => name === target) || ["", target])[1];
+  $("#import-body").innerHTML = `<label class="field full" style="margin-bottom:12px"><span>读取哪个平台的原生配置</span><select id="import-client" aria-label="选择平台">${IMPORT_CLIENTS.map(([name, label]) => `<option value="${esc(name)}" ${name === target ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label>` + importListHtml(state.importCandidates, client);
   $("#import-footer").innerHTML = state.importCandidates.length
-    ? `<button type="button" data-action="close-import">取消</button><button type="button" class="primary" data-action="import-zcode-apply" data-write>${icon("download")}导入 ${state.importCandidates.length} 个供应商</button>`
+    ? `<button type="button" data-action="close-import">取消</button><button type="button" class="primary" data-action="import-apply" data-write>${icon("download")}导入 ${state.importCandidates.length} 个供应商</button>`
     : `<button type="button" data-action="close-import">关闭</button>`;
-  $("#import-dialog").showModal();
   updateImportSelection();
 }
-async function applyImportZcode() {
+async function applyImport() {
   const indexes = $$(".import-check:checked").map(el => Number(el.dataset.index));
   const items = indexes.map(i => state.importCandidates[i]).filter(Boolean);
-  if (!items.length) return;
+  if (!items.length || !state.importTarget) return;
+  const target = state.importTarget;
   await busy("正在导入供应商…", async () => {
-    await api("POST", "/api/import/zcode", { items });
+    await api("POST", `/api/import/${encodeURIComponent(target)}`, { items });
   });
   $("#import-dialog").close();
   state.importCandidates = null;
@@ -1028,8 +1031,8 @@ document.addEventListener("click", async event => {
   const { action, pid, mid } = button.dataset;
   try {
     if (action === "add-provider") openProvider();
-    else if (action === "import-zcode") await openImportDialog();
-    else if (action === "import-zcode-apply") await applyImportZcode();
+    else if (action === "import-client") await scanImportClient(state.importTarget || "zcode");
+    else if (action === "import-apply") await applyImport();
     else if (action === "close-import") $("#import-dialog").close();
     else if (action === "edit-provider") openProvider(pid);
     else if (action === "add-model") openModel();
@@ -1141,6 +1144,7 @@ document.addEventListener("change", event => {
   if (el.id === "discover-agent") { state.discoverAgent = el.value; discover(state.editor?.pid); }
   if (el.classList.contains("discover-check")) updateDiscoverSelection();
   if (el.classList.contains("import-check")) updateImportSelection();
+  if (el.id === "import-client" && el.value !== state.importTarget) { scanImportClient(el.value).catch(e => toast(e.message, "error")); }
   if (el.id === "discover-all") { $$(".discover-row:not([hidden]) .discover-check:not(:disabled)").forEach(c => { c.checked = el.checked; }); updateDiscoverSelection(); }
   if (el.dataset.msProvider !== undefined || el.dataset.msSelect !== undefined || el.dataset.msEffort !== undefined) {
     const { scope, target, tier = "" } = el.dataset;
