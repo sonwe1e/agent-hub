@@ -70,6 +70,37 @@ class DshScopeTests(unittest.TestCase):
         self.assertIn('MYOPENROUTER_API_KEY: stored-openrouter-key',
                       self.credentials.read_text(encoding='utf-8'))
 
+    def test_deleted_provider_route_is_removed_from_every_layer(self):
+        # 真实删除 = providers 里移除 + removedProviders 留档；三层配置里的
+        # 残留路由（含 baseURL / apiKeyEnv 引用）必须在下次同步时清掉。
+        del self.cfg['providers']['firework']
+        self.cfg.setdefault('removedProviders', {})['firework'] = {
+            'reason': 'manual remove', 'removedAt': '2026-10-09'}
+        stale = {'firework': {'apiKeyEnv': 'FIREWORK_API_KEY',
+                              'baseURL': 'https://old.example/v1',
+                              'models': [{'id': 'glm-x'}]}}
+        for name in ('settings.yaml', 'settings.yaml.imported'):
+            data = engine.parse_yaml((self.dsh / name).read_text(encoding='utf-8'))
+            data['llm-pi-ai']['providers'].update(copy.deepcopy(stale))
+            (self.dsh / name).write_text(engine.dump_yaml(data) + '\n', encoding='utf-8')
+        items = engine.parse_yaml(self.patch.read_text(encoding='utf-8'))
+        next(b for b in items if b['id'] == 'llm-pi-ai')['config']['providers'].update(
+            copy.deepcopy(stale))
+        self.patch.write_text(engine.dump_yaml(items) + '\n', encoding='utf-8')
+        self.credentials.write_text(
+            'version: 1\nrefs:\n  KEEP_ME: keep-value\n'
+            '  FIREWORK_API_KEY: old-firework-key\n', encoding='utf-8')
+
+        self.save()
+        engine.Hub().push_dsh()
+        for layer in self.provider_layers():
+            self.assertNotIn('firework', layer)
+            self.assertIn('deepseek', layer)
+            self.assertEqual(layer['local'], {'models': [{'id': 'manual'}]})
+        # 已删供应商的已存凭据按 dsh 约定保留：不主动删除用户的密钥条目
+        self.assertIn('FIREWORK_API_KEY: old-firework-key',
+                      self.credentials.read_text(encoding='utf-8'))
+
     def test_explicit_empty_dsh_override_does_not_inherit_default_library(self):
         self.cfg['providers']['openrouter']['agents']['dsh'] = {'models': []}
         self.save()

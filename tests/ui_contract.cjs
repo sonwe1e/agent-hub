@@ -50,6 +50,13 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.match(html, /ZCode/);
     assert.match(run(`AGENT_OVERRIDES.map(x=>x[0]).join(',')`), /zcode/);
   });
+  await test('ZCode import list renders candidates and empty state', () => {
+    const html = run(`importListHtml([{id:'atria',name:'Atria',baseUrl:'https://api.atria.example/v1',api:'openai-completions',modelCount:2,models:[]}])`);
+    assert.match(html, /import-check/);
+    assert.match(html, /Atria/);
+    assert.match(html, /2 个模型/);
+    assert.match(run(`importListHtml([])`), /没有 Hub 尚未管理/);
+  });
   await test('ZCode official mode keeps catalog but explains no default takeover', () => {
     const html = run(`clientRow('zcode','ZCode')`);
     assert.match(html, /id="zcode-mode"/);

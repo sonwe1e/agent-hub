@@ -45,6 +45,11 @@
     <div class="dialog-body"><div class="confirm-symbol" id="confirm-symbol"></div><h2 id="confirm-title"></h2><p id="confirm-description"></p><div id="confirm-list" class="confirm-list" hidden></div><div id="confirm-ack" class="confirm-ack" hidden><label class="check-label"><input type="checkbox" id="confirm-ack-box" /><span id="confirm-ack-label"></span></label></div></div>
     <div class="dialog-footer"><button id="confirm-cancel">取消</button><button id="confirm-ok" class="danger-solid">确认删除</button></div>
   </dialog>
+  <dialog id="import-dialog" class="dialog" aria-labelledby="import-title">
+    <div class="dialog-header"><div><span class="eyebrow">反向同步</span><h2 id="import-title">从 ZCode 导入供应商</h2></div><button class="icon-button" data-action="close-import" aria-label="关闭弹窗"><span data-icon="x"></span></button></div>
+    <div class="dialog-body" id="import-body"></div>
+    <div class="dialog-footer" id="import-footer"></div>
+  </dialog>
   <div id="toasts" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
 </body>
 </html>

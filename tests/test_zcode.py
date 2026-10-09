@@ -439,5 +439,76 @@ class ZCodeModeTests(unittest.TestCase):
             engine.Hub().push_zcode()
 
 
+class ZCodeImportTests(unittest.TestCase):
+    """从 ZCode 个人供应商目录读取导入候选，并走 API 落进 Hub。"""
+
+    def setUp(self):
+        context = isolated()
+        self.home = context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+        self.path = self.home / ".zcode" / "v2" / "provider_config.json"
+        self.path.parent.mkdir(parents=True)
+        document = zcode_document()
+        rules = document["config"]["providerConfigRules"]["providerRules"]
+        rules.append({"providerId": "atria-id", "providerName": "Atria", "config": {
+            "group": "standard-personal",
+            "access": {"type": "api-key", "apiKey": "atria-key"},
+            "api": {"type": "openai-chat-completions", "baseUrl": "https://api.atria.example/v1"},
+            "personalModelIds": ["atria-1", "atria-img"],
+            "modelOrder": ["atria-1", "atria-img", "atria-off"],
+        }})
+        rules.append({"providerId": "name-clash", "providerName": "DeepSeek", "config": {
+            "group": "standard-personal",
+            "access": {"type": "api-key", "apiKey": "x"},
+            "api": {"type": "openai-responses", "baseUrl": "https://clash.example/v1"},
+        }})
+        rules.append({"providerId": "oauth-plan", "providerName": "Oauth Plan", "config": {
+            "group": "standard-personal",
+            "access": {"type": "oauth"},
+            "api": {"type": "openai-chat-completions", "baseUrl": "https://oauth.example/v1"},
+        }})
+        document["config"]["modelConfigRules"]["providerModelRules"].extend([
+            {"modelId": "atria-1", "providerId": "atria-id",
+             "config": {"properties": {"contextWindow": 200000}}},
+            {"modelId": "atria-img", "providerId": "atria-id",
+             "config": {"properties": {"contextWindow": 100000, "inputFormat": {"supportsImage": True}}}},
+            {"modelId": "atria-off", "providerId": "atria-id", "config": {"enabled": False}},
+        ])
+        self.path.write_text(json.dumps(document), encoding="utf-8")
+
+    def test_candidates_skip_managed_and_restore_hub_shape(self):
+        candidates = engine.Hub().zcode_import_candidates()
+        # 火山 = Hub 已管理的 firework（按名称映射跳过）；同名/OAuth 条目跳过
+        self.assertEqual([c["id"] for c in candidates], ["atria"])
+        only = candidates[0]
+        self.assertEqual((only["api"], only["baseUrl"], only["apiKey"]),
+                         ("openai-completions", "https://api.atria.example/v1", "atria-key"))
+        # 模型库按 modelOrder 还原；禁用模型跳过；上下文/多模态来自模型规则
+        self.assertEqual([m["id"] for m in only["models"]], ["atria-1", "atria-img"])
+        self.assertEqual(only["models"][0]["contextWindow"], 200000)
+        self.assertEqual(only["models"][1]["input"], ["text", "image"])
+
+    def test_scan_endpoint_lists_candidates(self):
+        result = server.api_import_zcode_scan()
+        self.assertEqual([c["id"] for c in result["candidates"]], ["atria"])
+
+    def test_import_then_sync_reaches_other_platforms(self):
+        items = engine.Hub().zcode_import_candidates()
+        result = server.api_import_zcode_apply({"items": items})
+        self.assertEqual(result["imported"], ["atria"])
+        provider = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))["providers"]["atria"]
+        self.assertEqual(provider["baseUrl"], "https://api.atria.example/v1")
+        self.assertEqual([m["id"] for m in provider["models"]], ["atria-1", "atria-img"])
+        # 导入后立即可同步给其它平台：pi 的模型库出现该供应商
+        engine.Hub().push_pi()
+        pi = json.loads((self.home / ".pi" / "agent" / "models.json").read_text(encoding="utf-8"))
+        self.assertEqual([m["id"] for m in pi["providers"]["atria"]["models"]],
+                         ["atria-1", "atria-img"])
+
+    def test_import_rejects_invalid_or_duplicate_ids(self):
+        with self.assertRaises(ValueError):
+            server.api_import_zcode_apply({"items": [{"id": "deepseek", "name": "dup"}]})
+
+
 if __name__ == "__main__":
     unittest.main()

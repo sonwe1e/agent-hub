@@ -252,6 +252,12 @@ ZCODE_API_TYPES = {
     "openai-responses": "openai-responses",
     "anthropic-messages": "anthropic-messages",
 }
+# 反向映射：从 ZCode 原生 api.type 还原 Hub 的协议词表（用于供应商导入）。
+ZCODE_API_REVERSE = {
+    "openai-chat-completions": "openai-completions",
+    "openai-responses": "openai-responses",
+    "anthropic-messages": "anthropic-messages",
+}
 
 
 def canonical_target(target: str) -> str:
@@ -1293,6 +1299,12 @@ class DshModelPlan:
             if provider_targets(p, "dsh") and agent_connection_ready(p, "dsh")
             and not agent_connection(p, "dsh")["models"]
         }
+        # 已删除供应商的残留路由同样要清理：否则删除 provider 后，旧路由
+        # （含 baseUrl 与 apiKeyEnv 引用）会一直留在 dsh 三层配置里。
+        self.removed_routes = {
+            rid for rid in (hub.cfg.get("removedProviders") or {})
+            if isinstance(rid, str)
+        }
         self.routes: dict[str, str] = {}
         for pid, p in self.providers.items():
             if not p.get("enabled", True) or pid in self.empty_routes:
@@ -1865,6 +1877,79 @@ class Hub:
         if next_state != saved:
             save_json(state_path, next_state)
 
+    def zcode_import_candidates(self) -> list[dict]:
+        """读取 ~/.zcode/v2/provider_config.json 里 Hub 尚未管理的个人供应商。
+
+        反向同步的读取侧：ZCode 的 provider 目录往往是用户最先配好的地方，
+        这里把它还原成 Hub 供应商形状（端点 / 密钥 / 协议 / 模型库），导入后
+        即可同步给 pi / dsh / Claude Code 等其它平台。只认个人目录里的
+        api-key 条目；OAuth/订阅登录与内置条目不属于 Hub 的密钥模型，跳过。
+        """
+        path = HOME / ".zcode" / "v2" / "provider_config.json"
+        data = load_json(path) or {}
+        config = data.get("config") or {}
+        rules = (config.get("providerConfigRules") or {}).get("providerRules") or []
+        model_rules = (config.get("modelConfigRules") or {}).get("providerModelRules") or []
+        name_map = {"firework": "火山", "openrouter": "OpenRouter", "deepseek": "DeepSeek", "stepfun": "StepFun"}
+        known_ids: set[str] = set()
+        known_names: set[str] = set()
+        for pid, p in self.providers.items():
+            known_ids.add(pid)
+            known_names.add(pid.casefold())
+            for label in (p.get("displayName"), p.get("name")):
+                if isinstance(label, str) and label.strip():
+                    known_names.add(label.casefold())
+            legacy = name_map.get(pid)
+            if legacy:
+                known_names.add(legacy.casefold())
+        candidates: list[dict] = []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            zid = rule.get("providerId")
+            name = rule.get("providerName") or zid
+            cfg = rule.get("config") or {}
+            group = cfg.get("group") or "standard-personal"
+            if group != "standard-personal":
+                continue
+            access = cfg.get("access") or {}
+            if access.get("type") != "api-key":
+                continue
+            api = cfg.get("api") or {}
+            wire = ZCODE_API_REVERSE.get(api.get("type"))
+            base_url = api.get("baseUrl") if isinstance(api.get("baseUrl"), str) else ""
+            if not wire or not base_url.strip():
+                continue
+            if zid in known_ids or (isinstance(name, str) and name.casefold() in known_names):
+                continue
+            rule_models = [r for r in model_rules
+                           if isinstance(r, dict) and r.get("providerId") == zid]
+            disabled = {r.get("modelId") for r in rule_models
+                        if (r.get("config") or {}).get("enabled") is False}
+            properties = {r.get("modelId"): (r.get("config") or {}).get("properties") or {}
+                          for r in rule_models}
+            models = []
+            for mid in (cfg.get("modelOrder") or cfg.get("personalModelIds") or []):
+                if not isinstance(mid, str) or not mid.strip() or mid in disabled:
+                    continue
+                props = properties.get(mid) or {}
+                models.append({
+                    "id": mid, "name": mid,
+                    "contextWindow": props.get("contextWindow", 128000),
+                    "maxTokens": 32768,
+                    "input": ["text", "image"] if (props.get("inputFormat") or {}).get("supportsImage") else ["text"],
+                    "reasoning": True,
+                })
+            slug = re.sub(r"[^a-z0-9]+", "-", str(name or zid or "zcode").lower()).strip("-") or "zcode-provider"
+            pid, n = slug, 2
+            while pid in known_ids:
+                pid, n = f"{slug}-{n}", n + 1
+            known_ids.add(pid)
+            candidates.append({"id": pid, "name": str(name or zid), "baseUrl": base_url,
+                               "apiKey": access.get("apiKey") if isinstance(access.get("apiKey"), str) else "",
+                               "api": wire, "modelCount": len(models), "models": models})
+        return candidates
+
     # ---- dsh ----
     def push_dsh(self) -> None:
         plan = DshModelPlan(self)
@@ -1895,7 +1980,7 @@ class Hub:
             data = parse_yaml(imported.read_text(encoding="utf-8")) or {}
             llm = data.setdefault("llm-pi-ai", {}).setdefault("providers", {})
             for rid in list(llm.keys()):
-                if "qwen-token" in rid or rid in plan.empty_routes:
+                if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
                     llm.pop(rid)
             llm.update(copy.deepcopy(blocks))
             data["llm-pi-ai"]["providers"] = llm
@@ -1915,7 +2000,7 @@ class Hub:
                         cfg = item.setdefault("config", {})
                         providers = cfg.setdefault("providers", {})
                         for rid in list(providers.keys()):
-                            if "qwen-token" in rid or rid in plan.empty_routes:
+                            if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
                                 providers.pop(rid)
                         providers.update(copy.deepcopy(blocks))
                         cfg["providers"] = providers
@@ -1953,7 +2038,7 @@ class Hub:
             if isinstance(existing, dict):
                 merged_providers = (existing.get("llm-pi-ai") or {}).get("providers") or {}
                 for rid in list(merged_providers.keys()):
-                    if "qwen-token" in rid or rid in plan.empty_routes:
+                    if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
                         merged_providers.pop(rid)
                 merged_providers.update(copy.deepcopy(blocks))
                 existing.setdefault("llm-pi-ai", {})["providers"] = merged_providers

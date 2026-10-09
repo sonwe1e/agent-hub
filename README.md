@@ -133,7 +133,7 @@ Codex 第三方线路管理 `model_provider`、`model`、可选的 `model_reason
   "default": { "provider": "tokenfree", "model": "gpt-6-astra" },
   "overrides": {
     "pi":  { "provider": "stepfun", "model": "step-5-preview" },   // 只改 pi
-    "dsh": { "provider": "firework", "model": "glm-5.3" },
+    "dsh": { "provider": "deepseek", "model": "deepseek-flash" },
     "zcode": { "provider": "openrouter", "model": "anthropic/stealth/space-bunny-alpha[1m]" },
     "codex": { "provider": "tokenfree", "model": "gpt-6-astra", "reasoningEffort": "ultra" },
     "claude": {
@@ -171,7 +171,7 @@ Codex 线路用 `none / minimal / low / medium / high / xhigh / max / ultra`（`
 
 ```powershell
 G:\workspaces\agent-hub\hub.cmd model deepseek deepseek-flash                     # 全局主模型
-G:\workspaces\agent-hub\hub.cmd model firework glm-5.3 --target dsh              # 只改 dsh
+G:\workspaces\agent-hub\hub.cmd model stepfun step-5-preview --target dsh        # 只改 dsh
 G:\workspaces\agent-hub\hub.cmd model tokenfree gpt-6-astra --target codex --reasoning-effort ultra
 G:\workspaces\agent-hub\hub.cmd model tokenfree-claude claude-opus-5-5 --target claude  # 只改 Claude Code
 G:\workspaces\agent-hub\hub.cmd model openrouter anthropic/stealth/space-bunny-alpha[1m] --target zcode  # 只改 ZCode
@@ -264,7 +264,6 @@ GUI 快捷方式位于个人开始菜单目录的 `AI 与模型\Agent Hub.lnk`�
       "agentModel": "step-5-preview",     // 可选：该供应商给 agent 用的默认模型
       "models": [ { "id": "step-5-preview", "contextWindow": 1000000, ... } ]
     },
-    "firework":  { /* 火山网关，dsh 路由名 firework */ },
     "deepseek":  { /* DeepSeek 官方 */ },
     "openrouter":{ /* 聚合网关 */ },
     "tokenfree":        { /* 自定义网关 OpenAI 线（gpt-*），见下 */ },
@@ -342,7 +341,6 @@ web 界面在「供应商 → 配置」的「按 Agent 覆盖」一节里编辑�
 | hub key | pi | mcode | zcode | dsh / dsh 桌面版 | claude | codex |
 |---------|----|-------|-------|----------------|--------|-------|
 | `stepfun` | stepfun | stepfun | StepFun | stepfun | —（没有 Claude 连接） | 不写入 |
-| `firework` | firework | volcano | 火山 | firework | —（没有 Claude 连接） | 不写入 |
 | `deepseek` | deepseek | deepseek | DeepSeek | deepseek | `agents.claude` → `/anthropic` | —（协议不是 responses） |
 | `openrouter` | openrouter | openrouter | OpenRouter | openrouter | `agents.claude` → `/api` + 模型库 | `agents.codex` → responses |
 | `tokenfree` | tokenfree（默认连接模型库） | tokenfree | — | tokenfree | —（Claude 线在独立供应商） | `agents.codex` → `/v1/responses` |
@@ -425,6 +423,15 @@ ZCode 的差异点与理由：
   或在官方模式下直接接受用户的选择作为新基线。
 - 损坏的托管记录（版本不符、快照形状不对）会拒绝同步并指向备份，不做猜测性修复。
 
+### 从 ZCode 导入供应商（反向同步）
+
+ZCode 的个人供应商目录往往是新网关最先配好的地方。「供应商」页的**从 ZCode 导入**会扫描
+`~/.zcode/v2/provider_config.json`，把 Hub 尚未管理的 api-key 供应商（端点、密钥、协议、
+模型库及其上下文/多模态属性）还原成 Hub 供应商形状，勾选导入后即可在「平台同步」里推送给
+pi / dsh / Claude Code 等其它平台。只读个人目录里的 api-key 条目；OAuth/订阅登录、内置
+条目、已被 Hub 管理或同名的供应商不会出现。API：`GET /api/import/zcode` 扫描、
+`POST /api/import/zcode` 导入。
+
 ## Claude Code
 
 - 写入 `~/.claude/settings.json` 的 `env.ANTHROPIC_*`（只改 env，保留 hooks / permissions / statusLine）。
@@ -436,6 +443,8 @@ ZCode 的差异点与理由：
 ## dsh 桌面版
 
 - 与 dsh CLI 共用 `~/.dsh`。桌面 profile 在 `profiles/desktop/`。
+- 删除供应商（进入 `removedProviders`）后，下次 dsh 同步会从三层配置里移除该供应商的
+  残留路由；已存进 `.credentials.yaml` 的密钥条目按约定保留，需要彻底清除时手动删除。
 - dsh 会把供应商的 `models: []` 回退成内置全部模型。Hub 同步时只启用该 dsh
   连接模型库非空的供应商，并从三层配置中移除没有选模型的 Hub 路由，保留已存凭据。
   因此 OpenRouter 没有选模型时不会自动展开整个目录；添加模型后再同步即可恢复。
@@ -465,7 +474,7 @@ ZCode 的差异点与理由：
 
 - **Codex 的 ChatGPT 登录态**完全不在本工具管理范围：`auth.json` 不读不写，恢复官方模式会同时恢复 provider、model、effort。
 - pi / dsh / ZCode / claude / codex 是主要目标；mcode / omp / cc-switch 适配器保留，不主动写入。
-- **qwen-token-plan-cn** 已过期并删除；qwen 系列模型仍可通过 firework（火山）使用。
+- **qwen-token-plan-cn** 与 **firework** 已过期并删除（`removedProviders` 有记录，同步时会一并清理各客户端里的同名路由）。
 - 每次写入前会把原文件备份到 `backups/`，可随时回滚。
 - 修改 `providers.json` 的连接或模型后，运行 `hub push` 即可全局生效。
 - 需要自动同步时运行 `hub watch`，它会轮询各 agent 配置哈希，变更后重新对齐。

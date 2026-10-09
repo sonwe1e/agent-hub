@@ -770,6 +770,41 @@ def api_import_models(pid: str, body: dict) -> dict:
     return {"ok": True, "count": len(merged), "added": added}
 
 
+def api_import_zcode_scan() -> dict:
+    """列出 ~/.zcode/v2/provider_config.json 中可导入的供应商候选。"""
+    return {"candidates": hub().zcode_import_candidates()}
+
+
+def api_import_zcode_apply(body: dict) -> dict:
+    """把选中的 ZCode 供应商写入 providers.json；随后即可同步到其它平台。"""
+    items = body.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("请选择要导入的供应商")
+    imported: list[str] = []
+    with LOCK:
+        h = hub()
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("导入条目必须是对象")
+            pid = item.get("id")
+            if not isinstance(pid, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", pid):
+                raise ValueError("供应商 ID 只能包含字母、数字、_、-，且以字母或数字开头")
+            name = item.get("name") if isinstance(item.get("name"), str) and item.get("name").strip() else pid
+            provider = {"name": name, "displayName": name,
+                        "baseUrl": item.get("baseUrl") or "", "apiKey": item.get("apiKey") or "",
+                        "api": item.get("api") or "openai-completions", "enabled": True,
+                        "notes": "从 ZCode 个人供应商目录导入",
+                        "models": [_normalize_model(m) for m in item.get("models") or [] if isinstance(m, dict)]}
+            _validate_provider(provider)
+            if pid in h.providers:
+                raise ValueError(f"供应商已存在: {pid}")
+            h.providers[pid] = provider
+            h.cfg.get("removedProviders", {}).pop(pid, None)
+            imported.append(pid)
+        _save_config(h)
+    return {"ok": True, "imported": imported}
+
+
 # URL 编码必须在路由匹配之后解码：openrouter 等模型 ID 自带 /。
 ROUTES = [
     ("GET", r"^/api/providers$", lambda m, b, q=None: api_providers()),
@@ -791,6 +826,8 @@ ROUTES = [
     ("GET", r"^/api/providers/([^/]+)/discover$", lambda m, b, q=None: api_discover_models(unquote(m[1]), _query_agent(q))),
     ("POST", r"^/api/providers/([^/]+)/models/batch-delete$", lambda m, b, q=None: api_batch_delete_models(unquote(m[1]), b)),
     ("POST", r"^/api/providers/([^/]+)/models/import$", lambda m, b, q=None: api_import_models(unquote(m[1]), b)),
+    ("GET", r"^/api/import/zcode$", lambda m, b, q=None: api_import_zcode_scan()),
+    ("POST", r"^/api/import/zcode$", lambda m, b, q=None: api_import_zcode_apply(b)),
 ]
 
 

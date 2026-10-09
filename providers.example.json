@@ -25,63 +25,6 @@
         }
       ]
     },
-    "firework": {
-      "name": "Firework",
-      "displayName": "Firework (Volcano Gateway)",
-      "baseUrl": "https://example-gateway.apigateway-cn-beijing.volceapi.com/v1",
-      "apiKey": "<apiKey: 在此填入真实值>",
-      "api": "openai-completions",
-      "enabled": true,
-      "notes": "火山网关，dsh 中路由名为 firework。注意 /responses 端点对部分模型会 400，统一走 openai-completions。",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "maxTokensField": "max_tokens"
-      },
-      "models": [
-        {
-          "id": "glm-5.3",
-          "name": "GLM 5.3",
-          "contextWindow": 1000000,
-          "maxTokens": 131072,
-          "input": [
-            "text",
-            "image"
-          ],
-          "reasoning": true,
-          "cost": {
-            "input": 1.95,
-            "output": 1.95,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "compat": {
-            "supportsDeveloperRole": false,
-            "maxTokensField": "max_tokens"
-          }
-        },
-        {
-          "id": "glm-5.3-flash",
-          "name": "GLM 5.3 Flash",
-          "contextWindow": 1000000,
-          "maxTokens": 131072,
-          "input": [
-            "text",
-            "image"
-          ],
-          "reasoning": true,
-          "cost": {
-            "input": 0.22,
-            "output": 0.22,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "compat": {
-            "supportsDeveloperRole": false,
-            "maxTokensField": "max_tokens"
-          }
-        }
-      ]
-    },
     "deepseek": {
       "name": "DeepSeek",
       "displayName": "DeepSeek (API key)",
@@ -246,7 +189,9 @@
       "api": "anthropic-messages",
       "enabled": true,
       "notes": "自定义网关 Anthropic 线：claude-* 模型走 /v1/messages 给 Claude Code。baseUrl 不带 /v1（Claude Code 自行追加 /v1/messages）。顶层 api=anthropic-messages 即视为 Claude 连接；agents.claude 只承载 env/settings 透传。",
-      "targets": ["claude"],
+      "targets": [
+        "claude"
+      ],
       "models": [
         {
           "id": "claude-opus-5-5",
