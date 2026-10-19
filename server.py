@@ -12,6 +12,7 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import os
 from urllib.parse import parse_qs, unquote, urlparse
 
 # Hub 自身目录不再绑定用户主目录：按本文件位置定位，
@@ -23,6 +24,12 @@ from hub import (Hub, HUB_CONFIG, ModelLossError, ZCODE_API_TYPES, assert_expect
                  canonical_target, provider_targets,
                  configure_stdio, expand, file_hash, load_json, save_json, now_iso, target_files)  # noqa: E402
 from discover import discover_models  # noqa: E402
+from agent_inventory import Inventory, AGENTS  # noqa: E402
+from observation import Store  # noqa: E402
+from switch_plans import (DEFAULT_CLEAR, PLAN_TARGETS, PlanError,  # noqa: E402
+                          analyze_plan, compile_plan, connection_snapshot,
+                          diagnose_fallback, model_sync_patch_for_write,
+                          normalize_plan, reference_states)
 
 # hub.py 是多客户端模型对齐的唯一实现，这里只调用、不复制。
 # 用带保护的 import：hub.py 尚未落地这些接口时，受影响的两个端点给出明确错误，
@@ -35,15 +42,16 @@ except ImportError:  # pragma: no cover
     agent_model_options = agent_model_tiers_public = resolve_agent_model = None
 
 UI_DIR = HUB_DIR / "ui"
-LOCK = threading.Lock()
+LOCK = threading.RLock()
 SUPPORTED_TARGETS = {"pi", "mcode", "zcode", "dsh", "dsh-desktop", "claude", "cc-switch", "omp", "codex"}
 PREVIEW_TARGETS = SUPPORTED_TARGETS - {"cc-switch"}
+PREVIEW_TARGETS = set(AGENTS) | {"dsh-desktop"}
 PROTOCOLS = {"openai-completions", "openai-responses", "openai-chat-completions", "anthropic-messages"}
 # 每个 Agent 连接允许的协议：Claude Code 只走 Anthropic Messages，Codex 第三方只走 Responses。
 AGENT_APIS = {"claude": {"anthropic-messages"}, "codex": {"openai-responses"},
               "zcode": set(ZCODE_API_TYPES)}
 # providers.json 里可以按 Agent 覆盖连接的目标名（dsh-desktop 归一化成 dsh）。
-AGENT_CONNECTION_KEYS = ("pi", "dsh", "zcode", "claude", "codex")
+AGENT_CONNECTION_KEYS = ("claude", "codex", "pi", "dsh")
 
 # modelSync 可写的目标 -> 落盘时使用的键。dsh 桌面版与 CLI 共用同一份配置，
 # 写入时归一化成 dsh，避免出现两份互相漂移的覆盖。
@@ -57,10 +65,167 @@ MODELSYNC_READONLY_TARGETS: set[str] = set()
 # Claude Code 可单独指定的档位；fable 是历史档位，保留以兼容既有 claudeModels。
 CLAUDE_TIER_KEYS = ("model", "opus", "sonnet", "haiku", "subagent", "fable")
 MODELSYNC_ENTRY_KEYS = ("provider", "model", "reasoningEffort")
+# 切换方案的顶层键（providers.json 里与 modelSync 平级）。
+SWITCH_PLANS_KEY = "switchPlans"
 
 
 def hub() -> Hub:
     return Hub()
+
+
+INVENTORY = Inventory()
+_OBSERVATIONS = {}
+_GATEWAYS = {}
+_GATEWAY_PREVIEWS = {}
+_WORKBUDDY_LOGINS = {}
+
+
+def workbuddy_login():
+    from workbuddy import Accounts, Login
+    directory=HUB_CONFIG.parent/'data/gateway/config/agent-hub'
+    with LOCK:
+        return _WORKBUDDY_LOGINS.setdefault(str(directory),Login(Accounts(directory)))
+
+
+def api_workbuddy():
+    login=workbuddy_login()
+    p=hub().providers.get('workbuddy-ai') or {}
+    return {**login.accounts.status(),'login':login.status(),
+            'connected':p.get('kind')=='workbuddy-ai' and p.get('enabled',True),
+            'models':len(p.get('models') or [])}
+
+
+def api_workbuddy_connect():
+    from workbuddy import provider_config
+    login=workbuddy_login()
+    with login.accounts.locked():before=login.accounts.read()
+    models=login.accounts.models()
+    with LOCK:
+        with login.accounts.locked():after=login.accounts.read()
+        identity=lambda auth:(auth.get('uid'),auth.get('enterpriseId'),auth.get('account'))
+        if not after.get('access') or identity(before)!=identity(after):
+            raise ValueError('读取模型期间账号已退出或切换，请刷新状态后重试')
+        h=hub()
+        old=h.providers.get('workbuddy-ai')
+        if old and old.get('kind')!='workbuddy-ai':
+            raise ValueError('workbuddy-ai ID 已被普通供应商占用，请先为它更名后再接入')
+        # Refresh metadata and add new models, retaining existing selections.
+        merged={m['id']:m for m in (old or {}).get('models',[])}
+        for m in models: merged[m['id']]={**merged.get(m['id'],{}),**m}
+        p=provider_config(h.cfg,list(merged.values()),old)
+        _validate_provider(p)
+        h.providers['workbuddy-ai']=p
+        h.cfg.get('removedProviders',{}).pop('workbuddy-ai',None)
+        _save_config(h)
+    gateway().start(observations().settings()['content'])
+    return {'ok':True,**api_workbuddy()}
+
+
+def api_workbuddy_logout():
+    login=workbuddy_login()
+    login.cancel()
+    with LOCK:
+        with login.accounts.locked(): login.accounts.path.unlink(missing_ok=True)
+        h=hub()
+        p=h.providers.get('workbuddy-ai')
+        if p and p.get('kind')=='workbuddy-ai':
+            p['enabled']=False
+            _save_config(h)
+        gateway().configure(observations().settings()['content'])
+    return {'ok':True,**api_workbuddy()}
+
+
+def gateway():
+    from gateway_runtime import Runtime
+    root=HUB_CONFIG.parent/'data/gateway'
+    with LOCK:
+        if str(root) not in _GATEWAYS:
+            import hub as engine
+            _GATEWAYS[str(root)]=Runtime(root,lambda:hub().cfg,
+                binary_root=Path(__file__).parent/'data/runtime',
+                codex_cache=Path(os.environ.get('CODEX_HOME') or engine.HOME/'.codex')/'models_cache.json')
+        return _GATEWAYS[str(root)]
+
+
+def api_gateway_preview(body):
+    from agent_inventory import AGENTS
+    with LOCK:
+        h=hub()
+        if type(body.get('enabled')) is not bool:
+            raise ValueError('enabled 必须为布尔值')
+        previous=h.cfg.get('gateway')
+        active=(previous or {}).get('activeEnabled',(previous or {}).get('enabled',False))
+        h.cfg['gateway']={**(previous or {}),'enabled':body['enabled'],'activeEnabled':active}
+        _save_config(h)
+        try:
+            if body['enabled']:
+                gateway().start(observations().settings()['content'])
+            # Use the same preview, conflict snapshots, grouped writes and restore.
+            selected=[a for a in AGENTS if (h.cfg.get('sync',{}).get('targets',{}).get(a) or {}).get('enabled')]
+            if not body['enabled']:
+                from gateway_runtime import gateway_url
+                import hub as engine
+                from sync_transaction import TARGET_FILES
+                url=(gateway_url(h.cfg)+'/').encode()
+                blocked=[a for a in AGENTS if a not in selected and any(
+                    (engine.HOME/rel).is_file() and url in (engine.HOME/rel).read_bytes()
+                    for rel in TARGET_FILES[a] if 'credentials' not in rel and '/auth.json' not in rel)]
+                if blocked:raise ValueError('以下已接入 Agent 当前未启用同步，请先重新启用再预览恢复：'+', '.join(blocked)+'；网关仍保持运行')
+            plan=h.preview_push(only=selected,reconcile=False)
+            _GATEWAY_PREVIEWS[plan['planId']]=body['enabled']
+        except Exception:
+            if previous is None:h.cfg.pop('gateway',None)
+            else:h.cfg['gateway']=previous
+            _save_config(h)
+            raise
+        return {'planId':plan['planId'],'targets':plan['targets'],
+            'files':[{'path':f['path'],'action':f['action']} for f in plan.get('files',[])],
+            'warnings':[*plan.get('warnings',[]),'应用后请启动新会话或重启客户端；原生登录凭据不写入网关。'],
+            'gateway':gateway().status()}
+
+
+def observations():
+    # Resolves from HUB_CONFIG so isolated tests can never read/write live telemetry.
+    root = HUB_CONFIG.parent / "data"
+    with LOCK:
+        if str(root) not in _OBSERVATIONS:
+            import hub as engine
+            _OBSERVATIONS[str(root)] = Store(root, engine.HOME, config=lambda: hub().cfg)
+        return _OBSERVATIONS[str(root)]
+
+
+def query_values(query):
+    return {k: v[0] for k, v in (query or {}).items() if v}
+
+
+def api_observations(query=None):
+    store = observations()
+    if store.settings()["enabled"] and store.progress.get("finishedAt", 0) < __import__("time").time() - 30:
+        store.refresh()
+    result=store.query(query_values(query))
+    result['status']['gateway']=gateway().status()
+    result['status']['coverage']='原生会话 + 已经过本机 Hub 网关的调用；按响应 ID 合并。直连线路只有原生日志视图，没有记录不等于零请求。'
+    return result
+
+
+def api_observation_settings(body):
+    result=observations().set_settings(body)
+    runtime=gateway()
+    if runtime.process and runtime.process.poll() is None:
+        runtime.configure(result['settings']['enabled'] and result['settings']['content'])
+    return result
+
+
+def api_observation_cleanup(body):
+    result=observations().cleanup(clear=body.get('clear') is True)
+    runtime=gateway()
+    if body.get('clear') is True and runtime.process and runtime.process.poll() is None:
+        runtime.configure(False)
+    return result
+
+
+def api_inventory(detect=False):
+    return INVENTORY.detect() if detect or INVENTORY.checked_at is None else INVENTORY.view()
 
 
 def _save_config(h: Hub, allowed_removed: dict[str, set[str]] | None = None) -> None:
@@ -162,7 +327,7 @@ def _validate_agents(agents: object) -> None:
     if not isinstance(agents, dict):
         raise ValueError("agents 必须是对象")
     for name, block in agents.items():
-        if name not in AGENT_CONNECTION_KEYS:
+        if name not in (*AGENT_CONNECTION_KEYS, "zcode"):
             raise ValueError(f"未知的 Agent 覆盖: {name}（可用: {', '.join(AGENT_CONNECTION_KEYS)}）")
         if not isinstance(block, dict):
             raise ValueError(f"agents.{name} 必须是对象")
@@ -242,12 +407,16 @@ def _validate_modelsync_entry(h: Hub, entry: object, where: str, *, allow_tiers:
     """校验 modelSync.default / overrides.<target> 的一条模型映射。"""
     if not isinstance(entry, dict):
         raise ValueError(f"{where} 必须是对象")
-    allowed = set(MODELSYNC_ENTRY_KEYS) | ({"tiers"} if allow_tiers else set())
+    allowed = set(MODELSYNC_ENTRY_KEYS) | ({"tiers", "preserveTiers"} if allow_tiers else set())
     unknown = sorted(set(entry) - allowed)
     if unknown:
         raise ValueError(f"{where} 包含未知字段: {', '.join(unknown)}")
     pid = entry.get("provider")
     if not isinstance(pid, str) or not pid.strip():
+        # 切换方案要用「清空全局主模型」表达"这次不设定全局主模型"；
+        # 该哨兵只在 switch_plans 编译结果里出现，手工请求仍按非法处理。
+        if where == "modelSync.default" and entry == DEFAULT_CLEAR:
+            return {}
         raise ValueError(f"{where}.provider 必须是非空字符串")
     pid = pid.strip()
     p = h.providers.get(pid)
@@ -264,6 +433,11 @@ def _validate_modelsync_entry(h: Hub, entry: object, where: str, *, allow_tiers:
     if effort is not None and effort not in efforts:
         raise ValueError(f"{where}.reasoningEffort 只能是 {'/'.join(efforts)} 或 null")
     checked = {"provider": pid, "model": model.strip(), "reasoningEffort": effort}
+    if "preserveTiers" in entry:
+        keep = entry["preserveTiers"]
+        if not isinstance(keep, list) or any(t not in CLAUDE_TIER_KEYS[1:] for t in keep):
+            raise ValueError("preserveTiers 包含未知 Claude 档位")
+        checked["preserveTiers"] = list(dict.fromkeys(keep))
     if "tiers" in entry:
         tiers = entry["tiers"]
         if not isinstance(tiers, dict):
@@ -285,7 +459,9 @@ def _normalize_modelsync(h: Hub, raw: object) -> dict:
         raise ValueError(f"modelSync 包含未知字段: {', '.join(unknown)}")
     out: dict = {}
     if "default" in raw:
-        out["default"] = _validate_modelsync_entry(h, raw["default"], "modelSync.default")
+        checked = _validate_modelsync_entry(h, raw["default"], "modelSync.default")
+        if checked:
+            out["default"] = checked
     overrides = raw.get("overrides", {})
     if not isinstance(overrides, dict):
         raise ValueError("modelSync.overrides 必须是对象")
@@ -376,11 +552,343 @@ def api_providers() -> dict:
     return {"providers": h.providers, "removedProviders": h.cfg.get("removedProviders", {})}
 
 
+# ---------------------------------------------------------------------------
+# 切换方案（switchPlans）：一次选择，明确应用到多个 Agent
+#
+# 方案只是"保存下来的意图"；应用时由 switch_plans.compile_plan 编译成现有的
+# modelSync，再走原来的预览 / 事务 / 恢复路径。这里不做第二套同步实现。
+# ---------------------------------------------------------------------------
+
+
+def _switch_plans_block(cfg: dict) -> dict:
+    block = cfg.get(SWITCH_PLANS_KEY)
+    block = block if isinstance(block, dict) else {}
+    plans = block.get("plans")
+    return {"version": 1, "default": block.get("default"),
+            "plans": plans if isinstance(plans, dict) else {}}
+
+
+def _plan_slug(name: str) -> str:
+    """方案 id 从名字派生：便于命令行与 URL 引用，冲突时由调用方加后缀。"""
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "-", (name or "").strip()).strip("-").lower()
+    return slug[:48] or "plan"
+
+
+def _store_switch_plans(h: Hub, block: dict) -> None:
+    # Existing out-of-scope plans are archival data, not selectable daily plans.
+    legacy = {k: v for k, v in _switch_plans_block(h.cfg)["plans"].items()
+              if any(canonical_target(t) not in AGENTS for t in v.get("targets", []))}
+    block = {**block, "plans": {**legacy, **block["plans"]}}
+    h.cfg[SWITCH_PLANS_KEY] = block
+    _save_config(h)
+
+
+def normalize_switch_plans(h: Hub, raw: object) -> dict:
+    """校验整块 switchPlans；与 modelSync 一样是整块替换，写入走 _save_config。"""
+    if not isinstance(raw, dict):
+        raise ValueError("switchPlans 必须是对象")
+    unknown = sorted(set(raw) - {"version", "default", "plans"})
+    if unknown:
+        raise ValueError(f"switchPlans 包含未知字段: {', '.join(unknown)}")
+    version = raw.get("version", 1)
+    if version != 1:
+        raise ValueError(f"switchPlans.version 只支持 1（当前 {version!r}）")
+    plans_raw = raw.get("plans") or {}
+    if not isinstance(plans_raw, dict):
+        raise ValueError("switchPlans.plans 必须是对象")
+    plans: dict[str, dict] = {}
+    names: dict[str, str] = {}
+    for key, value in plans_raw.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("switchPlans.plans 的键必须是非空字符串")
+        pid = key.strip()
+        try:
+            plan = normalize_plan({**(value if isinstance(value, dict) else {}), "id": pid})
+        except PlanError as exc:
+            raise ValueError(f"方案 {pid} 无效: {exc}") from exc
+        if not plan["name"]:
+            raise ValueError(f"方案 {pid} 缺少 name")
+        if plan["name"] in names:
+            raise ValueError(f"方案名重复: {plan['name']}（{names[plan['name']]} 与 {pid}）")
+        names[plan["name"]] = pid
+        plans[pid] = plan
+    default = raw.get("default")
+    if default is None or default == "":
+        default = None
+    elif not isinstance(default, str) or default.strip() not in plans:
+        raise ValueError(f"switchPlans.default 指向不存在的方案: {default!r}")
+    else:
+        default = default.strip()
+    return {"version": 1, "default": default, "plans": plans}
+
+
+def _plan_state(h: Hub, block: dict) -> dict:
+    """界面需要的方案清单 + 失效标记；引用了被删/改名的供应商或模型必须看得见。"""
+    items = []
+    for pid, plan in block["plans"].items():
+        if any(canonical_target(t) not in AGENTS for t in plan.get("targets", [])):
+            continue
+        state = reference_states(h.cfg, plan)
+        items.append({
+            "id": pid, "name": plan["name"], "description": plan["description"],
+            "targets": plan["targets"], "base": plan["base"], "agents": plan["agents"],
+            "fallback": plan["fallback"], "updatedAt": plan.get("updatedAt"),
+            "stale": state["stale"], "refs": state["refs"],
+        })
+    return {"version": 1, "default": block["default"], "plans": items,
+            "targets": list(PLAN_TARGETS)}
+
+
+def plan_view() -> dict:
+    """GET /api/switch-plans：已保存方案 + 每个 Agent 连接上可选的模型（不含密钥）。"""
+    h = hub()
+    targets = {}
+    for name in PLAN_TARGETS:
+        targets[name] = {"connections": connection_snapshot(h.cfg, name),
+                         "resolved": resolve_agent_model(h.cfg, name) if resolve_agent_model else None}
+    return {"store": _plan_state(h, _switch_plans_block(h.cfg)),
+            "modelSync": _modelsync_block(h.cfg),
+            "targets": targets}
+
+
+def update_plans(body: dict) -> dict:
+    """PUT /api/switch-plans：整块替换已保存方案。"""
+    if SWITCH_PLANS_KEY not in body:
+        raise ValueError(f"缺少 {SWITCH_PLANS_KEY} 字段")
+    if not _modelsync_api_ready():
+        raise RuntimeError("hub.py 未提供 modelSync 接口，无法保存切换方案")
+    with LOCK:
+        h = hub()
+        block = normalize_switch_plans(h, body[SWITCH_PLANS_KEY])
+        _store_switch_plans(h, block)
+    return {"ok": True, "store": _plan_state(h, block)}
+
+
+def _plan_request(body: dict) -> tuple[dict, list[str], str]:
+    """解析 preview / apply 请求：planId、name、内联 plan 三种引用方式。"""
+    h = hub()
+    plans = _switch_plans_block(h.cfg)["plans"]
+    ref = body.get("planId") or body.get("name")
+    if isinstance(ref, str) and ref.strip():
+        key = ref.strip()
+        plan = plans.get(key)
+        if plan is None:
+            plan = next((p for p in plans.values() if p["name"] == key), None)
+        if plan is None:
+            raise ValueError(f"方案不存在: {key}（可能已被删除或改名）")
+        plan = dict(plan)
+    elif isinstance(body.get("plan"), dict):
+        try:
+            plan = normalize_plan(body["plan"])
+        except PlanError as exc:
+            raise ValueError(str(exc)) from exc
+    elif isinstance(body.get("plan"), (str, int, float, bool)) or body.get("plan") is not None:
+        raise ValueError("plan 必须是对象")
+    else:
+        raise ValueError("请提供 planId（已保存方案）或 plan（内联方案）")
+    requested = body.get("targets")
+    if requested is not None:
+        if not isinstance(requested, list) or not requested \
+                or any(not isinstance(name, str) for name in requested):
+            raise ValueError("targets 必须是非空字符串数组")
+        scope = [canonical_target(name) for name in requested]
+        unknown = [name for name in scope if name not in PLAN_TARGETS]
+        if unknown:
+            raise ValueError(f"targets 包含不支持的目标: {', '.join(unknown)}")
+    else:
+        scope = list(plan["targets"])
+    if any(canonical_target(name) not in AGENTS for name in scope):
+        raise ValueError("历史方案含当前支持范围以外的目标，未写入客户端")
+    return plan, scope, ""
+
+
+def _mode_of(h: Hub):
+    targets = (h.cfg.get("sync") or {}).get("targets") or {}
+
+    def mode(name: str) -> str:
+        entry = targets.get(name)
+        entry = entry if isinstance(entry, dict) else {}
+        return entry.get("mode", "official")
+
+    return mode
+
+
+def api_switch_plans() -> dict:
+    return plan_view()
+
+
+def api_update_switch_plans(body: dict) -> dict:
+    return update_plans(body)
+
+
+def api_switch_plan_analyze(body: dict) -> dict:
+    """POST /api/switch-plans/analyze：只读分析——写之前就看清楚每个目标的实际变化。"""
+    h = hub()
+    plan, scope, _ = _plan_request(body)
+    report = analyze_plan(h.cfg, plan, targets=scope, mode_of=_mode_of(h))
+    report["fallback"] = diagnose_fallback(h.cfg, plan, targets=scope)
+    report["configured"] = {"modelSync": _modelsync_block(h.cfg)}
+    return report
+
+
+def api_switch_plan_preview(body: dict) -> dict:
+    """POST /api/switch-plans/preview：编译方案 -> 落盘 modelSync -> 生成原生预览。
+
+    只在"这次会写入的目标"参与预览：方案没选中的 Agent 一个文件都不碰。
+    """
+    if not _modelsync_api_ready():
+        raise RuntimeError("hub.py 未提供 modelSync 接口，无法应用切换方案")
+    with LOCK:
+        h = hub()
+        plan, scope, _ = _plan_request(body)
+        report = analyze_plan(h.cfg, plan, targets=scope, mode_of=_mode_of(h))
+        if not report["writable"]:
+            return {"ok": False, "writable": False, "analysis": report,
+                    "error": "本次方案有未解决的不兼容项，没有写入任何文件"}
+        try:
+            _patched, patch, _issues, blocked = compile_plan(h.cfg, plan, targets=scope)
+        except PlanError as exc:
+            return {"ok": False, "writable": False, "analysis": report, "error": str(exc)}
+        if blocked or patch is None:
+            return {"ok": False, "writable": False, "analysis": report,
+                    "error": "本次方案有未解决的不兼容项，没有写入任何文件"}
+        block = model_sync_patch_for_write(h.cfg, patch)
+        try:
+            normalized = _normalize_modelsync(h, block)
+        except ValueError as exc:
+            return {"ok": False, "writable": False, "analysis": report,
+                    "error": f"编译结果未通过 modelSync 校验: {exc}"}
+        warnings = _modelsync_warnings(h, normalized)
+        previous = copy.deepcopy(h.cfg.get("modelSync"))
+        h.cfg["modelSync"] = normalized
+        try:
+            _save_config(h)
+            write_scope = [item["target"] for item in report["details"] if item["status"] in ("ok", "warning")]
+            preview = h.preview_push(only=write_scope, reconcile=True)
+        except Exception:
+            h.cfg["modelSync"] = previous
+            raise
+        report["appliedModelSync"] = normalized
+        report["modelSyncWarnings"] = warnings
+    return {"ok": True, "writable": True, "planId": preview["planId"],
+            "targets": preview["targets"],
+            "files": [{"path": f["path"], "action": f["action"]} for f in preview.get("files", [])],
+            "warnings": [*preview.get("warnings", []), *warnings],
+            "analysis": report,
+            "results": _plan_result_rows(report, preview),
+            "disclaimer": report["disclaimer"]}
+
+
+def _plan_result_rows(report: dict, preview: dict | None = None) -> list[dict]:
+    """把分析结果落成"哪些写入、哪些跳过、哪些还要客户端动手"的结果区数据。"""
+    files_by_target: dict[str, list[dict]] = {}
+    if preview:
+        for item in preview.get("files", []):
+            for name in preview.get("targets", []):
+                files_by_target.setdefault(name, []).append(
+                    {"path": item["path"], "action": item["action"]})
+    rows = []
+    for item in report["details"]:
+        target = item["target"]
+        status = item["status"]
+        row = {"target": target, "label": item["label"], "status": status,
+               "provider": item["provider"], "model": item["model"],
+               "reason": item.get("reason", ""),
+               "needsClientAction": item.get("needsClientAction", ""),
+               "effort": item["effort"], "tiers": item.get("tiers", [])}
+        if status == "ok":
+            row["message"] = f"{item['provider']} / {item['model']} 已写入该客户端的原生配置"
+            if target in files_by_target:
+                row["files"] = files_by_target[target]
+        elif status == "warning":
+            row["message"] = item.get("reason", "")
+        elif status == "skipped":
+            row["message"] = item.get("reason", "本次跳过")
+        else:
+            row["message"] = item.get("reason", "无法写入")
+        rows.append(row)
+    return rows
+
+
+def api_switch_plan_apply(body: dict) -> dict:
+    """POST /api/switch-plans/apply：一次确认走完「编译 -> 落盘 -> 事务写入 -> 结果」。
+
+    仍然遵守现有的写入门槛：预览与应用的源文件核对、外部修改拒绝、
+    官方模式门控、事务备份与回滚都在 sync_transaction 里，这里不改写它们。
+    """
+    result = api_switch_plan_preview(body)
+    if not result.get("ok"):
+        return result
+    plan_id = result["planId"]
+    with LOCK:
+        applied = hub().apply_preview(plan_id)
+        h = hub()
+        recorded = _record_sync(h, applied["results"], transaction_id=applied["transactionId"])
+    rows = result["results"]
+    detail_by_target = {row["target"]: row for row in rows}
+    for detail in recorded["details"]:
+        row = detail_by_target.get(detail["target"])
+        if row is not None:
+            # 结果区以事务的实际回执为准：文件写入失败就是失败，不显示成成功。
+            row["writeOk"] = detail["ok"]
+            row["message"] = detail["message"]
+            if not detail["ok"]:
+                row["status"] = "failed"
+        elif not detail["ok"]:
+            # 事务里失败、但清单里没有对应行（例如只剩退出码）：照样要报出来。
+            rows.append({"target": detail["target"], "label": detail["target"],
+                         "status": "failed", "provider": "", "model": "",
+                         "reason": detail["message"], "message": detail["message"],
+                         "needsClientAction": "", "writeOk": False,
+                         "effort": {"support": "applied", "requested": None}, "tiers": []})
+    written = [row["target"] for row in rows if row.get("writeOk")]
+    failed = [row["target"] for row in rows if row["status"] == "failed"]
+    skipped = [row["target"] for row in rows if row["status"] == "skipped"]
+    return {"ok": recorded["ok"], "planId": result["planId"],
+            "targets": result["targets"], "files": result["files"],
+            "warnings": result["warnings"], "analysis": result["analysis"],
+            "results": rows, "written": written, "failed": failed, "skipped": skipped,
+            "transactionId": recorded["transactionId"],
+            "restorable": bool(recorded["transactionId"]),
+            "disclaimer": result["disclaimer"],
+            "clientActions": result["analysis"]["clientActions"]}
+
+
+def api_switch_plan_delete(body: dict) -> dict:
+    """DELETE /api/switch-plans/<id>：删方案；引用它的 default 指针一并清掉，不偷偷替换。"""
+    plan_id = unquote(str(body.get("planId") or ""))
+    if not plan_id:
+        raise ValueError("缺少 planId")
+    with LOCK:
+        h = hub()
+        block = _switch_plans_block(h.cfg)
+        if plan_id not in block["plans"]:
+            raise ValueError(f"方案不存在: {plan_id}")
+        del block["plans"][plan_id]
+        cleared_default = block["default"] == plan_id
+        if cleared_default:
+            block["default"] = None
+        _store_switch_plans(h, block)
+    return {"ok": True, "deleted": plan_id, "defaultCleared": cleared_default,
+            "store": _plan_state(h, block)}
+
+
+def api_switch_fallback(body: dict) -> dict:
+    """POST /api/switch-plans/fallback：备用线路白名单诊断（不自动执行）。"""
+    h = hub()
+    plan, scope, _ = _plan_request(body)
+    report = diagnose_fallback(h.cfg, plan, targets=scope)
+    report["analysis"] = analyze_plan(h.cfg, plan, targets=scope, mode_of=_mode_of(h))
+    return report
+
+
 def api_status() -> dict:
     h = hub()
     changed = set(h.changed_files())
     targets = {}
     for name, t in (h.cfg.get("sync", {}).get("targets") or {}).items():
+        if name not in PREVIEW_TARGETS:
+            continue
         files = [{"path": str(expand(f)), "exists": expand(f).exists(),
                   "changed": str(expand(f)) in changed} for f in target_files(name, t)]
         targets[name] = {
@@ -398,7 +906,7 @@ def api_status() -> dict:
                       and agent_connection_ready(p, name)]
                for name in AGENT_CONNECTION_KEYS}
     return {
-        "app": "agent-hub", "uiVersion": 2,
+        "app": "agent-hub", "uiVersion": 6,
         "statusText": h.status(), "providerCount": len(h.providers), "targets": targets,
         "anthropicCapable": capable["claude"], "agentCapable": capable,
         "connections": agent_connections(h.cfg),
@@ -495,6 +1003,13 @@ def api_apply(body: dict) -> dict:
         raise ValueError("请先生成并确认同步预览，再提交 planId")
     with LOCK:
         result = hub().apply_preview(plan_id)
+        if plan_id in _GATEWAY_PREVIEWS:
+            enabled=_GATEWAY_PREVIEWS.pop(plan_id)
+            h=hub()
+            h.cfg['gateway'].pop('activeEnabled',None)
+            _save_config(h)
+            if enabled or any(p.get('kind')=='workbuddy-ai' and p.get('enabled',True) for p in h.providers.values()):gateway().start(observations().settings()['content'])
+            else:gateway().stop()
         # Applying may update Hub configuration; reload before recording status.
         return _record_sync(hub(), result["results"], transaction_id=result["transactionId"])
 
@@ -600,9 +1115,11 @@ def api_update_provider(pid: str, body: dict) -> dict:
             if field in body:
                 p[field] = body[field]
         if "agents" in body:
-            p["agents"] = body["agents"]
+            # Hidden legacy connections remain byte-for-byte data; the daily UI
+            # can only replace the four active connections.
+            p["agents"] = {**{k: v for k, v in (p.get("agents") or {}).items() if k not in AGENTS}, **body["agents"]}
         if "targets" in body:
-            p["targets"] = body["targets"]
+            p["targets"] = list(dict.fromkeys([*body["targets"], *[t for t in p.get("targets", []) if canonical_target(t) not in AGENTS]])) if body["targets"] else []
         _validate_provider(p)
         h.providers[pid] = p
         _save_config(h)
@@ -733,7 +1250,8 @@ def api_batch_delete_models(pid: str, body: dict) -> dict:
 
 def api_discover_models(pid: str, agent: str | None = None) -> dict:
     h = hub()
-    models = discover_models(_provider(h, pid), agent)
+    p=_provider(h,pid)
+    models = workbuddy_login().accounts.models() if p.get('kind')=='workbuddy-ai' else discover_models(p,agent)
     return {"ok": True, "count": len(models), "models": models}
 
 
@@ -772,14 +1290,14 @@ def api_import_models(pid: str, body: dict) -> dict:
 
 def api_import_scan(target: str) -> dict:
     """列出某个客户端原生配置中可导入的供应商候选。"""
-    if target not in hub().IMPORT_TARGETS:
+    if target not in AGENTS:
         raise ValueError(f"不支持从 {target} 读取供应商")
     return {"candidates": hub().import_candidates(target)}
 
 
 def api_import_apply(target: str, body: dict) -> dict:
     """把选中的供应商写入 providers.json；随后即可同步到其它平台。"""
-    if target not in hub().IMPORT_TARGETS:
+    if target not in AGENTS:
         raise ValueError(f"不支持导入到来自 {target} 的条目")
     items = body.get("items")
     if not isinstance(items, list) or not items:
@@ -815,6 +1333,25 @@ def api_import_apply(target: str, body: dict) -> dict:
 
 # URL 编码必须在路由匹配之后解码：openrouter 等模型 ID 自带 /。
 ROUTES = [
+    ("GET", r"^/api/workbuddy$", lambda m,b,q=None: api_workbuddy()),
+    ("POST", r"^/api/workbuddy/login$", lambda m,b,q=None: workbuddy_login().start()),
+    ("DELETE", r"^/api/workbuddy/login$", lambda m,b,q=None: workbuddy_login().cancel() or {"ok":True}),
+    ("POST", r"^/api/workbuddy/connect$", lambda m,b,q=None: api_workbuddy_connect()),
+    ("POST", r"^/api/workbuddy/logout$", lambda m,b,q=None: api_workbuddy_logout()),
+    ("GET", r"^/api/gateway$", lambda m,b,q=None: gateway().status()),
+    ("POST", r"^/api/gateway/start$", lambda m,b,q=None: gateway().start(observations().settings()['content'])),
+    ("POST", r"^/api/gateway/preview$", lambda m,b,q=None: api_gateway_preview(b)),
+    ("GET", r"^/api/agents$", lambda m, b, q=None: api_inventory()),
+    ("POST", r"^/api/agents/detect$", lambda m, b, q=None: api_inventory(True)),
+    ("POST", r"^/api/agents/check$", lambda m, b, q=None: INVENTORY.check(b.get("instanceId"))),
+    ("POST", r"^/api/agents/update$", lambda m, b, q=None: INVENTORY.start_update(b.get("instanceId"))),
+    ("GET", r"^/api/observation$", lambda m, b, q=None: api_observations(q)),
+    ("GET", r"^/api/observation/status$", lambda m, b, q=None: observations().status()),
+    ("PUT", r"^/api/observation/settings$", lambda m, b, q=None: api_observation_settings(b)),
+    ("POST", r"^/api/observation/refresh$", lambda m, b, q=None: observations().refresh()),
+    ("POST", r"^/api/observation/cleanup$", lambda m, b, q=None: api_observation_cleanup(b)),
+    ("GET", r"^/api/observation/requests/([a-f0-9]+)$", lambda m, b, q=None: observations().detail(m[1])),
+    ("GET", r"^/api/observation/session$", lambda m, b, q=None: observations().session_detail(query_values(q).get("agent"), query_values(q).get("session"), query_values(q))),
     ("GET", r"^/api/providers$", lambda m, b, q=None: api_providers()),
     ("GET", r"^/api/status$", lambda m, b, q=None: api_status()),
     ("POST", r"^/api/preview$", lambda m, b, q=None: api_preview(b)),
@@ -825,6 +1362,14 @@ ROUTES = [
     ("PUT", r"^/api/targets$", lambda m, b, q=None: api_update_targets(b)),
     ("GET", r"^/api/modelsync$", lambda m, b, q=None: api_modelsync()),
     ("PUT", r"^/api/modelsync$", lambda m, b, q=None: api_update_modelsync(b)),
+    ("GET", r"^/api/switch-plans$", lambda m, b, q=None: api_switch_plans()),
+    ("PUT", r"^/api/switch-plans$", lambda m, b, q=None: api_update_switch_plans(b)),
+    ("POST", r"^/api/switch-plans/analyze$", lambda m, b, q=None: api_switch_plan_analyze(b)),
+    ("POST", r"^/api/switch-plans/preview$", lambda m, b, q=None: api_switch_plan_preview(b)),
+    ("POST", r"^/api/switch-plans/apply$", lambda m, b, q=None: api_switch_plan_apply(b)),
+    ("POST", r"^/api/switch-plans/fallback$", lambda m, b, q=None: api_switch_fallback(b)),
+    ("DELETE", r"^/api/switch-plans/([^/]+)$",
+     lambda m, b, q=None: api_switch_plan_delete({**(b or {}), "planId": unquote(m[1])})),
     ("POST", r"^/api/providers$", lambda m, b, q=None: api_add_provider(b)),
     ("PUT", r"^/api/providers/([^/]+)$", lambda m, b, q=None: api_update_provider(unquote(m[1]), b)),
     ("DELETE", r"^/api/providers/([^/]+)$", lambda m, b, q=None: api_delete_provider(unquote(m[1]))),
@@ -868,6 +1413,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_api(self, method: str) -> None:
         # 本地工具不允许其他网页跨站触发配置写入。
+        host = urlparse("http://" + (self.headers.get("Host") or "")).hostname
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            self._send_json(403, {"error": "工作台 API 仅允许本机 Host"})
+            return
         origin = self.headers.get("Origin")
         if origin and origin != f"http://{self.headers.get('Host')}":
             self._send_json(403, {"error": "拒绝跨站请求"})
@@ -876,6 +1425,10 @@ class Handler(BaseHTTPRequestHandler):
         path = split.path
         try:
             body = self._read_body() if method in ("POST", "PUT", "PATCH") else {}
+            if method == "POST" and path == "/api/shutdown":
+                self._send_json(200, {"ok": True, "message": "本地服务正在退出"})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
             query = parse_qs(split.query)
             for verb, pattern, fn in ROUTES:
                 match = re.match(pattern, path) if verb == method else None
@@ -938,6 +1491,10 @@ def main() -> int:
         print(f"缺少界面目录: {UI_DIR}", file=sys.stderr)
         return 1
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    collector = observations()
+    collector.start()
+    managed_gateway=gateway()
+    managed_gateway.watch(collector.settings)
     url = f"http://{args.host}:{args.port}/"
     print(f"Agent Hub 工作台: {url}\nCtrl+C 退出")
     if args.open:
@@ -947,6 +1504,9 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        workbuddy_login().cancel()
+        managed_gateway.close()
+        collector.close()
         server.server_close()
     return 0
 

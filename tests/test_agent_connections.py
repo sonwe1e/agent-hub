@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from support import isolated, engine, server
 
@@ -203,9 +204,14 @@ class MigrateAgentsTests(unittest.TestCase):
 
     def test_migration_is_idempotent(self):
         engine.save_json(server.HUB_CONFIG, self.legacy())
-        engine.cmd_migrate_agents(engine.Hub(), None)
+        with patch.object(engine,"now_iso",return_value="2026-10-17T03:00:00Z"):
+            engine.cmd_migrate_agents(engine.Hub(), None)
         first = self.config()
-        engine.cmd_migrate_agents(engine.Hub(), None)
+        with patch.object(engine,"now_iso",return_value="2026-10-17T03:00:02Z"), \
+             patch.object(engine,"backup_file") as backup, patch.object(engine,"save_json") as save:
+            engine.cmd_migrate_agents(engine.Hub(), None)
+            backup.assert_not_called()
+            save.assert_not_called()
         self.assertEqual(first, self.config())
 
     def test_migration_keeps_existing_modelsync_tiers(self):

@@ -18,7 +18,7 @@ class PreviewContractTests(unittest.TestCase):
         status = server.api_status()
         self.assertFalse(status['targets']['pi']['enabled'])
         self.assertEqual(status['targets']['codex']['mode'], 'official')
-        self.assertEqual(status['targets']['zcode']['mode'], 'official')
+        self.assertNotIn('zcode', status['targets'])
         self.assertFalse(status['targets']['codex']['readonly'])
         with self.assertRaises(ValueError):
             server.api_preview({'targets': ['pi']})
@@ -27,7 +27,7 @@ class PreviewContractTests(unittest.TestCase):
         cfg = self.config()
         cfg['sync']['targets']['cc-switch']['enabled'] = True
         engine.save_json(server.HUB_CONFIG, cfg)
-        self.assertFalse(server.api_status()['targets']['cc-switch']['supported'])
+        self.assertNotIn('cc-switch', server.api_status()['targets'])
         with self.assertRaises(ValueError):
             server.api_preview({'targets': ['cc-switch']})
         with self.assertRaises(ValueError):
@@ -44,11 +44,11 @@ class PreviewContractTests(unittest.TestCase):
         server.api_update_targets({'targets': {'codex': {'mode': 'official'}}})
         self.assertEqual(server.api_status()['targets']['codex']['mode'], 'official')
 
-    def test_zcode_mode_is_accepted_and_reported(self):
-        server.api_update_targets({'targets': {'zcode': {'enabled': True, 'mode': 'third-party'}}})
-        self.assertEqual(server.api_status()['targets']['zcode']['mode'], 'third-party')
-        server.api_update_targets({'targets': {'zcode': {'mode': 'official'}}})
-        self.assertEqual(server.api_status()['targets']['zcode']['mode'], 'official')
+    def test_legacy_target_mode_is_rejected_without_mutation(self):
+        before = server.HUB_CONFIG.read_bytes()
+        with self.assertRaises(ValueError):
+            server.api_update_targets({'targets': {'zcode': {'enabled': True, 'mode': 'third-party'}}})
+        self.assertEqual(before, server.HUB_CONFIG.read_bytes())
 
     def test_codex_provider_responses_and_env_round_trip(self):
         server.api_add_provider({'id': 'env-gateway', 'name': 'Gateway',

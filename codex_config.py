@@ -173,6 +173,8 @@ def compile_config(text, saved, mode, provider=None, selection=None, *,
         if not isinstance(model, str) or not model.strip():
             raise ValueError("Codex 模型不能为空")
         effort = selection.get("reasoningEffort")
+        if effort is None:
+            effort = before.get("model_reasoning_effort")
         if effort == "off":
             effort = "none"  # Global legacy vocabulary; Codex uses none.
         if effort is not None and effort not in ("none", "minimal", "low", "medium", "high",

@@ -7,23 +7,31 @@
   <title>Agent Hub · 模型工作台</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/daily.css" />
   <script src="/app.js" defer></script>
+  <script src="/workbench.js" defer></script>
+  <script src="/workbuddy.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#content">跳至主要内容</a>
   <div class="app-shell">
     <aside class="sidebar" aria-label="主导航">
-      <a class="brand" href="#sync" aria-label="Agent Hub 首页">
+      <a class="brand" href="#agents" aria-label="Agent Hub 首页">
         <span class="brand-mark" data-icon="hub"></span>
-        <span>Agent Hub<small>你的模型配置中枢</small></span>
+        <span>Agent Hub<small>LOCAL AGENT WORKSPACE</small></span>
       </a>
       <div class="nav-caption">工作空间</div>
       <nav>
-        <a href="#models" class="nav-item" data-page="models" aria-label="模型库"><span data-icon="grid"></span>模型库<span class="nav-count" id="nav-model-count">—</span></a>
-        <a href="#providers" class="nav-item" data-page="providers" aria-label="供应商"><span data-icon="layers"></span>供应商<span class="nav-count" id="nav-provider-count">—</span></a>
-        <a href="#sync" class="nav-item active" data-page="sync" aria-label="平台同步"><span data-icon="sync"></span>平台同步<span class="nav-dot" id="nav-sync-dot" hidden></span></a>
+        <a href="#agents" class="nav-item" data-page="agents"><span data-icon="hub"></span>Agent<span class="nav-count">4</span></a>
+        <a href="#observe" class="nav-item" data-page="observe"><span data-icon="eye"></span>观测</a>
+        <a href="#settings" class="nav-item" data-page="settings"><span data-icon="layers"></span>设置<span class="nav-dot" id="nav-sync-dot" hidden></span></a>
       </nav>
-      <div class="sidebar-note"><span data-icon="sparkles"></span><strong>改一处，用在每个平台</strong><p>统一管理连接与模型，<br />告别重复修改配置。</p></div>
+      <nav id="settings-nav" class="settings-nav" hidden>
+        <a href="#providers" class="nav-item" data-page="providers">供应商与连接<span class="nav-count" id="nav-provider-count"></span></a>
+        <a href="#models" class="nav-item" data-page="models">模型库<span class="nav-count" id="nav-model-count"></span></a>
+        <a href="#sync" class="nav-item" data-page="sync">方案与高级同步</a>
+      </nav>
+      <div class="sidebar-note"><span data-icon="shield"></span><strong>本机管理 · 有据可查</strong><p>配置写入前自动备份。<br />观测来源与未知项始终可见。</p></div>
       <div class="sidebar-footer"><span class="online-dot"></span><div>本地运行<small>密钥仅保存在本机配置中</small></div><span data-icon="shield"></span></div>
     </aside>
     <div class="workspace">

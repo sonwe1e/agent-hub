@@ -53,6 +53,10 @@ def isolated():
         root.mkdir()
         config = root / "providers.json"
         config.write_text(json.dumps(fixture()), encoding="utf-8")
+        data = root / "data"
+        data.mkdir()
+        (data / "observation-settings.json").write_text(json.dumps({
+            "enabled": False, "content": False, "retentionDays": 30, "clearedBefore": 0}), encoding="utf-8")
         def expand(path):
             text = str(path)
             return home / text[2:] if text.startswith("~/") else Path(text)
@@ -60,4 +64,11 @@ def isolated():
         with patch.multiple(engine, HOME=home, HUB_DIR=root, HUB_CONFIG=config,
                             HUB_STATE=root / "state.json", HUB_BACKUP=root / "backups", expand=expand), \
              patch.object(server, "HUB_CONFIG", config), patch.object(server, "expand", expand):
-            yield home
+            try:
+                yield home
+            finally:
+                runtime=server._GATEWAYS.pop(str(data/'gateway'),None)
+                if runtime:runtime.close()
+                store = server._OBSERVATIONS.pop(str(data),None)
+                if store:
+                    store.close()

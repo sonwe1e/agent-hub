@@ -33,12 +33,12 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     const submit = dialog.locator('button[type=submit]');
     const waitSaved = async () => { await dialog.waitFor({ state: 'hidden' }); await page.waitForFunction(() => !document.body.classList.contains('busy')); };
     const config = async () => (await (await page.request.get(`${url}/api/providers`)).json()).providers;
-    const go = async hash => { await page.locator(`nav a[href="#${hash}"]`).click(); await main.locator('h1').filter({ hasText: ({ models: '模型库', providers: '供应商', sync: '平台同步' })[hash] }).waitFor(); };
+    const go = async hash => { await page.evaluate(hash => location.hash=hash,hash); await main.locator('h1').filter({ hasText: ({ models: '模型库', providers: '供应商', sync: '平台同步' })[hash] }).waitFor(); };
     const confirm = async label => { await page.locator('#confirm-dialog').waitFor({ state: 'visible' }); await page.locator('#confirm-ok').click(); await page.waitForFunction(() => !document.body.classList.contains('busy')); };
 
     await step('initial sync workspace and model library layout', async () => {
       await page.goto(url);
-      await main.locator('h1').filter({ hasText: '平台同步' }).waitFor();
+      await main.locator('h1').filter({ hasText: 'Agent' }).waitFor();
       await go('models');
       await main.locator('h1').filter({ hasText: '模型库' }).waitFor();
       assert.equal(await page.locator('#nav-model-count').textContent(), '28');
@@ -93,7 +93,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     });
     await step('add and configure supplier without changing its models', async () => {
       await main.locator('[data-action="add-provider"]').click();
-      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['pi', 'dsh', 'zcode', 'claude', 'codex']);
+      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['claude', 'codex', 'pi', 'dsh']);
       assert.equal(await dialog.locator('[name=allTargets]').isChecked(), false);
       await dialog.locator('[name=id]').fill('new-provider');
       await dialog.locator('[name=displayName]').fill('New Provider');
@@ -102,7 +102,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await submit.click();
       await waitSaved();
       assert.equal(Object.keys(await config()).length, 5);
-      assert.deepEqual((await config())['new-provider'].targets, ['pi', 'dsh', 'zcode', 'claude', 'codex']);
+      assert.deepEqual((await config())['new-provider'].targets, ['claude', 'codex', 'pi', 'dsh']);
       await go('providers');
       await main.locator('[data-action="edit-provider"][data-pid="deepseek"]').click();
       await dialog.locator('[name=displayName]').fill('DeepSeek Updated');
@@ -183,65 +183,16 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       assert.equal((await config()).deepseek.models.length, 7);
       assert.equal((await config()).openrouter.models.length, 6);
     });
-    await step('ZCode-only connection and isolated model selection', async () => {
-      await go('providers');
-      await main.locator('[data-action="add-provider"]').first().click();
-      await dialog.locator('[name=id]').fill('zcode-plan');
-      await dialog.locator('[name=displayName]').fill('ZCode Plan');
-      await dialog.locator('summary').filter({ hasText: '高级设置' }).click();
-      for (const checkbox of await dialog.locator('[name=targets]').all()) await checkbox.uncheck();
-      await dialog.locator('[name=targets][value=zcode]').check();
-      await dialog.locator('[data-agent-section=zcode] > summary').click();
-      await dialog.locator('[name="agent-zcode-baseUrl"]').fill('https://zcode.example/api');
-      await dialog.locator('[name="agent-zcode-apiKey"]').fill('zcode-test-key');
-      await dialog.locator('[name="agent-zcode-api"]').selectOption('anthropic-messages');
-      assert.equal(await dialog.locator('[name=baseUrl]').evaluate(input => input.required), false);
-      await submit.click();
-      await waitSaved();
-      let plan = (await config())['zcode-plan'];
-      assert.equal(plan.baseUrl, '');
-      assert.deepEqual(plan.targets, ['zcode']);
-      assert.equal(plan.agents.zcode.api, 'anthropic-messages');
-      assert.equal(plan.agents.zcode.apiKey, 'zcode-test-key');
-
-      await main.locator('[data-action="provider-models"][data-pid="zcode-plan"]').click();
-      await main.locator('[data-action="add-model"]').first().click();
-      await dialog.locator('[name=agent]').selectOption('zcode');
-      await dialog.locator('[name=id]').fill('zcode-only');
-      await submit.click();
-      await waitSaved();
-      await main.locator('[data-action="add-model"]').first().click();
-      await dialog.locator('[name=id]').fill('default-only');
-      await submit.click();
-      await waitSaved();
-      plan = (await config())['zcode-plan'];
-      assert.deepEqual(plan.models.map(model => model.id), ['default-only']);
-      assert.deepEqual(plan.agents.zcode.models.map(model => model.id), ['zcode-only']);
-
+    await step('legacy agents absent from all daily selection controls',async()=>{
       await go('sync');
-      // 官方模式下 ZCode 不展示覆盖行；先切第三方模式并勾选确认，顺带覆盖模式 UI
-      await main.locator('#zcode-mode').selectOption('third-party');
-      await main.locator('#zcode-optin').check();
-      await main.locator('[data-action="ms-override"][data-target="zcode"]').click();
-      await main.locator('#ms-provider-clients-zcode').selectOption('zcode-plan');
-      const choices = await main.locator('#ms-model-clients-zcode option').evaluateAll(options => options.map(option => option.value));
-      assert.ok(choices.includes('zcode-only'));
-      assert.ok(!choices.includes('default-only'));
-      await main.locator('#ms-model-clients-zcode').selectOption('zcode-only');
-      await main.locator('[data-action="save-modelsync"]').click();
-      await page.waitForFunction(() => !document.body.classList.contains('busy'));
-      const modelsync = await (await page.request.get(`${url}/api/modelsync`)).json();
-      assert.equal(modelsync.modelSync.overrides.zcode.provider, 'zcode-plan');
-      assert.equal(modelsync.resolved.zcode.model, 'zcode-only');
-      await page.screenshot({ path: path.join(artifacts, 'zcode-model-selection.png'), fullPage: true });
+      assert.equal(await main.locator('[data-target="zcode"], [data-target="omp"], [data-target="mcode"]').count(),0);
     });
     await step('sync draft protection and linked alias targets', async () => {
       await go('sync');
       for (const checkbox of await main.locator('.target-check:not(:disabled)').all()) await checkbox.uncheck();
       await main.locator('.target-check[data-target="pi"]').check();
       await main.locator('.target-check[data-target="dsh"]').check();
-      assert.equal(await main.locator('.target-check[data-target="dsh-desktop"]').isChecked(), true);
-      assert.equal(await main.locator('.target-check[data-target="dsh-desktop"]').isDisabled(), true);
+      assert.equal(await main.locator('.target-check[data-target="dsh-desktop"]').count(), 0);
       await page.locator('nav a[href="#models"]').click();
       await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
       await page.locator('#confirm-cancel').click();
@@ -265,8 +216,8 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await main.locator('[data-action="apply-preview"]').click();
       await page.waitForFunction(() => !document.body.classList.contains('busy'));
       assert.equal(await main.locator('.result-row.error').count(), 1);
-      assert.match(await main.locator('.result-row.error').textContent(), /omp/);
-      await main.locator('.target-check[data-target="omp"]').uncheck();
+      assert.match(await main.locator('.result-row.error').textContent(), /Claude Code/);
+      await main.locator('.target-check[data-target="claude"]').uncheck();
       await main.locator('[data-action="run-sync"]').click();
       await page.waitForFunction(() => !document.body.classList.contains('busy'));
       await main.locator('[data-action="apply-preview"]').click();
@@ -414,6 +365,105 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await go('sync');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
       await page.screenshot({ path: path.join(artifacts, 'sync-mobile.png'), fullPage: true });
+    });
+    await step('switch plan: one choice, explicit scope, preview, apply, restore', async () => {
+      await go('sync');
+      await main.locator('.target-check[data-target="pi"]').check();
+      await main.locator('.target-check[data-target="claude"]').check();
+      await main.locator('[data-action="save-targets"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const card = main.locator('#plan-card');
+      await card.locator('#plan-provider').selectOption('deepseek');
+      const options = await card.locator('#plan-model option').evaluateAll(nodes => nodes.map(n => n.value));
+      assert.ok(options.includes('deepseek/model-2'), `plan model options: ${JSON.stringify(options)}`);
+      await card.locator('#plan-model').selectOption('deepseek/model-2');
+      // 只检查不写入：必须一个文件都不写
+      const before = (await (await page.request.get(`${url}/api/status`)).json()).lastSync;
+      await card.locator('[data-action="plan-analyze"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const report = await card.locator('#plan-report').textContent();
+      assert.match(report, /切换清单/);
+      assert.match(report, /Claude Code/);
+      assert.doesNotMatch(report, /test-not-a-real-key/);
+      assert.equal((await (await page.request.get(`${url}/api/status`)).json()).lastSync, before);
+      // 一次选中连接就绪的 Agent
+      await card.locator('[data-action="plan-pick-usable"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const chosen = await card.locator('input[data-plan-pick]:checked').count();
+      assert.ok(chosen >= 2, `expected several agents picked, got ${chosen}`);
+      // 未勾选的 Agent 用「保留客户端当前值」表达，不写它
+      const dsh = card.locator('[data-plan-target="dsh"]');
+      if (await dsh.locator('input[data-plan-pick]').isChecked()) {
+        await dsh.locator('input[data-plan-pick]').uncheck();
+      }
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      await card.locator('select[data-plan-policy="dsh"]').selectOption('keep');
+      assert.equal(await card.locator('[data-plan-target="dsh"].on').count(), 0);
+      // 预览 -> 确认应用
+      await card.locator('[data-action="plan-preview"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      assert.match(await card.locator('#plan-result').textContent(), /将写入|尚未写入客户端|不写入/);
+      await card.locator('[data-action="plan-confirm-apply"]').click();
+      await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator('#confirm-ok').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const status = await (await page.request.get(`${url}/api/status`)).json();
+      assert.ok(status.lastTransaction, 'apply should record a transaction');
+      assert.ok(status.lastResults.length >= 1);
+      const sync = await (await page.request.get(`${url}/api/modelsync`)).json();
+      assert.equal(sync.modelSync.overrides.dsh, undefined);   // keep -> 不写 dsh
+      assert.equal(sync.modelSync.overrides.claude.provider, 'deepseek');
+      await page.screenshot({ path: path.join(artifacts, 'switch-plan.png'), fullPage: true });
+      // 结果区说明还要客户端动手，不宣称会话已经换模；也不回传配置正文或 JSON
+      const resultText = await card.locator('#plan-result').textContent();
+      assert.match(resultText, /重启/);
+      assert.doesNotMatch(resultText, /\{"ok"|planId|ANTHROPIC_AUTH_TOKEN|test-not-a-real-key/);
+      assert.match(resultText, /已写入|将写入/);
+      // 恢复这次切换前的配置（结果区里的按钮）
+      await card.locator('[data-action="restore-sync"]').click();
+      await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator('#confirm-ok').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      assert.match(await page.locator('#toasts').textContent(), /已恢复/);
+    });
+    await step('switch plan: save, reuse and delete a named plan', async () => {
+      await go('sync');
+      const card = main.locator('#plan-card');
+      await card.locator('#plan-provider').selectOption('deepseek');
+      await card.locator('#plan-model').selectOption('deepseek/model-3');
+      await card.locator('[data-action="plan-pick-usable"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      await card.locator('#plan-name').fill('省钱模式');
+      await card.locator('[data-action="plan-save"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const saved = await (await page.request.get(`${url}/api/switch-plans`)).json();
+      assert.equal(saved.store.plans.length, 1);
+      assert.equal(saved.store.plans[0].name, '省钱模式');
+      assert.equal(saved.store.default, saved.store.plans[0].id);
+      assert.equal(saved.store.plans[0].stale, false);
+      // 重新载入并再次应用，不需要重新逐项选择
+      await card.locator('#plan-select').selectOption(saved.store.plans[0].id);
+      await card.locator('[data-action="plan-load"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      assert.equal(await card.locator('#plan-name').inputValue(), '省钱模式');
+      await card.locator('[data-action="plan-preview"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      await card.locator('[data-action="plan-confirm-apply"]').click();
+      await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator('#confirm-ok').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      assert.match(await card.locator('#plan-result').textContent(), /将写入|写入/);
+      // 删除方案时不碰客户端配置
+      const modelsyncBefore = await (await page.request.get(`${url}/api/modelsync`)).json();
+      await card.locator('[data-action="plan-delete"]').click();
+      await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
+      await page.locator('#confirm-ok').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const after = await (await page.request.get(`${url}/api/switch-plans`)).json();
+      assert.equal(after.store.plans.length, 0);
+      assert.equal(after.store.default, null);
+      const modelsyncAfter = await (await page.request.get(`${url}/api/modelsync`)).json();
+      assert.deepEqual(modelsyncAfter.modelSync, modelsyncBefore.modelSync);
     });
     await step('keyboard save, Escape and runtime errors', async () => {
       await go('models');

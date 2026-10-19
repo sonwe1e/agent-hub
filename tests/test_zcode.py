@@ -145,16 +145,24 @@ class ZCodeTests(unittest.TestCase):
         engine.Hub().push_zcode()
         self.assertEqual(self.read_zcode()["config"]["defaultModelSelection"], before)
 
-    def test_unknown_zcode_model_is_rejected_before_write(self):
+    def test_unknown_zcode_model_writes_with_warning(self):
         cfg = self.config()
         cfg["modelSync"] = {"overrides": {"zcode": {
             "provider": "firework", "model": "not-in-zcode-library",
         }}}
         self.save(cfg)
-        before = self.path.read_bytes()
-        with self.assertRaisesRegex(ValueError, "不在 firework 的 zcode 模型库"):
-            engine.Hub().push_zcode()
-        self.assertEqual(self.path.read_bytes(), before)
+        warnings: list[str] = []
+        engine.Hub().push_zcode(warnings=warnings)
+        data = self.read_zcode()["config"]
+        rule = next(r for r in data["providerConfigRules"]["providerRules"]
+                    if r["providerId"] == FIREWORK_ZCODE_ID)
+        # 手填模型补进个人模型列表，defaultModelSelection 才能解析
+        self.assertIn("not-in-zcode-library", rule["config"]["personalModelIds"])
+        self.assertIn("not-in-zcode-library", rule["config"]["modelOrder"])
+        selection = data["defaultModelSelection"]
+        self.assertEqual((selection["providerId"], selection["modelId"]),
+                         (FIREWORK_ZCODE_ID, "not-in-zcode-library"))
+        self.assertTrue(any("不在 firework 的 zcode 模型库" in w for w in warnings))
 
     def test_explicit_protocol_overrides_native_api_and_uses_zcode_credentials(self):
         for protocol, native_protocol in (
@@ -263,28 +271,14 @@ class ZCodeTests(unittest.TestCase):
             server.api_update_provider("zcode-plan", {"agents": {"zcode": {"apiKey": "zcode-test-key"}}})
         self.assertEqual(server.HUB_CONFIG.read_bytes(), before)
 
-    def test_first_edit_of_inherited_zcode_models_keeps_default_catalog_unchanged(self):
+    def test_legacy_model_edits_are_rejected_and_preserved(self):
         cfg = self.config()
         cfg["providers"]["openrouter"]["agents"]["zcode"] = {"api": "openai-responses"}
-        default_models = copy.deepcopy(cfg["providers"]["openrouter"]["models"])
-        for operation in ("add", "update"):
-            with self.subTest(operation=operation):
-                self.save(cfg)
-                if operation == "add":
-                    server.api_add_model("openrouter", {"id": "zcode-only", "agent": "zcode"})
-                else:
-                    server.api_update_model("openrouter", default_models[0]["id"], {
-                        "name": "ZCode-specific name", "agent": "zcode",
-                    })
-                provider = self.config()["providers"]["openrouter"]
-                self.assertEqual(provider["models"], default_models)
-                own_models = provider["agents"]["zcode"]["models"]
-                if operation == "add":
-                    self.assertEqual(own_models[:-1], default_models)
-                    self.assertEqual(own_models[-1]["id"], "zcode-only")
-                else:
-                    self.assertEqual(own_models[0]["name"], "ZCode-specific name")
-                    self.assertEqual(own_models[1:], default_models[1:])
+        self.save(cfg)
+        before = server.HUB_CONFIG.read_bytes()
+        with self.assertRaises(ValueError):
+            server.api_add_model("openrouter", {"id": "zcode-only", "agent": "zcode"})
+        self.assertEqual(server.HUB_CONFIG.read_bytes(), before)
 
 
 class ZCodeModeTests(unittest.TestCase):
@@ -488,22 +482,13 @@ class ZCodeImportTests(unittest.TestCase):
         self.assertEqual(only["models"][0]["contextWindow"], 200000)
         self.assertEqual(only["models"][1]["input"], ["text", "image"])
 
-    def test_scan_endpoint_lists_candidates(self):
-        result = server.api_import_scan("zcode")
-        self.assertEqual([c["id"] for c in result["candidates"]], ["atria"])
-
-    def test_import_then_sync_reaches_other_platforms(self):
-        items = engine.Hub().import_candidates("zcode")
-        result = server.api_import_apply("zcode", {"items": items})
-        self.assertEqual(result["imported"], ["atria"])
-        provider = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))["providers"]["atria"]
-        self.assertEqual(provider["baseUrl"], "https://api.atria.example/v1")
-        self.assertEqual([m["id"] for m in provider["models"]], ["atria-1", "atria-img"])
-        # 导入后立即可同步给其它平台：pi 的模型库出现该供应商
-        engine.Hub().push_pi()
-        pi = json.loads((self.home / ".pi" / "agent" / "models.json").read_text(encoding="utf-8"))
-        self.assertEqual([m["id"] for m in pi["providers"]["atria"]["models"]],
-                         ["atria-1", "atria-img"])
+    def test_legacy_import_endpoints_are_rejected_without_mutation(self):
+        before = server.HUB_CONFIG.read_bytes()
+        with self.assertRaises(ValueError):
+            server.api_import_scan("zcode")
+        with self.assertRaises(ValueError):
+            server.api_import_apply("zcode", {"items": engine.Hub().import_candidates("zcode")})
+        self.assertEqual(server.HUB_CONFIG.read_bytes(), before)
 
     def test_import_rejects_invalid_or_duplicate_ids(self):
         with self.assertRaises(ValueError):

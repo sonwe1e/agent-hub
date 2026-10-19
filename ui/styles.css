@@ -219,8 +219,51 @@ h2 { font-size: 16px; font-weight: 650; letter-spacing: -.3px; }
 .result-symbol .icon { width: 14px; height: 14px; }
 .result-row strong { font-size: 12px; font-weight: 600; color: #6b7388; }
 .result-row p { font-size: 12px; color: #7f8ba1; margin-top: 3px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.diagnostics { margin-top: 16px; color: #a0a7b8; font-size: 11px; }
-.diagnostics summary { cursor: pointer; padding: 8px 0; }
+/* ---- 切换方案 ---- */
+.plan-card { margin-bottom: 22px; }
+.plan-switch { padding: 4px 24px 16px; border-bottom: 1px solid var(--line); }
+.plan-switch .ms-row { align-items: flex-end; }
+.plan-targets { display: grid; gap: 10px; padding: 18px 24px; border-bottom: 1px solid var(--line); }
+.plan-target { border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: #fcfcfe; }
+.plan-target.on { border-color: #cfd6ea; background: #fff; box-shadow: 0 1px 2px rgba(28, 38, 71, .04); }
+.plan-target-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.plan-target-head strong { font-size: 12px; font-weight: 600; color: #656c82; }
+.plan-target-body { margin-top: 9px; }
+.plan-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 11px; color: #7f8ba1; }
+.plan-summary select { flex: 0 1 200px; }
+.plan-effort { color: #a0a6b6; }
+.plan-fixed { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 9px; }
+.plan-fixed select { flex: 1 1 180px; min-width: 0; }
+.plan-allow { font-size: 10px; color: #a0a6b6; flex-basis: 100%; }
+.plan-picker { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; padding: 16px 24px; border-bottom: 1px solid var(--line); }
+.plan-picker .field { display: flex; flex-direction: column; gap: 7px; flex: 1 1 190px; min-width: 170px; }
+.plan-picker .field > span { color: #747c91; font-size: 11px; font-weight: 550; }
+.plan-report, .plan-result { padding: 0 24px; }
+.plan-report h3 { font-size: 12px; font-weight: 600; color: #6b7388; padding: 16px 0 2px; }
+.plan-report:empty, .plan-result:empty { display: none; }
+.plan-issues { list-style: none; margin: 10px 0; display: grid; gap: 8px; }
+.plan-issues li { display: flex; align-items: flex-start; gap: 7px; font-size: 11px; line-height: 1.7; color: #7f8ba1; }
+.plan-issues li.error { color: #b4595c; }
+.plan-issues li .icon { width: 13px; height: 13px; margin-top: 3px; flex-shrink: 0; }
+.plan-issues em { display: block; color: #a0a6b6; font-style: normal; font-size: 10px; }
+.plan-table { width: 100%; border-collapse: collapse; margin: 10px 0 6px; font-size: 11px; }
+.plan-table th { text-align: left; color: #96a0b3; font-weight: 550; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+.plan-table td { padding: 9px 10px; border-bottom: 1px solid #f1f2f7; color: #6b7388; vertical-align: top; }
+.plan-table small { color: #a0a6b6; font-size: 10px; }
+.plan-note { font-size: 10px; color: #a0a6b6; line-height: 1.8; display: flex; align-items: flex-start; gap: 6px; margin: 6px 0 12px; }
+.plan-note .icon { width: 12px; height: 12px; margin-top: 3px; flex-shrink: 0; }
+.plan-client-action { display: flex; align-items: flex-start; gap: 6px; color: #9a8ba6 !important; }
+.plan-client-action .icon { width: 12px; height: 12px; margin-top: 3px; flex-shrink: 0; }
+.plan-files { font-size: 10px !important; color: #a0a6b6 !important; }
+.plan-fallback { margin: 6px 0 14px; font-size: 11px; color: #86909f; }
+.plan-fallback summary { cursor: pointer; padding: 8px 0; }
+.plan-result { padding-bottom: 6px; }
+@media (max-width: 720px) {
+  .plan-summary, .plan-fixed, .plan-picker { align-items: stretch; }
+  .plan-summary select, .plan-fixed select, .plan-picker .field { flex: 1 1 100%; min-width: 0; }
+  .plan-table { display: block; overflow-x: auto; }
+}
+.diagnostics { margin-top: 16px; color: #a0a7b8; font-size: 11px; }.diagnostics summary { cursor: pointer; padding: 8px 0; }
 .diagnostics pre { padding: 16px; background: #f0f2f8; border-radius: 10px; max-height: 260px; overflow: auto; font: 11px/1.8 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .workspace-footer { display: flex; justify-content: space-between; padding: 0 38px 22px; color: #b2b7c6; font-size: 10px; }
 .empty-state { text-align: center; padding: 60px 24px; color: #a1a7b8; white-space: normal; }

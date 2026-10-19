@@ -404,7 +404,7 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(status["agentCapable"]["claude"], ["deepseek", "openrouter"])
         self.assertEqual(status["agentCapable"]["codex"], ["deepseek", "openrouter"])
         self.assertEqual(status["agentCapable"]["pi"], ["deepseek", "stepfun", "openrouter", "firework"])
-        self.assertEqual(status["agentCapable"]["zcode"], ["deepseek", "stepfun", "openrouter", "firework"])
+        self.assertNotIn("zcode", status["agentCapable"])
         # 连接概况：未声明 Claude 连接的供应商显示未就绪
         self.assertTrue(status["connections"]["deepseek"]["claude"]["ready"])
         self.assertFalse(status["connections"]["stepfun"]["claude"]["ready"])

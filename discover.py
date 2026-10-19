@@ -48,7 +48,10 @@ def _norm_model(item: Any) -> dict | None:
         return {"id": item, "name": item}
     if not isinstance(item, dict):
         return None
-    mid = item.get("id") or item.get("model") or item.get("name")
+    # ID 候选覆盖各家网关的字段习惯：OpenAI 用 id，部分网关用 model/name，
+    # Zhipu Coding Plan 的 Responses 线路用 slug + display_name（没有 id 字段）。
+    mid = (item.get("id") or item.get("model") or item.get("name")
+           or item.get("slug") or item.get("display_name"))
     if not mid:
         return None
     name = item.get("name") or item.get("display_name") or mid
@@ -72,13 +75,15 @@ def _norm_model(item: Any) -> dict | None:
             out.setdefault("contextWindow", int(item["context_length"]))
         except (TypeError, ValueError):
             pass
-    arch = item.get("architecture") or {}
+    arch = item.get("architecture")
+    modality = None
     if isinstance(arch, dict):
-        modality = arch.get("input_modalities") or arch.get("modality") or []
-        if isinstance(modality, str):
-            modality = [modality]
-        if modality:
-            out["input"] = [str(m) for m in modality if m]
+        modality = arch.get("input_modalities") or arch.get("modality")
+    modality = modality or item.get("input_modalities") or []
+    if isinstance(modality, str):
+        modality = [modality]
+    if modality:
+        out["input"] = [str(m) for m in modality if m]
     return out
 
 
@@ -128,8 +133,16 @@ def discover_models(provider: dict, agent: str | None = None) -> list[dict]:
     elif not base.endswith("/v1/models"):
         candidates.append((f"{base}/v1/models", {"Authorization": f"Bearer {key}"}))
 
-    errors: list[str] = []
+    # baseUrl 以 /v1 结尾时两个候选会拼出同一个地址；去重避免重复请求与重复报错。
+    unique: list[tuple[str, dict[str, str]]] = []
+    seen_urls: set[str] = set()
     for url, headers in candidates:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique.append((url, headers))
+
+    errors: list[str] = []
+    for url, headers in unique:
         try:
             data = _http_get_json(url, headers)
         except Exception as e:  # noqa: BLE001

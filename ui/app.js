@@ -31,63 +31,42 @@ const icons = {
 const icon = name => `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${icons[name] || icons.grid}</svg>`;
 $$('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-const PAGES = { models: ["模型库", "管理可用模型，让每个 Agent 都用上合适的模型。"], providers: ["供应商", "连接你的模型服务，所有平台共用一份配置。"], sync: ["平台同步", "将本地配置写入多个平台，每次同步都有迹可循。"] };
-const TARGETS = {
-  pi: ["pi", "pi", "模型、授权与默认设置"], mcode: ["mcode", "mc", "MiniMax 自定义供应商"],
-  zcode: ["ZCode", "zc", "供应商规则与模型配置"], dsh: ["dsh", "ds", "CLI 与桌面版共用配置"],
-  "dsh-desktop": ["dsh 桌面版", "ds", "随 dsh 一起同步，无需重复选择"],
-  claude: ["Claude Code", "cc", "Anthropic 环境变量与模型别名"],
-  "cc-switch": ["cc-switch", "cs", "多客户端供应商数据库"], omp: ["omp", "om", "Agent 模型配置"],
-  codex: ["Codex", "cx", "显式选择官方或第三方线路；登录态不动"],
-};
+const PAGES = { agents: ["Agent", "维护实际使用的安装实例与模型选择。"], observe: ["观测", "从实际记录理解使用情况。"], settings: ["设置", "连接、模型与本机采集设置。"], models: ["模型库", "管理可用模型，让每个 Agent 都用上合适的模型。"], providers: ["供应商", "连接你的模型服务，所有平台共用一份配置。"], sync: ["平台同步", "将本地配置写入多个平台，每次同步都有迹可循。"] };
+const TARGETS = {claude:["Claude Code","cc","原生配置"], codex:["Codex","cx","CLI 与桌面版配置"], pi:["pi","pi","模型与默认设置"], dsh:["dsh","ds","CLI 与桌面版共用配置"], "dsh-desktop":["dsh 桌面版","ds","跟随 dsh"]};
 const palette = [["#f0edff", "#9984cd"], ["#fff1e9", "#c99b7b"], ["#edf3ff", "#84a0cf"], ["#edf7f3", "#80af9b"]];
 // 供应商表单里的平台多选：顺序固定，便于用户按习惯找到目标平台。
-const PROVIDER_TARGETS = [["pi", "pi"], ["dsh", "dsh"], ["dsh-desktop", "dsh 桌面版"], ["zcode", "ZCode"], ["claude", "Claude Code"], ["cc-switch", "cc-switch（旧版，不自动写入）"], ["mcode", "mcode"], ["omp", "omp"], ["codex", "Codex"]];
-const DEFAULT_PROVIDER_TARGETS = ["pi", "dsh", "zcode", "claude", "codex"];
-// 可以按 Agent 覆盖连接的目标：端点 / 密钥 / 协议 / 模型都可以只为某个 Agent 配。
-// 同一个网关给不同 Agent 发不同 key 时，各自的模型集合也可以不同。
-const AGENT_OVERRIDES = [
-  ["pi", "pi", "OpenAI 兼容端点"],
-  ["dsh", "dsh（含桌面版）", "OpenAI 兼容端点"],
-  ["zcode", "ZCode", "Chat Completions / Responses / Anthropic 端点"],
-  ["claude", "Claude Code", "Anthropic Messages 端点"],
-  ["codex", "Codex", "Responses 端点（第三方线路）"],
-];
-const AGENT_APIS = { claude: ["anthropic-messages"], codex: ["openai-responses"],
-  zcode: ["openai-completions", "openai-chat-completions", "openai-responses", "anthropic-messages"] };
-const AGENT_LABEL = { pi: "pi", dsh: "dsh", zcode: "ZCode", claude: "Claude", codex: "Codex" };
-const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
-const CODEX_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
-// 模型同步卡片里的客户端行；dsh-desktop 与 dsh 共用配置，不接受单独 override。
-const SYNC_CLIENTS = [["pi", "pi"], ["dsh", "dsh（含桌面版）"], ["zcode", "ZCode"], ["claude", "Claude Code"], ["codex", "Codex"]];
-// 有「官方 / 第三方」双模式的客户端：默认模型选择的接管与归还。
-// official = 不写默认选择（ZCode 仍维护供应商目录；Codex 恢复官方基线）；
-// third-party = 按 Hub 模型设置写入，需要显式 opt-in。
-const MODE_CLIENTS = {
-  codex: {
-    label: "Codex", lineLabel: "Codex 请求线路", noun: "线路",
-    officialOption: "官方 · 恢复原模型与推理强度", thirdPartyOption: "第三方 · 使用 Hub 模型设置",
-    officialTag: "官方线路",
-    optInText: "我明确选择第三方线路，Codex 请求将发送到所选供应商",
-    officialNote: "同步时恢复 Hub 首次切换第三方前保存的官方 model、model_provider 和 reasoning effort；没有保存记录时仅接受现有官方配置；现有第三方线路会拒绝恢复，需先在 Codex 中恢复官方配置。不会更改 auth.json 登录态。",
-    officialKeepNote: "第三方模型覆盖保留在 Hub 中，官方模式不会将这些模型写入 Codex。",
-  },
-  zcode: {
-    label: "ZCode", lineLabel: "ZCode 默认模型", noun: "模式",
-    officialOption: "官方 · 保留当前默认模型", thirdPartyOption: "第三方 · 使用 Hub 模型设置",
-    officialTag: "官方模式",
-    optInText: "我明确选择第三方模式，ZCode 默认模型将切换到所选供应商",
-    officialNote: "官方模式仍会把 Hub 供应商维护进 ZCode 的个人供应商目录，但不会更改默认模型选择；若 Hub 之前接管过默认选择，将恢复接管前保存的选择。ZCode 账号登录（credentials.json）永不触碰。",
-    officialKeepNote: "模型覆盖保留在 Hub 中，官方模式不会更改 ZCode 的默认模型选择；供应商目录照常维护。",
-  },
-};
+const PROVIDER_TARGETS = [["claude","Claude Code"],["codex","Codex"],["pi","pi"],["dsh","dsh"]];
+const DEFAULT_PROVIDER_TARGETS = ["claude","codex","pi","dsh"];
+const AGENT_OVERRIDES = [["claude","Claude Code","Anthropic Messages"],["codex","Codex","Responses"],["pi","pi","OpenAI 兼容端点"],["dsh","dsh（含桌面版）","OpenAI 兼容端点"]];
+const AGENT_APIS = {claude:["anthropic-messages"],codex:["openai-responses"]};
+const AGENT_LABEL = {claude:"Claude Code",codex:"Codex",pi:"pi",dsh:"dsh"};
+const EFFORTS = ["off","minimal","low","medium","high","xhigh","max","ultra"];
+const CODEX_EFFORTS = ["none","minimal","low","medium","high","xhigh","max","ultra"];
+const SYNC_CLIENTS = PROVIDER_TARGETS;
+const MODE_CLIENTS = {codex: {label:"Codex",lineLabel:"Codex 请求线路",noun:"线路",officialOption:"官方 · 恢复原模型与推理强度",thirdPartyOption:"第三方 · 使用 Hub 模型设置",officialTag:"官方线路",optInText:"我明确选择第三方线路，Codex 请求将发送到所选供应商",officialNote:"同步时恢复 Hub 首次切换第三方前保存的官方 model、model_provider 和 reasoning effort；不会更改 auth.json 登录态。",officialKeepNote:"官方模式保留 Hub 的第三方选择。"}};
 const CLAUDE_TIERS = [["opus", "opus 档位"], ["sonnet", "sonnet 档位"], ["haiku", "haiku 档位"], ["subagent", "subagent 档位"]];
+// ---- 切换方案（一次选择，明确应用到多个 Agent）----
+// 参与切换的 Agent 与展示顺序；后端 switch_plans.PLAN_TARGETS 是同一份名单。
+const PLAN_TARGETS = [["claude", "Claude Code"], ["codex", "Codex"], ["pi", "pi"], ["dsh", "dsh（含桌面版）"]];
+// 每个客户端的推理强度词表：Codex 没有 off、多了 none，不能和其它 Agent 混为一谈。
+const PLAN_EFFORTS = {
+  codex: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+  claude: EFFORTS, pi: EFFORTS, dsh: EFFORTS, zcode: EFFORTS,
+};
+// 该客户端有没有"推理强度"这个参数：pi 没有，界面必须如实说"不生效"。
+const PLAN_EFFORT_SUPPORT = { claude: true, codex: true, pi: true, dsh: true, zcode: true };
+const PLAN_POLICY_LABEL = { follow: "跟随本次选择", fixed: "单独指定", keep: "保留客户端当前值" };
+const PLAN_STATUS_LABEL = { ok: "将写入", warning: "将写入（有提示）", skipped: "跳过", error: "不兼容", failed: "写入失败" };
+const emptyPlanDraft = () => ({ base: { provider: "", model: "", reasoningEffort: "" }, targets: [], agents: {} });
 const state = {
   providers: {}, status: null, page: "models", busy: false, loaded: false,
   filters: { query: "", provider: "all", agent: "all", capability: "all" }, modelPage: 1, selection: new Set(),
-  providerQuery: "", targetDraft: {}, clientMode: { codex: "official", zcode: "official" }, clientOptIn: { codex: false, zcode: false }, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [], importCandidates: null, importTarget: "zcode",
+  providerQuery: "", targetDraft: {}, clientMode: { codex: "official", zcode: "official" }, clientOptIn: { codex: false, zcode: false }, preview: null, previewError: "", editor: null, editorSnapshot: "", discovered: [], importCandidates: null, importTarget: "claude",
   modelSync: null, modelSyncError: "", modelSyncLoading: false, modelSyncDraft: null, modelSyncDraftKey: "", modelSyncCustom: {}, modelSyncOpen: new Set(),
   discoverAgent: "",
+  // 切换方案：已保存方案来自后端，草稿是本次要应用的意图。
+  plans: null, plansError: "", planDraft: null, planLoaded: "", planName: "", planDescription: "",
+  planTargets: new Set(), planOverrides: {}, planAnalysis: null, planPreviewResult: null, planBusy: false,
 };
 const pathFor = pid => `/api/providers/${encodeURIComponent(pid)}`;
 const modelKey = (pid, agent, mid) => JSON.stringify([pid, agent || "", mid]);
@@ -97,7 +76,7 @@ const providerColor = pid => palette[Math.max(0, Object.keys(state.providers).in
 const connectionLabel = agent => agent ? (AGENT_LABEL[agent] || agent) : "默认";
 const allModels = () => Object.entries(state.providers).flatMap(([pid, p]) => {
   const groups = [["", p.models || []]];
-  for (const [name, block] of Object.entries(p.agents || {})) groups.push([name, (block && block.models) || []]);
+  for (const [name, block] of Object.entries(p.agents || {}).filter(([agent]) => AGENT_LABEL[agent])) groups.push([name, (block && block.models) || []]);
   return groups.flatMap(([agent, list]) => (list || []).map(m => ({ ...m, pid, agent, key: modelKey(pid, agent, m.id) })));
 });
 // 自定义供应商：把对象渲染成可编辑的 JSON 文本（空对象显示为空白而不是 {}）。
@@ -144,6 +123,7 @@ const knownModels = (pid, target) => new Set([
 const modelChoices = (pid, target) => [...knownModels(pid, target)].sort();
 const cleanEntry = entry => {
   const out = {};
+  if (Array.isArray(entry?.preserveTiers)) out.preserveTiers = [...entry.preserveTiers];
   if (entry?.provider) out.provider = entry.provider;
   if (entry?.model) out.model = entry.model;
   if (entry?.reasoningEffort) out.reasoningEffort = entry.reasoningEffort;
@@ -247,6 +227,318 @@ async function saveModelSync() {
   return { warnings };
 }
 
+// ---- 切换方案：拉取、草稿、渲染、预览、应用 ----
+async function loadPlans() {
+  try {
+    const data = await api("GET", "/api/switch-plans");
+    state.plans = data;
+    state.plansError = "";
+    if (!state.planDraft) state.planDraft = draftFromPlan(data.store.plans.find(p => p.id === data.store.default));
+  } catch (e) {
+    state.plans = null;
+    state.plansError = e.message;
+  }
+}
+// 已保存方案 -> 可编辑草稿；只保留本轮真正会用到的键，避免把失效的旧字段带进新方案。
+function draftFromPlan(plan) {
+  if (!plan) return emptyPlanDraft();
+  const agents = {};
+  for (const [name, spec] of Object.entries(plan.agents || {})) {
+    agents[name] = { policy: spec.policy || "follow", provider: spec.provider || "", model: spec.model || "", reasoningEffort: spec.reasoningEffort || "" };
+  }
+  return {
+    base: { provider: plan.base?.provider || "", model: plan.base?.model || "", reasoningEffort: plan.base?.reasoningEffort || "" },
+    targets: [...(plan.targets || [])],
+    agents,
+  };
+}
+// 草稿 -> 方案请求体；空字段一律省略，不产生"看起来有值其实是空串"的配置。
+function planPayload() {
+  const base = state.planDraft.base || {};
+  // 勾选框就是本次范围：以它为准，而不是草稿里上一次保存的范围。
+  const targets = PLAN_TARGETS.map(([name]) => name).filter(name => state.planTargets.has(name));
+  const plan = { name: state.planName.trim(), description: state.planDescription.trim(), targets };
+  if (base.provider && base.model) {
+    plan.base = { provider: base.provider, model: base.model };
+    if (base.reasoningEffort) plan.base.reasoningEffort = base.reasoningEffort;
+  }
+  const agents = {};
+  for (const name of targets) {
+    const spec = state.planOverrides[name];
+    if (!spec) continue;
+    const entry = { policy: spec.policy || "fixed" };
+    if (entry.policy === "fixed") { entry.provider = spec.provider; entry.model = spec.model; }
+    if (spec.reasoningEffort) entry.reasoningEffort = spec.reasoningEffort;
+    if (spec.allowUnknownModel) entry.allowUnknownModel = true;
+    agents[name] = entry;
+  }
+  if (Object.keys(agents).length) plan.agents = agents;
+  return plan;
+}
+function planDirty() {
+  if (!state.planDraft) return false;
+  return JSON.stringify(planPayload()) !== JSON.stringify(state.planLoaded);
+}
+function planTargetsForModel(provider, model) {
+  // 同一个模型名不代表每条连接都有权限：逐连接判断哪个 Agent 真能用这个模型。
+  const out = [];
+  for (const [name] of PLAN_TARGETS) {
+    const conn = state.plans?.targets?.[name]?.connections?.[provider];
+    if (conn && conn.ready && conn.enabled && conn.models.includes(model)) out.push(name);
+  }
+  return out;
+}
+function planModelOptions(provider) {
+  const seen = new Set();
+  for (const [name] of PLAN_TARGETS) {
+    const conn = state.plans?.targets?.[name]?.connections?.[provider];
+    if (conn && conn.ready && conn.enabled) (conn.models || []).forEach(m => seen.add(m));
+  }
+  return [...seen].sort();
+}
+function planProviderIds() {
+  const seen = new Set();
+  for (const [name] of PLAN_TARGETS) {
+    Object.entries(state.plans?.targets?.[name]?.connections || {}).forEach(([pid, conn]) => {
+      if (conn.ready && conn.enabled) seen.add(pid);
+    });
+  }
+  return [...seen].sort((a, b) => providerName(a).localeCompare(providerName(b)));
+}
+function planIssueList(analysis, severity) {
+  const items = (analysis?.issues || []).filter(i => i.severity === severity);
+  if (!items.length) return "";
+  return `<ul class="plan-issues">${items.map(i => `<li class="${esc(severity)}">${icon(severity === "error" ? "alert" : "info")}<span>${i.target ? `<strong>${esc(PLAN_TARGETS.find(t => t[0] === i.target)?.[1] || i.target)}</strong> ` : ""}${esc(i.message)}${i.fix ? `<em>建议：${esc(i.fix)}</em>` : ""}</span></li>`).join("")}</ul>`;
+}
+function planResultRows(result) {
+  const rows = result?.results || result?.analysis?.details?.map(d => ({ ...d, message: d.reason })) || [];
+  if (!rows.length) return "";
+  return rows.map(row => {
+    const status = row.status === "warning" ? "ok" : row.status;
+    const effort = row.effort || {};
+    const effortText = effort.support === "unsupported"
+      ? "该客户端没有推理强度参数"
+      : effort.requested ? `强度 ${effort.requested}` : (effort.current ? `保留当前强度 ${effort.current}` : "未指定强度");
+    const tiers = (row.tiers || []).length ? ` · 档位 ${row.tiers.map(t => `${t.tier}:${t.action === "clear" ? "清除" : t.provider + "/" + t.model}`).join("、")}` : "";
+    const files = (row.files || []).length ? `<p class="mono plan-files">${row.files.map(f => esc(f.path)).join("<br />")}</p>` : "";
+    return `<div class="result-row ${status === "ok" ? "" : "error"}"><div class="result-symbol">${icon(status === "ok" ? "check" : status === "skipped" ? "clock" : "x")}</div><div>
+      <strong>${esc(row.label || row.target)}</strong>
+      <p>${esc(PLAN_STATUS_LABEL[row.status] || row.status)} · ${row.provider ? `${esc(row.provider)} / ${esc(row.model)}` : "未指定模型"} · ${esc(effortText)}${esc(tiers)}</p>
+      ${row.message ? `<p>${esc(row.message)}</p>` : ""}
+      ${row.needsClientAction ? `<p class="plan-client-action">${icon("info")}${esc(row.needsClientAction)}</p>` : ""}
+      ${files}</div><span class="tag ${status === "ok" ? "green" : "amber"}" style="margin-left:auto">${esc(PLAN_STATUS_LABEL[row.status] || row.status)}</span></div>`;
+  }).join("");
+}
+function fallbackPanel(diag) {
+  if (!diag || !(diag.routes || []).length) return "";
+  const rows = diag.routes.map(route => {
+    const bad = (route.checks || []).filter(c => !c.usable);
+    const detail = bad.length
+      ? bad.map(c => `${PLAN_TARGETS.find(t => t[0] === c.target)?.[1] || c.target}：${c.reason}`).join("；")
+      : "约束与连接检查都通过";
+    return `<li class="${route.usable ? "ok" : ""}">${icon(route.usable ? "check" : "alert")}<span><strong>${esc(route.label)}</strong> · ${esc(detail)}</span></li>`;
+  }).join("");
+  const unknown = (diag.unknowns || []).length ? `<p class="plan-note">未知信息（不猜）：${esc(diag.unknowns.join("、"))}</p>` : "";
+  return `<details class="plan-fallback"><summary>备用线路诊断（白名单顺序 · 不自动执行）</summary>
+    <p class="plan-note">${esc(diag.note)}</p><ul class="plan-issues">${rows}</ul>
+    <p class="plan-note">自动切换还缺：${esc((diag.autoSwitchBlockedBy || []).join(" "))}</p>${unknown}</details>`;
+}
+function planTargetRow(name, label) {
+  const selected = state.planTargets.has(name);
+  const base = state.planDraft.base || {};
+  const spec = state.planOverrides[name];
+  const policy = spec?.policy || "follow";
+  const provider = policy === "fixed" ? spec.provider : (base.provider || "");
+  const model = policy === "fixed" ? spec.model : (base.model || "");
+  const conn = provider ? state.plans?.targets?.[name]?.connections?.[provider] : null;
+  const ready = !!(conn && conn.ready && conn.enabled);
+  const known = !!(conn && model && conn.models.includes(model));
+  const effort = policy === "fixed" ? (spec.reasoningEffort || "") : (base.reasoningEffort || "");
+  const effortOk = !effort || (PLAN_EFFORTS[name] || EFFORTS).includes(effort);
+  const choices = provider ? planModelOptions(provider) : [];
+  const ownProviders = Object.entries(state.plans?.targets?.[name]?.connections || {})
+    .filter(([, c]) => c.ready && c.enabled).map(([pid]) => pid);
+  const connNote = !selected ? "未参与本次切换"
+    : !provider ? "还没有选主模型"
+    : !ready ? `${provider} 没有可用的 ${label} 连接`
+    : !model ? "还没有选模型"
+    : known ? "连接就绪、模型在该连接上"
+    : "模型不在该连接的模型库里";
+  return `<div class="plan-target ${selected ? "on" : ""}" data-plan-target="${esc(name)}">
+    <label class="plan-target-head"><input type="checkbox" data-plan-pick="${esc(name)}" ${selected ? "checked" : ""} aria-label="让 ${esc(label)} 参与本次切换" /><strong>${esc(label)}</strong>
+      <span class="tag ${!selected ? "" : ready && known ? "green" : "amber"}">${esc(connNote)}</span></label>
+    <div class="plan-target-body">
+      <div class="plan-summary">${provider ? `<span class="mono">${esc(provider)} / ${esc(model || "—")}</span>` : "<span>—</span>"}
+        <span class="plan-effort">${esc(effort ? `强度 ${effort}` : "强度跟随默认")}${effort && !effortOk ? `（${esc(label)} 不支持！）` : ""}${effort && !PLAN_EFFORT_SUPPORT[name] ? "（该客户端无此参数）" : ""}</span>
+        <select data-plan-policy="${esc(name)}" aria-label="${esc(label)} 的取值方式">
+          ${["follow", "fixed", "keep"].map(p => `<option value="${p}" ${policy === p ? "selected" : ""}>${esc(PLAN_POLICY_LABEL[p])}</option>`).join("")}
+        </select></div>
+      ${policy === "fixed" ? `<div class="plan-fixed">
+        <select data-plan-provider="${esc(name)}" aria-label="${esc(label)} 供应商"><option value="">选择供应商</option>${ownProviders.map(pid => `<option value="${esc(pid)}" ${pid === spec.provider ? "selected" : ""}>${esc(providerName(pid))}</option>`).join("")}</select>
+        <select data-plan-model="${esc(name)}" aria-label="${esc(label)} 模型"><option value="">选择模型</option>${choices.map(m => `<option value="${esc(m)}" ${m === spec.model ? "selected" : ""}>${esc(m)}</option>`).join("")}${spec.model && !choices.includes(spec.model) ? `<option value="${esc(spec.model)}" selected>${esc(spec.model)}（不在该连接模型库）</option>` : ""}</select>
+        <select data-plan-effort="${esc(name)}" aria-label="${esc(label)} 推理强度"><option value="">强度：跟随本次选择</option>${(PLAN_EFFORTS[name] || EFFORTS).map(v => `<option value="${v}" ${v === spec.reasoningEffort ? "selected" : ""}>${esc(effortLabel(v))}</option>`).join("")}</select>
+        ${known ? "" : `<label class="check-label plan-allow"><input type="checkbox" data-plan-allow="${esc(name)}" ${spec.allowUnknownModel ? "checked" : ""} />该模型不在连接模型库里，仍按手填值写入</label>`}
+      </div>` : ""}
+    </div></div>`;
+}
+function planCard() {
+  const header = `<div class="card-heading"><div><h2>切换方案</h2><p>选一次模型，勾上要跟着换的 Agent，先看清单再确认；方案可以存下来反复用。</p></div>${state.planBusy ? `<span class="tag amber">处理中…</span>` : planDirty() ? `<span class="tag amber">清单有改动</span>` : `<span class="tag">未改动</span>`}</div>`;
+  if (state.plansError) {
+    return `<section class="card plan-card" id="plan-card">${header}<div class="notice warn" id="plan-warning">${icon("alert")}<div><strong>切换方案接口不可用</strong><br />${esc(state.plansError)}<br />其余同步功能不受影响。</div></div></section>`;
+  }
+  if (!state.plans) return `<section class="card plan-card" id="plan-card">${header}<div class="load-state"><span class="spinner"></span><p>正在读取切换方案…</p></div></section>`;
+  const saved = state.plans.store.plans || [];
+  const base = state.planDraft.base || {};
+  const providers = planProviderIds();
+  const models = base.provider ? planModelOptions(base.provider) : [];
+  const usable = base.provider && base.model ? planTargetsForModel(base.provider, base.model) : [];
+  const chosen = [...state.planTargets];
+  const stuck = chosen.filter(n => !usable.includes(n));
+  const options = saved.length
+    ? saved.map(p => `<option value="${esc(p.id)}" ${p.id === state.planLoaded?.id ? "selected" : ""}>${esc(p.name)}${p.stale ? "（引用已失效）" : ""}</option>`).join("")
+    : "";
+  const planPicker = `<div class="plan-picker">
+    <label class="field"><span>已保存方案</span><select id="plan-select" aria-label="已保存的切换方案"><option value="">— 新方案 —</option>${options}</select></label>
+    <div class="actions"><button class="small" type="button" data-action="plan-load">载入</button>
+      <button class="small ghost" type="button" data-action="plan-duplicate" ${state.planLoaded ? "" : "disabled"}>复制为新方案</button>
+      <button class="small ghost" type="button" data-action="plan-delete" ${state.planLoaded ? "" : "disabled"}>删除</button></div>
+    <label class="field"><span>方案名称</span><input id="plan-name" value="${esc(state.planName)}" placeholder="例如：省钱模式" /></label>
+    <label class="field"><span>说明（可选）</span><input id="plan-description" value="${esc(state.planDescription)}" placeholder="这份方案什么时候用" /></label>
+    <div class="actions"><button class="small" type="button" data-action="plan-save" data-write>${state.planLoaded ? "更新这个方案" : "保存为新方案"}</button></div>
+  </div>`;
+  const stale = state.planLoaded && state.plans.store.plans.find(p => p.id === state.planLoaded.id)?.stale;
+  const staleNotice = stale ? `<div class="notice warn">${icon("alert")}<div><strong>这份方案引用的供应商或模型已经不存在</strong><br />失效的引用会逐条列出，<b>不会自动换成别的模型</b>；请重新选择后再应用。</div></div>` : "";
+  return `<section class="card plan-card" id="plan-card">${header}
+    ${staleNotice}
+    <div class="plan-switch">
+      <div class="ms-row">
+        <label class="ms-field"><span>选一个模型 · 供应商</span><select id="plan-provider" aria-label="切换目标供应商"><option value="">请选择供应商</option>${providers.map(pid => `<option value="${esc(pid)}" ${pid === base.provider ? "selected" : ""}>${esc(providerName(pid))}</option>`).join("")}</select></label>
+        <label class="ms-field"><span>模型</span><select id="plan-model" aria-label="切换目标模型" ${base.provider ? "" : "disabled"}><option value="">${base.provider ? "请选择模型" : "先选择供应商"}</option>${models.map(m => `<option value="${esc(m)}" ${m === base.model ? "selected" : ""}>${esc(m)}${usable.includes(m) || base.model !== m ? "" : ""}</option>`).join("")}${base.model && !models.includes(base.model) ? `<option value="${esc(base.model)}" selected>${esc(base.model)}（不在该连接模型库）</option>` : ""}</select></label>
+        <label class="ms-field"><span>推理强度（可选）</span><select id="plan-effort" aria-label="切换目标推理强度"><option value="">各 Agent 保留当前值 / 各自词表</option>${EFFORTS.concat(["none"]).map(v => `<option value="${v}" ${v === base.reasoningEffort ? "selected" : ""}>${esc(effortLabel(v))}</option>`).join("")}</select></label>
+        <div class="ms-field"><span>一次选中可用它的 Agent</span><button class="small" type="button" data-action="plan-pick-usable" ${usable.length ? "" : "disabled"}>选中 ${usable.length} 个连接就绪的 Agent</button></div>
+      </div>
+      <p class="ms-hint">${icon("info")}${base.provider && base.model
+        ? `模型 <span class="mono">${esc(base.model)}</span> 在 ${usable.length} 个 Agent 的连接上可用${stuck.length ? `；<b>${esc(stuck.map(n => PLAN_TARGETS.find(t => t[0] === n)?.[1] || n).join("、"))}</b> 的连接上没有它，会在下面单独标出` : ""}。`
+        : "先选供应商与模型；下面每个 Agent 的连接会分别核对，同一个模型名不代表每条连接都有权限。"}</p>
+    </div>
+    <div class="plan-targets">${PLAN_TARGETS.map(([name, label]) => planTargetRow(name, label)).join("")}</div>
+    ${planPicker}
+    <div class="table-footer"><span class="ms-foot-note">${icon("shield")}预览会先说明每个目标实际会写什么、跳过什么；密钥不会出现在预览里。</span>
+      <div class="actions">
+        <button class="small ghost" type="button" data-action="plan-analyze" ${chosen.length ? "" : "disabled"}>只检查不写入</button>
+        <button class="small" type="button" data-action="plan-preview" data-write ${chosen.length && base.provider && base.model ? "" : "disabled"}>预览这次切换</button>
+        <button class="primary small" type="button" data-action="plan-apply" data-write ${chosen.length && base.provider && base.model ? "" : "disabled"}>应用这次切换</button>
+      </div></div>
+    <div id="plan-report" class="plan-report">${state.planAnalysis ? `<h3>切换清单</h3>${planIssueList(state.planAnalysis, "error")}${planTargetsReport(state.planAnalysis)}${planIssueList(state.planAnalysis, "warning")}${fallbackPanel(state.planAnalysis.fallback)}` : ""}</div>
+    <div id="plan-result" class="plan-result">${state.planPreviewResult ? planResultRows(state.planPreviewResult) : ""}</div>
+    ${state.planPreviewResult?.planId ? `<div class="table-footer"><span>预览已生成，尚未写入客户端。确认后只应用本次预览。</span><div class="actions"><button class="small ghost" type="button" data-action="plan-cancel">取消预览</button><button class="primary small" type="button" data-action="plan-confirm-apply" data-write>确认应用并写入客户端</button></div></div>` : ""}
+    ${state.planPreviewResult?.transactionId ? `<div class="table-footer"><span>${esc(state.planPreviewResult.disclaimer || "")}</span><div class="actions"><button class="small" type="button" data-action="restore-sync" data-write>恢复这次切换前的配置</button></div></div>` : ""}
+  </section>`;
+}
+function planTargetsReport(analysis) {
+  const details = analysis?.details || [];
+  if (!details.length) return "";
+  const rows = details.map(d => {
+    const effortText = d.effort?.support === "unsupported" ? "该客户端没有推理强度参数"
+      : d.effort?.requested ? `强度 ${d.effort.requested}`
+      : d.effort?.current ? `保留当前强度 ${d.effort.current}` : "不改强度";
+    return `<tr><td>${esc(d.label)}</td><td class="mono">${d.provider ? esc(`${d.provider} / ${d.model}`) : "—"}</td><td>${esc(effortText)}</td>
+      <td><span class="tag ${d.status === "ok" ? "green" : d.status === "skipped" ? "" : "amber"}">${esc(PLAN_STATUS_LABEL[d.status] || d.status)}</span>${d.reason ? `<br /><small>${esc(d.reason)}</small>` : ""}</td></tr>`;
+  }).join("");
+  return `<table class="plan-table"><thead><tr><th>Agent</th><th>供应商 / 模型</th><th>推理强度</th><th>本次结果</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="plan-note">${icon("info")}写入原生配置成功不等于正在运行的会话已经换模；${esc(analysis.disclaimer || "")}</p>`;
+}
+function renderPlanCard() {
+  const card = $("#plan-card");
+  if (card) card.outerHTML = planCard();
+}
+async function planAnalyze() {
+  const payload = planPayload();
+  if (!payload.targets.length) throw new Error("请至少勾选一个参与本次切换的 Agent。");
+  const data = await api("POST", "/api/switch-plans/analyze", { plan: payload, targets: payload.targets });
+  state.planAnalysis = data;
+  renderPlanCard();
+  return data;
+}
+async function planPreview() {
+  const payload = planPayload();
+  const data = await api("POST", "/api/switch-plans/preview", { plan: payload, targets: payload.targets });
+  state.planAnalysis = data.analysis || state.planAnalysis;
+  state.planPreviewResult = data.ok ? data : null;
+  renderPlanCard();
+  if (!data.ok) throw new Error(data.error || "本次方案有未解决的不兼容项，没有写入任何文件。");
+  return data;
+}
+async function planApply() {
+  const payload = planPayload();
+  const data = await api("POST", "/api/switch-plans/apply", { plan: payload, targets: payload.targets });
+  state.planAnalysis = data.analysis || state.planAnalysis;
+  state.planPreviewResult = data.planId ? data : (data.ok ? data : null);
+  renderPlanCard();
+  if (!data.ok) throw new Error(data.error || (data.results || []).map(r => r.message).join("；") || "写入被拒绝。");
+  return data;
+}
+async function savePlan() {
+  const payload = planPayload();
+  if (!payload.name) throw new Error("请先给方案起一个名字。");
+  if (!payload.targets.length) throw new Error("请至少勾选一个参与本次切换的 Agent。");
+  if (!payload.base && !Object.keys(payload.agents || {}).length) throw new Error("请先选择主模型，或至少为某个 Agent 单独指定模型。");
+  const store = state.plans?.store || { version: 1, default: null, plans: [] };
+  const plans = Object.fromEntries((store.plans || []).map(p => [p.id, stripPlanView(p)]));
+  const existing = store.plans.find(p => p.name === payload.name);
+  const id = existing?.id || planSlug(payload.name, plans);
+  plans[id] = payload;
+  const data = await api("PUT", "/api/switch-plans", { switchPlans: { version: 1, default: id, plans } });
+  state.plans = { ...(state.plans || {}), store: data.store };
+  state.planLoaded = { id, name: payload.name };
+  state.planLoadedPayload = JSON.parse(JSON.stringify(payload));
+  state.planName = payload.name;
+  renderPlanCard();
+  return existing ? `已更新方案「${payload.name}」` : `已保存方案「${payload.name}」`;
+}
+function planSlug(name, plans) {
+  const base = String(name).trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "plan";
+  let id = base, n = 2;
+  while (plans[id]) id = `${base}-${n++}`;
+  return id;
+}
+// 只把方案本体写回后端；stale / refs / updatedAt 是后端算出来的展示字段。
+function stripPlanView(plan) {
+  const out = { name: plan.name, description: plan.description || "", targets: [...(plan.targets || [])] };
+  if (plan.base) out.base = { ...plan.base };
+  if (plan.agents && Object.keys(plan.agents).length) out.agents = JSON.parse(JSON.stringify(plan.agents));
+  if (plan.fallback) out.fallback = JSON.parse(JSON.stringify(plan.fallback));
+  return out;
+}
+async function deletePlan() {
+  if (!state.planLoaded) return;
+  const data = await api("DELETE", `/api/switch-plans/${encodeURIComponent(state.planLoaded.id)}`, {});
+  state.plans = { ...(state.plans || {}), store: data.store };
+  state.planLoaded = null;
+  state.planLoadedPayload = null;
+  state.planDraft = emptyPlanDraft();
+  state.planTargets = new Set();
+  state.planOverrides = {};
+  state.planName = ""; state.planDescription = "";
+  state.planAnalysis = null; state.planPreviewResult = null;
+  renderPlanCard();
+  return data.defaultCleared ? "方案已删除；它原本是默认方案，默认指针也一并清空了。" : "方案已删除。";
+}
+function loadPlanIntoDraft(plan) {
+  state.planDraft = draftFromPlan(plan);
+  state.planTargets = new Set(plan.targets || []);
+  state.planOverrides = {};
+  for (const [name, spec] of Object.entries(plan.agents || {})) {
+    if ((spec.policy || "follow") !== "follow") {
+      state.planOverrides[name] = { policy: spec.policy || "fixed", provider: spec.provider || "", model: spec.model || "", reasoningEffort: spec.reasoningEffort || "", allowUnknownModel: !!spec.allowUnknownModel };
+    }
+  }
+  state.planName = plan.name; state.planDescription = plan.description || "";
+  state.planLoaded = { id: plan.id, name: plan.name };
+  state.planLoadedPayload = JSON.parse(JSON.stringify(planPayload()));
+  state.planAnalysis = null; state.planPreviewResult = null;
+}
+
 function toast(message, type = "ok") {
   const el = document.createElement("div");
   el.className = `toast ${type === "error" ? "error" : ""}`;
@@ -301,7 +593,7 @@ async function busy(label, task) {
 async function reload() {
   invalidatePreview();
   const keepDraft = state.loaded && targetDirty();
-  const [providers, status] = await Promise.all([api("GET", "/api/providers"), api("GET", "/api/status"), loadModelSync()]);
+  const [providers, status] = await Promise.all([api("GET", "/api/providers"), api("GET", "/api/status"), loadModelSync(), loadPlans()]);
   state.providers = providers.providers || {};
   state.status = status;
   if (!keepDraft) resetTargetDraft();
@@ -418,7 +710,7 @@ function renderProviderCards() {
   const entries = Object.entries(state.providers).filter(([pid]) => `${pid} ${providerName(pid)}`.toLocaleLowerCase().includes(q));
   $("#provider-cards").innerHTML = entries.map(([pid, p]) => {
     const color = providerColor(pid);
-    return `<article class="card provider-card"><div class="provider-card-head"><div class="avatar" style="--avatar-bg:${color[0]};--avatar-color:${color[1]}">${esc(providerName(pid).slice(0, 1).toUpperCase())}</div><div><h3>${esc(providerName(pid))}</h3><div class="provider-id">${esc(pid)}</div></div><span class="tag ${p.enabled !== false ? "green" : ""}">${p.enabled !== false ? "已启用" : "已停用"}</span></div><div class="provider-url">${icon("link")}<span title="${esc(p.baseUrl)}">${esc(p.baseUrl || "未配置端点")}</span></div><div class="provider-meta"><span>${icon("grid")}${allModels().filter(m => m.pid === pid).length} 个模型</span><span>${icon("key")}${p.apiKey ? "密钥已配置" : "未配置密钥"}</span>${AGENT_OVERRIDES.map(([name, label]) => { const c = state.status?.connections?.[pid]?.[name]; if (!c || !c.ready) return ""; const over = c.overridden ? "*" : ""; return `<span class="tag purple" title="${esc(label)} 连接已就绪${over ? "（按 Agent 覆盖）" : ""}">${esc(label)}</span>`; }).join("")}${p.targets?.length ? `<span class="tag" title="仅同步到：${esc(p.targets.join(", "))}">平台受限</span>` : ""}</div><div class="provider-card-footer"><button class="ghost small" data-action="provider-models" data-pid="${esc(pid)}">查看模型${icon("arrow")}</button><div class="actions"><button class="small" data-action="discover" data-write data-pid="${esc(pid)}">${icon("sparkles")}检测模型</button><button class="small" data-action="edit-provider" data-pid="${esc(pid)}">${icon("edit")}配置</button></div></div></article>`;
+    return `<article class="card provider-card"><div class="provider-card-head"><div class="avatar" style="--avatar-bg:${color[0]};--avatar-color:${color[1]}">${esc(providerName(pid).slice(0, 1).toUpperCase())}</div><div><h3>${esc(providerName(pid))}</h3><div class="provider-id">${esc(pid)}</div></div><span class="tag ${p.enabled !== false ? "green" : ""}">${p.enabled !== false ? "已启用" : "已停用"}</span></div><div class="provider-url">${icon("link")}<span title="${esc(p.baseUrl)}">${esc(p.baseUrl || "未配置端点")}</span></div><div class="provider-meta"><span>${icon("grid")}${allModels().filter(m => m.pid === pid).length} 个模型</span><span>${icon("key")}${p.apiKey ? "密钥已配置" : "未配置密钥"}</span>${AGENT_OVERRIDES.map(([name, label]) => { const c = state.status?.connections?.[pid]?.[name]; if (!c || !c.ready) return ""; const over = c.overridden ? "*" : ""; return `<span class="tag purple" title="${esc(label)} 连接已就绪${over ? "（按 Agent 覆盖）" : ""}">${esc(label)}</span>`; }).join("")}${p.targets?.length ? `<span class="tag" title="仅同步到：${esc(p.targets.filter(t=>AGENT_LABEL[t]).join(", "))}">平台受限</span>` : ""}</div><div class="provider-card-footer"><button class="ghost small" data-action="provider-models" data-pid="${esc(pid)}">查看模型${icon("arrow")}</button><div class="actions"><button class="small" data-action="discover" data-write data-pid="${esc(pid)}">${icon("sparkles")}检测模型</button><button class="small" data-action="edit-provider" data-pid="${esc(pid)}">${icon("edit")}配置</button></div></div></article>`;
   }).join("") + (q && !entries.length ? `<div class="card">${empty("search", "没有找到供应商", "尝试其他关键词。")}</div>` : "") + `<button class="card provider-add-card" data-action="add-provider">${icon("plus")}连接新的供应商<small>OpenAI / Anthropic 兼容服务</small></button>`;
 }
 
@@ -427,14 +719,15 @@ function renderSync() {
   $("#content").innerHTML = heading(`<button data-action="detect-sync" data-write>${icon("refresh")}检测变更并预览</button><button class="primary" data-action="run-sync" data-write id="sync-primary">${icon("sync")}预览已选平台</button>`) + `
     <div class="notice ${pending ? "warn" : ""}">${icon(pending ? "clock" : "shield")}<div><strong>${pending ? "本地配置有更新，等待同步到平台" : "本地配置已同步到所有启用平台"}</strong><br />${pending ? "以 Hub 为准写入已选平台；未选平台保持不变。" : "你可以再次同步，或先检测客户端配置是否有变化。"} 写入前会备份原配置。</div></div>
     <section id="sync-preview" class="card sync-preview" aria-live="polite" hidden></section>
-    <section class="card modelsync-card" id="modelsync-card" aria-label="多 agent 使用的模型"></section>
-    <div class="sync-layout"><section class="card"><div class="card-heading"><div><h2>同步到哪些平台？</h2><p>dsh 桌面版与 CLI 联动；官方授权不在管理范围内。</p></div><span class="tag" id="target-count"></span></div><div class="target-grid">${Object.entries(state.status.targets || {}).map(([name, t]) => {
+    ${planCard()}
+    <section class="card modelsync-card" id="modelsync-card" aria-label="多 agent 使用的模型（精细设置）"></section>
+    <div class="sync-layout"><section class="card"><div class="card-heading"><div><h2>同步到哪些平台？</h2><p>dsh 桌面版与 CLI 联动；官方授权不在管理范围内。</p></div><span class="tag" id="target-count"></span></div><div class="target-grid">${Object.entries(state.status.targets || {}).filter(([name]) => AGENT_LABEL[name]).map(([name, t]) => {
       const [title, short, desc] = TARGETS[name] || [name, name.slice(0, 2), t.notes || "模型配置"];
       const readonly = !!t.aliasOf || !t.supported;
       const enabled = t.aliasOf ? state.targetDraft[t.aliasOf] : state.targetDraft[name];
       const existing = (t.files || []).filter(f => f.exists).length;
       return `<label class="target-card ${enabled ? "enabled" : ""} ${readonly ? "readonly" : ""}" data-target="${esc(name)}"><div class="target-top"><span class="target-symbol">${esc(short)}</span><h3>${esc(title)}</h3><input type="checkbox" class="target-check" data-target="${esc(name)}" aria-label="同步到 ${esc(title)}" ${enabled ? "checked" : ""} ${readonly ? "disabled" : ""} /></div><div class="target-desc">${esc(desc)}</div><div class="target-state">${icon(readonly ? "link" : "shield")}${t.aliasOf ? `跟随 ${esc(t.aliasOf)}` : !t.supported ? "不自动写入" : `${existing} / ${t.files?.length || 0} 个配置文件已存在`}</div></label>`;
-    }).join("")}</div><div class="table-footer"><span id="target-draft-status"></span><div class="table-footer"><span id="target-draft-status"></span><div class="actions"><button class="small ghost" data-action="reset-targets" id="reset-targets">撤销更改</button><button class="small" data-action="save-targets" data-write id="save-targets">保存平台设置</button></div></div></section>
+    }).join("")}</div><div class="table-footer"><span id="target-draft-status"></span><div class="actions"><button class="small ghost" data-action="reset-targets" id="reset-targets">撤销更改</button><button class="small" data-action="save-targets" data-write id="save-targets">保存平台设置</button></div></div></section>
     <section class="card"><div class="card-heading"><div><h2>最近同步结果</h2><p>${state.status.lastSync ? `执行于 ${esc(dateLabel(state.status.lastSync))}` : "同步后，这里会显示每个平台的执行结果。"}</p></div>${state.status.lastTransaction ? `<button class="small" data-action="restore-sync" data-write>恢复上次同步</button>` : state.status.lastSync ? `<span class="tag">${icon("clock")}最近一次</span>` : ""}</div><div class="sync-results" id="sync-results">${renderResults(state.status.lastResults || [])}</div></section></div>
     <details class="diagnostics"><summary>查看配置路径与诊断信息</summary><pre>${esc(state.status.configPath)}\n\n${esc(state.status.statusText)}${state.status.changedFiles?.length ? `\n\n检测到外部变更：\n${esc(state.status.changedFiles.join("\n"))}` : ""}</pre></details>`;
   updateTargetDraftUI();
@@ -591,7 +884,7 @@ function modelSyncCard() {
   const defaultProvider = draft.default?.provider || "";
   const defaultModel = draft.default?.model || "";
   const dirty = modelSyncDirty();
-  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）、ZCode、Claude Code 与显式选择第三方线路的 Codex；改完保存，预览后再应用。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
+  const header = `<div class="card-heading"><div><h2>多 agent 使用的模型</h2><p>一份设置，对齐 pi、dsh（含桌面版）、Claude Code 与显式选择第三方线路的 Codex；改完保存，预览后再应用。</p></div><span class="tag ${dirty ? "amber" : ""}" id="modelsync-state">${dirty ? "有未保存修改" : "已保存到本地"}</span></div>`;
   if (warn) {
     return `${header}<div class="notice warn" id="modelsync-warning">${icon("alert")}<div><strong>模型设置接口不可用</strong><br />${esc(warn)}<br />下面的选择会先留在页面上，但无法保存或读取解析结果；确认服务已更新后点右侧按钮重试。</div><div class="actions"><button class="small" type="button" data-action="reload-modelsync">${icon("refresh")}重新读取</button></div></div><div class="ms-global"><div class="ms-global-note">${icon("info")}<div>接口 <span class="mono">GET /api/modelsync</span> 暂时不可用，解析状态无法展示；供应商与模型下拉仍可正常使用。</div></div></div><div class="table-footer"><span class="ms-foot-note">${icon("info")}保存只写入 Hub 配置；客户端文件需先预览并确认应用。</span><div class="actions"><button class="small ghost" type="button" data-action="ms-reset" ${dirty ? "" : "disabled"}>撤销更改</button><button class="small" type="button" data-action="save-modelsync" data-write disabled>保存模型设置</button></div></div>`;
   }
@@ -605,12 +898,11 @@ function modelSyncCard() {
         ${modelRow("default", "default", "", draft.default || {}, null, defaultProvider, "全局主模型 · 模型")}
         <label class="ms-field"><span>推理强度（可选）</span><select id="ms-default-effort" data-ms-effort data-scope="default" data-target="default" aria-label="推理强度"><option value="">不改客户端现有值</option>${EFFORTS.map(v => `<option value="${esc(v)}" ${v === draft.default?.reasoningEffort ? "selected" : ""}>${esc(effortLabel(v))}</option>`).join("")}</select></label>
       </div>
-      <p class="ms-hint">留空时其他客户端保留现有强度；Codex 第三方模式会移除旧强度，官方模式恢复之前保存的值。</p>
+      <p class="ms-hint">留空时保留客户端现有强度；Codex 官方模式恢复之前保存的值。</p>
     </div>
     <div class="ms-clients">
       ${clientRow("pi", "pi")}
       ${clientRow("dsh", "dsh（含桌面版）")}
-      ${clientRow("zcode", "ZCode")}
       ${claudeRow()}
       ${clientRow("codex", "Codex")}
     </div>
@@ -731,7 +1023,7 @@ async function restoreSync() {
 function showEditor(type, title, body, footer, context = {}) {
   state.editor = { type, ...context };
   $("#editor-title").textContent = title;
-  $("#editor-eyebrow").textContent = type === "discover" ? "MODEL DISCOVERY" : type === "provider" ? "PROVIDER SETTINGS" : "MODEL SETTINGS";
+  $("#editor-eyebrow").textContent = type === "read-only" ? "只读详情" : type === "discover" ? "MODEL DISCOVERY" : type === "provider" ? "PROVIDER SETTINGS" : "MODEL SETTINGS";
   $("#editor-body").innerHTML = body;
   $("#editor-footer").innerHTML = footer;
   $("#editor-error").hidden = true;
@@ -772,7 +1064,7 @@ function openProvider(pid) {
     const apiOptions = allowed || protocols;
     const ready = state.status?.connections?.[pid]?.[name]?.ready;
     const models = block.models || (name in agents ? [] : p.models) || [];
-    return `<details class="form-section" data-agent-section="${esc(name)}"><summary>${esc(label)} 连接${ready ? " · 已就绣" : ""} <small>${esc(hint)}</small></summary><div class="form-grid">
+    return `<details class="form-section" data-agent-section="${esc(name)}"><summary>${esc(label)} 连接${ready ? " · 已就绪" : ""} <small>${esc(hint)}</small></summary><div class="form-grid">
       <label class="field full"><span>${esc(label)} Base URL</span><input name="agent-${esc(name)}-baseUrl" type="url" value="${esc(block.baseUrl || "")}" placeholder="留空则使用默认连接" /><small>留空：该 Agent 直接用顶层默认连接。</small></label>
       <label class="field"><span>${esc(label)} API Key</span><div class="password-wrap"><input name="agent-${esc(name)}-apiKey" type="password" value="${esc(block.apiKey || "")}" autocomplete="off" /><button class="icon-button" type="button" data-action="toggle-key" aria-label="显示密钥" title="显示密钥">${icon("eye")}</button></div></label>
       ${name === "codex" ? `<label class="field"><span>API Key 环境变量名</span><input name="agent-${esc(name)}-apiKeyEnv" value="${esc(block.apiKeyEnv || "")}" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="例如 VENDOR_API_KEY" autocomplete="off" /><small>只保存变量名</small></label>` : ""}
@@ -794,7 +1086,7 @@ function openProvider(pid) {
     <details class="form-section"><summary>高级设置 · 备注与目标平台</summary><div class="form-grid">
       ${edit ? `<label class="field full"><span>内部名称</span><input name="name" value="${esc(p.name || pid)}" required /></label>` : ""}
       <label class="field full"><span>备注</span><input name="notes" value="${esc(p.notes || "")}" placeholder="可选，例如套餐或网关说明" /></label>
-      <div class="field full"><span>同步到哪些平台</span><label class="check-label"><input type="checkbox" name="allTargets" ${allTargets ? "checked" : ""} />所有平台（包括旧版映射）</label><div class="check-group">${PROVIDER_TARGETS.map(([name, label]) => `<label class="check-label"><input type="checkbox" name="targets" value="${esc(name)}" ${selectedTargets.includes(name) ? "checked" : ""} ${allTargets ? "disabled" : ""} />${esc(label)}</label>`).join("")}</div><small>未配置连接的平台不会写入；新供应商默认选择常用 Agent。</small></div>
+      <div class="field full"><span>同步到哪些平台</span><label class="check-label"><input type="checkbox" name="allTargets" ${allTargets ? "checked" : ""} />四个受支持 Agent（按连接兼容性）</label><div class="check-group">${PROVIDER_TARGETS.map(([name, label]) => `<label class="check-label"><input type="checkbox" name="targets" value="${esc(name)}" ${selectedTargets.includes(name) ? "checked" : ""} ${allTargets ? "disabled" : ""} />${esc(label)}</label>`).join("")}</div><small>未配置连接的平台不会写入；新供应商默认选择常用 Agent。</small></div>
       <label class="field full"><span>agent 默认模型 · agentModel</span><input name="agentModel" value="${esc(p.agentModel || "")}" placeholder="例如 deepseek-chat" /><small>可选；客户端未单独指定模型时使用。</small></label>
     </div></details>
     <details class="form-section" open><summary>按 Agent 覆盖 · 端点 / 密钥 / 模型</summary>${agentSections}<p class="form-intro">留空的 Agent 使用默认连接。Claude Code 需要 Anthropic Messages 端点；Codex 第三方线路只接受 Responses。</p></details>`, formFooter(edit ? "保存配置" : "添加供应商", edit ? `<button type="button" class="danger" data-action="delete-provider" data-pid="${esc(pid)}">${icon("trash")}删除</button>` : ""), { pid });
@@ -811,7 +1103,7 @@ function openModel(pid, mid, agent = "") {
   const inputs = [...new Set(["text", "image", "audio", "video", ...(m.input || [])])];
   // 模型属于哪条连接；编辑时不允许改变（避免静默验证失败）。
   const connections = [["", `默认连接（${(p.models || []).length} 个模型）`],
-    ...Object.entries(p.agents || {}).map(([name, block]) => [name, `${connectionLabel(name)} 连接（${((block && block.models) || []).length} 个模型）`])];
+    ...Object.entries(p.agents || {}).filter(([agent]) => AGENT_LABEL[agent]).map(([name, block]) => [name, `${connectionLabel(name)} 连接（${((block && block.models) || []).length} 个模型）`])];
   showEditor("model", edit ? "编辑模型" : "添加新的模型", `<p class="form-intro">${edit ? "保留高级配置，只更新你在此修改的模型字段。" : "模型 ID 必须与该连接接口中的标识一致。不确定时，可先在供应商页检测模型。"}</p><div class="form-grid"><label class="field full"><span>所属供应商</span><select name="provider" ${edit ? "disabled" : ""}>${Object.keys(state.providers).map(id => `<option value="${esc(id)}" ${id === pid ? "selected" : ""}>${esc(providerName(id))} (${esc(id)})</option>`).join("")}</select></label><label class="field full"><span>所属连接</span><select name="agent" ${edit ? "disabled" : ""}>${connections.map(([name, label]) => `<option value="${esc(name)}" ${name === agent ? "selected" : ""}>${esc(label)}</option>`).join("")}</select><small>同一供应商的不同连接（不同 Key）可以有不同的模型列表。</small></label><label class="field full"><span>模型 ID <b class="required">*</b></span><input class="mono" name="id" value="${esc(m.id || "")}" placeholder="例如 deepseek-chat 或 vendor/model-name" required /></label><label class="field full"><span>显示名称</span><input name="name" value="${esc(m.name || "")}" placeholder="可选，默认使用模型 ID" /></label><label class="field"><span>上下文窗口 · tokens</span><input name="contextWindow" type="number" min="1" max="100000000" step="1" value="${Number(m.contextWindow) || 128000}" required /></label><label class="field"><span>最大输出 · tokens</span><input name="maxTokens" type="number" min="1" max="100000000" step="1" value="${Number(m.maxTokens) || 32768}" required /></label><fieldset class="field full"><legend>输入类型</legend><div class="check-group">${inputs.map(v => `<label class="check-label"><input type="checkbox" name="input" value="${esc(v)}" ${(m.input || ["text"]).includes(v) ? "checked" : ""} />${esc(({ text: "文本", image: "图片", audio: "音频", video: "视频" })[v] || v)}</label>`).join("")}</div></fieldset><label class="check-label full"><input type="checkbox" name="reasoning" ${m.reasoning !== false ? "checked" : ""} />支持推理 / 思考</label></div>`, formFooter(edit ? "保存模型" : "添加模型"), { pid, mid, agent });
 }
 
@@ -828,7 +1120,7 @@ async function discover(pid) {
     const added = state.discovered.filter(m => !existing.has(m.id)).length;
     const p2 = state.providers[pid] || {};
     const connections = [["", `默认连接（${(p2.models || []).length} 个模型）`],
-      ...Object.entries(p2.agents || {}).map(([name, block]) => [name, `${connectionLabel(name)} 连接（${((block && block.models) || []).length} 个模型）`])];
+      ...Object.entries(p2.agents || {}).filter(([agent]) => AGENT_LABEL[agent]).map(([name, block]) => [name, `${connectionLabel(name)} 连接（${((block && block.models) || []).length} 个模型）`])];
     showEditor("discover", `检测模型 · ${providerName(pid)}`, `<div class="notice" style="margin-bottom:16px">${icon("shield")}仅导入勾选的新模型。不会覆盖已有参数，也不会移除未检测到的模型。</div><label class="field full" style="margin-bottom:12px"><span>检测哪来连接（不同 Key 返回的模型集合可能不同）</span><select id="discover-agent" aria-label="选择连接">${connections.map(([name, label]) => `<option value="${esc(name)}" ${name === state.discoverAgent ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><div class="search-box" style="max-width:none">${icon("search")}<input id="discover-search" type="search" aria-label="搜索检测结果" placeholder="搜索检测到的模型…" /></div><div class="discover-toolbar"><label class="check-label"><input type="checkbox" id="discover-all" ${added ? "checked" : "disabled"} />选择当前可见的新模型</label><span>检测到 ${state.discovered.length} 个 · ${added} 个新模型</span></div><div class="discover-list" id="discover-list">${state.discovered.map((m, index) => `<label class="discover-row ${existing.has(m.id) ? "existing" : ""}" data-search="${esc(`${m.id} ${m.name || ""}`.toLocaleLowerCase())}"><input class="discover-check" type="checkbox" name="discovered" value="${index}" ${existing.has(m.id) ? "disabled" : "checked"} /><div><div class="mono">${esc(m.id)}</div>${m.name && m.name !== m.id ? `<small>${esc(m.name)}</small>` : ""}</div><span class="tag ${existing.has(m.id) ? "" : "green"}">${existing.has(m.id) ? "已添加" : "新模型"}</span></label>`).join("") || empty("search", "没有检测到模型", "请检查该连接的接口与授权。")}</div>`, formFooter(`导入 ${added} 个新模型`), { pid });
     updateDiscoverSelection();
   });
@@ -846,7 +1138,7 @@ function updateDiscoverSelection() {
 }
 
 // ---- 从客户端导入供应商（反向同步的读取侧：任一平台的新供应商都可读取并写入其它平台）----
-const IMPORT_CLIENTS = [["zcode", "ZCode"], ["pi", "pi"], ["dsh", "dsh"], ["codex", "Codex"], ["claude", "Claude Code"]];
+const IMPORT_CLIENTS = [ ["pi", "pi"], ["dsh", "dsh"], ["codex", "Codex"], ["claude", "Claude Code"]];
 function importListHtml(candidates, client) {
   if (!candidates.length) {
     return `<div class="notice">${icon("info")}${client} 的原生配置里没有 Hub 尚未管理的供应商。先在该客户端里添加（或确认未被 Hub 覆盖）后，再回来扫描。</div>`;
@@ -926,7 +1218,7 @@ async function submitEditor(event) {
       if (existing && Array.isArray(existing.models)) block.models = existing.models;
       if (Object.keys(block).length) agents[name] = block;
     }
-    if (Object.keys(agents).length) payload.agents = agents;
+    payload.agents = agents;
   }
   if (editor.type === "model") {
     payload = { id: value("id"), name: value("name"), agent: value("agent"), contextWindow: Number(value("contextWindow")), maxTokens: Number(value("maxTokens")), input: fd.getAll("input"), reasoning: fd.has("reasoning") };
@@ -1013,7 +1305,7 @@ async function deleteProvider(pid) {
 }
 
 async function navigate(page) {
-  if (!PAGES[page]) page = "sync";
+  if (!PAGES[page]) page = "agents";
   if (page === state.page) return;
   if (state.busy || state.page === "sync" && targetDirty() && !await confirmDialog("平台设置尚未保存", "离开将放弃未保存的平台选择与模型设置。你也可以取消，先保存设置。", [], "放弃并离开", false)) {
     history.replaceState(null, "", `#${state.page}`);
@@ -1031,7 +1323,7 @@ document.addEventListener("click", async event => {
   const { action, pid, mid } = button.dataset;
   try {
     if (action === "add-provider") openProvider();
-    else if (action === "import-client") await scanImportClient(state.importTarget || "zcode");
+    else if (action === "import-client") await scanImportClient(state.importTarget || "claude");
     else if (action === "import-apply") await applyImport();
     else if (action === "close-import") $("#import-dialog").close();
     else if (action === "edit-provider") openProvider(pid);
@@ -1098,6 +1390,69 @@ document.addEventListener("click", async event => {
     else if (action === "cancel-preview") invalidatePreview();
     else if (action === "restore-sync") await restoreSync();
     else if (action === "run-sync" || action === "detect-sync") await runSync(action === "detect-sync");
+    // ---- 切换方案 ----
+    else if (action === "plan-load") {
+      const id = $("#plan-select")?.value || "";
+      if (!id) { state.planLoaded = null; state.planLoadedPayload = null; state.planDraft = emptyPlanDraft(); state.planTargets = new Set(); state.planOverrides = {}; state.planName = ""; state.planDescription = ""; state.planAnalysis = null; state.planPreviewResult = null; renderPlanCard(); }
+      else {
+        const plan = state.plans.store.plans.find(p => p.id === id);
+        loadPlanIntoDraft(plan);
+        renderPlanCard();
+        const stale = (plan.refs || []).filter(r => !r.valid);
+        toast(stale.length ? `已载入「${plan.name}」；有 ${stale.length} 个引用已失效，请先修正。` : `已载入「${plan.name}」。`, stale.length ? "error" : "ok");
+      }
+    }
+    else if (action === "plan-duplicate") {
+      // 复制为新方案：保留清单，只清掉"当前方案"的绑定，避免误覆盖原方案。
+      state.planLoaded = null; state.planLoadedPayload = null;
+      state.planName = `${state.planName || "方案"} 副本`;
+      renderPlanCard();
+      toast("已复制为未保存的新方案；改好名字后点「保存为新方案」。");
+    }
+    else if (action === "plan-save") await busy("正在保存切换方案…", async () => { const message = await savePlan(); await reload(); toast(message); });
+    else if (action === "plan-delete") {
+      const plan = state.planLoaded;
+      if (!plan) return;
+      if (!await confirmDialog(`删除方案「${plan.name}」？`, "只删除这份保存的方案，不改动任何客户端配置，也不改动当前生效的模型设置。", [], "删除方案")) return;
+      await busy("正在删除方案…", async () => { const message = await deletePlan(); toast(message); });
+    }
+    else if (action === "plan-analyze") await busy("正在检查每个 Agent…", async () => {
+      const data = await planAnalyze();
+      toast(data.errors?.length ? `发现 ${data.errors.length} 个不兼容项，没有写入任何文件。` : `检查完成：${data.summary.ready.length} 个 Agent 可以写入${data.summary.skipped.length ? `，${data.summary.skipped.length} 个会跳过` : ""}。`, data.errors?.length ? "error" : "ok");
+    });
+    else if (action === "plan-preview") await busy("正在生成原生配置预览…", async () => {
+      const data = await planPreview();
+      toast(`预览已生成：${data.targets.join("、")}，共 ${data.files.length} 个文件。确认后才会写入客户端。`);
+    });
+    else if (action === "plan-confirm-apply") {
+      if (!state.planPreviewResult?.planId) { toast("请先生成预览，再确认应用。", "error"); return; }
+      if (!await confirmDialog("确认写入这些客户端？", "会按上面的清单写入已选 Agent 的原生配置文件，写入前自动备份；正在运行的客户端需要重启才会使用新模型。", [], "确认应用", false)) return;
+      await busy("正在写入客户端配置…", async () => {
+        // 应用用户实际检查过的预览；源文件或 Hub 配置发生变更时拒绝写入。
+        const preview = state.planPreviewResult;
+        const receipt = await api("POST", "/api/apply", { planId: preview.planId });
+        const data = { ...preview, ...receipt, results: preview.results.map(row => {
+          const written = receipt.details?.find(d => d.target === row.target);
+          return written ? { ...row, status: written.ok ? "ok" : "failed", writeOk: written.ok, message: written.message } : row;
+        }), written: (receipt.details || []).filter(d => d.ok).map(d => d.target), failed: (receipt.details || []).filter(d => !d.ok).map(d => d.target) };
+        state.planPreviewResult = data;
+        await reload();
+        state.planPreviewResult = data;
+        renderPlanCard();
+        const written = data.written || [], failed = data.failed || [];
+        toast(failed.length ? `${written.length} 个写入成功，${failed.length} 个失败：请查看结果区，可按需恢复。`
+                            : `已写入 ${written.length} 个客户端；重启对应客户端后才会用上新模型。`, failed.length ? "error" : "ok");
+      });
+    }
+    else if (action === "plan-pick-usable") {
+      const base = state.planDraft.base || {};
+      const usable = planTargetsForModel(base.provider, base.model);
+      state.planTargets = new Set(usable);
+      Object.keys(state.planOverrides).forEach(n => { if (!usable.includes(n)) delete state.planOverrides[n]; });
+      renderPlanCard();
+      toast(`已选中 ${usable.length} 个连接上有这个模型的 Agent。`);
+    }
+    else if (action === "plan-cancel") { state.planPreviewResult = null; renderPlanCard(); }
   } catch (e) { toast(e.message, "error"); }
 });
 document.addEventListener("input", event => {
@@ -1107,6 +1462,8 @@ document.addEventListener("input", event => {
     $("#editor-form [name='baseUrl']").required = !String(el.value || "").trim() && !hasAgentBase && el.name === "baseUrl";
   }
   if (el.id === "model-search") { state.filters.query = el.value; state.modelPage = 1; renderModelRows(); }
+  if (el.id === "plan-name") { state.planName = el.value; }
+  if (el.id === "plan-description") { state.planDescription = el.value; }
   if (el.id === "provider-search") { state.providerQuery = el.value; renderProviderCards(); }
   if (el.id === "discover-search") { const q = el.value.trim().toLocaleLowerCase(); $$(".discover-row").forEach(row => { row.hidden = !row.dataset.search.includes(q); }); updateDiscoverSelection(); }
   if (el.dataset.msCustom !== undefined && !state.busy) {
@@ -1125,6 +1482,91 @@ document.addEventListener("input", event => {
 document.addEventListener("change", event => {
   const el = event.target;
   if (state.busy) return;
+  // ---- 切换方案：任何只读字段改动都作废已有预览，避免用旧清单写新配置 ----
+  if (el.dataset.planPick !== undefined) {
+    const name = el.dataset.planPick;
+    if (el.checked) state.planTargets.add(name); else state.planTargets.delete(name);
+    if (!el.checked) delete state.planOverrides[name];
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.dataset.planPolicy !== undefined) {
+    const name = el.dataset.planPolicy, value = el.value;
+    if (value === "follow") delete state.planOverrides[name];
+    else {
+      const previous = state.planOverrides[name] || {};
+      const base = state.planDraft.base || {};
+      // 从"跟随"切到"单独指定"时预填当前值，用户只改想改的那一项。
+      const conn = state.plans?.targets?.[name]?.connections;
+      const seed = conn?.[base.provider]?.ready ? base.provider : Object.keys(conn || {}).find(pid => conn[pid].ready) || "";
+      state.planOverrides[name] = { policy: value, provider: previous.provider || (value === "fixed" ? seed : ""), model: previous.model || (value === "fixed" ? (conn?.[seed]?.models?.[0] || "") : ""), reasoningEffort: previous.reasoningEffort || "" };
+    }
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.dataset.planProvider !== undefined) {
+    const name = el.dataset.planProvider, spec = state.planOverrides[name] || { policy: "fixed" };
+    const models = Object.entries(state.plans?.targets?.[name]?.connections?.[el.value]?.models || {});
+    const known = (state.plans?.targets?.[name]?.connections?.[el.value]?.models) || [];
+    spec.policy = "fixed"; spec.provider = el.value;
+    if (spec.model && !known.includes(spec.model)) spec.model = known[0] || "";
+    state.planOverrides[name] = spec;
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.dataset.planModel !== undefined) {
+    const name = el.dataset.planModel, spec = state.planOverrides[name] || { policy: "fixed", provider: "" };
+    spec.policy = "fixed"; spec.model = el.value;
+    state.planOverrides[name] = spec;
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.dataset.planEffort !== undefined) {
+    const name = el.dataset.planEffort, spec = state.planOverrides[name] || { policy: "fixed" };
+    spec.reasoningEffort = el.value;
+    state.planOverrides[name] = spec;
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.dataset.planAllow !== undefined) {
+    const name = el.dataset.planAllow, spec = state.planOverrides[name] || { policy: "fixed" };
+    spec.allowUnknownModel = el.checked;
+    state.planOverrides[name] = spec;
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.id === "plan-provider") {
+    // 换供应商后清掉不属于新供应商的旧模型，要求重新选择；不静默换模型。
+    const draft = state.planDraft;
+    const models = planModelOptions(el.value);
+    draft.base.provider = el.value;
+    if (draft.base.model && !models.includes(draft.base.model)) draft.base.model = "";
+    Object.entries(state.planOverrides).forEach(([, spec]) => { if (!spec.allowUnknownModel && spec.model && !models.includes(spec.model)) spec.model = ""; });
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.id === "plan-model" || el.id === "plan-effort") {
+    const key = el.id === "plan-model" ? "model" : "reasoningEffort";
+    state.planDraft.base[key] = el.value;
+    if (el.id === "plan-model") {
+      // 选完模型就把"这条模型在哪些 Agent 的连接上可用"直接选中：用户只需取消不想换的，
+      // 不必先猜哪些能用；不可用的 Agent 不会被勾上，因此不会写到不认识的连接上。
+      const usable = el.value ? planTargetsForModel(state.planDraft.base.provider, el.value) : [];
+      state.planTargets = new Set(usable);
+      Object.keys(state.planOverrides).forEach(n => { if (!usable.includes(n)) delete state.planOverrides[n]; });
+    }
+    state.planAnalysis = null; state.planPreviewResult = null;
+    renderPlanCard();
+    return;
+  }
+  if (el.id === "plan-select") return;
   if (el.id === "capability-filter") { state.filters.capability = el.value; state.modelPage = 1; renderModelRows(); }
   if (el.classList.contains("model-check")) { if (el.checked) state.selection.add(el.dataset.key); else state.selection.delete(el.dataset.key); renderSelection(); }
   if (el.id === "select-page") { visibleModels().forEach(m => el.checked ? state.selection.add(m.key) : state.selection.delete(m.key)); renderModelRows(); }
@@ -1215,7 +1657,7 @@ async function awaitSaveSyncPage() {
   });
 }
 
-state.page = PAGES[location.hash.slice(1)] ? location.hash.slice(1) : "sync";
+state.page = PAGES[location.hash.slice(1)] ? location.hash.slice(1) : "agents";
 reload().catch(e => {
   renderChrome();
   $("#content").innerHTML = `<div class="card">${empty("alert", "暂时无法加载工作空间", e.message, '<button data-action="retry" class="primary">重试连接</button>')}</div>`;

@@ -37,7 +37,7 @@ class CodexReconciliationTests(unittest.TestCase):
 
     def test_added_effort_can_be_reconciled_and_then_official_restored(self):
         third, state = compile_config(BASE, None, "third-party", PROVIDER, {"model": "third-party-model"})
-        changed = 'model_reasoning_effort = "low"\n' + third
+        changed = third.replace('model_reasoning_effort = "medium"', 'model_reasoning_effort = "low"')
         official, inactive = compile_config(changed, state, "official", reconcile=True)
         self.assertEqual(tomllib.loads(official), tomllib.loads(BASE))
         self.assertFalse(inactive["active"])

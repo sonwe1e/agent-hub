@@ -33,7 +33,7 @@ TARGET_FILES = {
     "dsh": (".dsh/.credentials.yaml", ".dsh/settings.yaml.imported",
             ".dsh/profiles/desktop/cordis.patch.yml", ".dsh/settings.yaml"),
     "claude": (".claude/settings.json",),
-    "codex": (".codex/config.toml", ".codex/.agent-hub-state.json"),
+    "codex": (".codex/config.toml", ".codex/.agent-hub-state.json", ".codex/.agent-hub-gateway.json"),
     "omp": (".omp/agent/config.yml",),
 }
 ALIASES = {"dsh-desktop": "dsh"}
@@ -155,7 +155,8 @@ def _select(cfg: dict, only: list[str] | None) -> list[str]:
     if only is not None and (not isinstance(only, list) or any(not isinstance(x, str) for x in only)):
         raise TransactionError("targets must be an array of target names")
     selected = only if only is not None else [name for name, entry in targets.items()
-                                            if isinstance(entry, dict) and entry.get("enabled") is True]
+                                            if name in ("claude", "codex", "pi", "dsh", "dsh-desktop")
+                                            and isinstance(entry, dict) and entry.get("enabled") is True]
     canonical = []
     for name in selected:
         entry = targets.get(name)
@@ -519,10 +520,27 @@ def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
     cfg = copy.deepcopy(hub.cfg)
     _validate_config(cfg)
     targets = _select(cfg, only)
+    if (cfg.get('gateway') or {}).get('enabled'):
+        # The gateway, rather than the eventual client shell, must possess the
+        # selected connection's credential. Reject unresolved env references
+        # before generating any client writes.
+        from gateway_runtime import export_connections, route_id
+        available=export_connections(cfg)[1]
+        module=_module(hub)
+        for agent in targets:
+            if agent=='codex' and (cfg.get('sync',{}).get('targets',{}).get('codex') or {}).get('mode','official')!='third-party':
+                continue # Native ChatGPT authentication is supplied by the client.
+            for selection in module.agent_model_tiers(cfg,agent).values():
+                if route_id(agent,selection['provider']) not in available:
+                    raise TransactionError(f'{agent}: 网关无法解析选定连接的认证信息，请检查 API 密钥或环境变量；未改写客户端')
     home, config, backups, engine = _context(hub)
     relative_files = sorted({rel for name in targets for rel in TARGET_FILES[name]})
     sources = {path: _snapshot(path) for path in
                (config, engine, engine.with_name("codex_config.py"), Path(__file__).absolute())}
+    if 'gateway' in cfg:
+        for name in ('gateway_runtime.py','gateway_server.py'):
+            path=engine.with_name(name)
+            sources[path]=_snapshot(path)
     # A long-lived Hub instance must not compile an obsolete in-memory config.
     try:
         disk_cfg = json.loads(_module(hub).strip_json_comments(sources[config].data.decode("utf-8")))
@@ -816,12 +834,19 @@ def _worker(engine: Path, root: Path, targets: list[str], *, reconcile=False) ->
     module.HUB_STATE = root / "hub" / "state.json"
     module.HUB_BACKUP = root / "backups"
     hub = module.Hub()
+    if (hub.cfg.get('gateway') or {}).get('enabled') or 'gateway' in hub.cfg:
+        from gateway_runtime import install_compiler_routes, prepare_compiler_native
+        prepare_compiler_native(module,hub,targets)
+        install_compiler_routes(module, hub)
     target = "configuration"
     warnings = []
     try:
         for target in targets:
             if target == "codex":
                 hub.push_codex(reconcile=reconcile, warnings=warnings)
+                if (hub.cfg.get('gateway') or {}).get('enabled') or (module.HOME/'.codex/.agent-hub-gateway.json').exists():
+                    from gateway_runtime import compile_codex_native
+                    compile_codex_native(module.HOME, hub.cfg)
             elif target == "zcode":
                 hub.push_zcode(reconcile=reconcile, warnings=warnings)
             elif target == "pi":

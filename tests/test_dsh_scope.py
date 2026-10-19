@@ -39,6 +39,19 @@ class DshScopeTests(unittest.TestCase):
     def save(self):
         engine.save_json(server.HUB_CONFIG, self.cfg)
 
+    def test_empty_inline_credentials_refs_expand_once_and_preserve_records(self):
+        for heading in ('refs: {}','refs: null','refs:'):
+            with self.subTest(heading=heading):
+                source='version: 1\n'+heading+'\nrecords:\n  retained:\n    kind: api-key\n'
+                self.credentials.write_text(source,encoding='utf-8')
+                self.save()
+                h=engine.Hub();plan=h.preview_push(['dsh']);h.apply_preview(plan['planId'])
+                rendered=self.credentials.read_text(encoding='utf-8')
+                self.assertEqual(sum(line.startswith('refs:') for line in rendered.splitlines()),1)
+                parsed=engine.parse_yaml(rendered)
+                self.assertEqual(parsed['refs']['MYOPENROUTER_API_KEY'],'test-not-a-real-key')
+                self.assertEqual(parsed['records']['retained']['kind'],'api-key')
+
     def provider_layers(self):
         layers = []
         for name in ('settings.yaml', 'settings.yaml.imported'):

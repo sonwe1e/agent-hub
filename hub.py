@@ -38,6 +38,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 HOME = Path.home()
+ACTIVE_AGENTS = ("claude", "codex", "pi", "dsh")
 # Hub 自身（代码 + providers.json + state.json + backups）不再绑定用户主目录，
 # 按本文件位置定位，整个目录可任意搬迁（如 ~/.agent-hub -> G:\workspaces\agent-hub）。
 # 注意 HOME 仍指向用户主目录，各 agent 的配置文件（~/.pi、~/.dsh 等）不受影响。
@@ -1432,6 +1433,8 @@ class Hub:
         hashes = {}
         targets = self.cfg.get("sync", {}).get("targets", {})
         for tname, tcfg in targets.items():
+            if canonical_target(tname) not in ACTIVE_AGENTS:
+                continue
             if tcfg.get("enabled") is not True:
                 continue
             for f in target_files(tname, tcfg):
@@ -1446,6 +1449,8 @@ class Hub:
         # SQLite 等二进制库打开即变，不参与外部变更检测 (它们是 hub 的写入目标)
         skip_names = {"cc-switch.db"}
         for tname, tcfg in targets.items():
+            if canonical_target(tname) not in ACTIVE_AGENTS:
+                continue
             if tcfg.get("enabled") is not True:
                 continue
             for f in target_files(tname, tcfg):
@@ -1551,7 +1556,7 @@ class Hub:
             # 供应商级 compat 必须下发：maxTokensField / supportsDeveloperRole /
             # thinkingFormat 等缺失会让 pi 发出的请求被网关 400 拒绝。
             if conn.get("compat"):
-                entry["compat"] = copy.deepcopy(conn["compat"])
+                entry["compat"] = {**(entry.get("compat") or {}), **copy.deepcopy(conn["compat"])}
             pi_models_by_id = {
                 m.get("id"): m
                 for m in (previous.get("models") if isinstance(previous, dict) else None) or []
@@ -1577,7 +1582,8 @@ class Hub:
                 # hub 里显式配置的高级字段优先于 pi 侧旧值
                 for key in ("cost", "compat"):
                     if m.get(key) is not None:
-                        item[key] = copy.deepcopy(m[key])
+                        item[key] = ({**(item.get(key) or {}), **copy.deepcopy(m[key])}
+                                     if key == "compat" else copy.deepcopy(m[key]))
                 entry["models"].append(item)
             providers[pid] = entry
             auth[pid] = {"type": "api_key", "key": conn["apiKey"]}
@@ -1860,7 +1866,19 @@ class Hub:
             conn = agent_connection(self.providers[pid], "zcode")
             if not any(isinstance(m, dict) and m.get("id") == selection["model"]
                        for m in conn["models"]):
-                raise ValueError(f"modelSync 指向的模型 {selection['model']} 不在 {pid} 的 zcode 模型库里，未写入 zcode")
+                # 手填模型放行：同时补进该供应商的个人模型列表，
+                # 否则 defaultModelSelection 指向一个 ZCode 看不见的模型。
+                rule = by_id.get(zid)
+                if isinstance(rule, dict):
+                    rule_cfg = rule.setdefault("config", {})
+                    for key in ("personalModelIds", "modelOrder"):
+                        ids = rule_cfg.setdefault(key, [])
+                        if selection["model"] not in ids:
+                            ids.append(selection["model"])
+                if warnings is not None:
+                    warnings.append(
+                        f"ZCode: 模型 {selection['model']} 不在 {pid} 的 zcode 模型库中，"
+                        "按手填值写入并补进个人模型列表；ZCode 可能无法识别该 ID。")
             chosen = {"providerId": zid, "modelId": selection["model"]}
             effort = selection.get("reasoningEffort")
             if effort:
@@ -2117,8 +2135,9 @@ class Hub:
                 pattern = rf"(?m)^(\s*{re.escape(key)}:\s*).*$"
                 if re.search(pattern, cred_text):
                     cred_text = re.sub(pattern, rf"\g<1>{value}", cred_text)
-                elif re.search(r"(?m)^refs:\s*$", cred_text):
-                    cred_text = re.sub(r"(?m)^(refs:\s*)$", rf"\1\n  {key}: {value}", cred_text, count=1)
+                elif re.search(r"(?m)^refs:[ \t]*(?:\{\}|null|~)?[ \t]*(?:#.*)?$", cred_text):
+                    cred_text = re.sub(r"(?m)^refs:[ \t]*(?:\{\}|null|~)?[ \t]*(?P<comment>#.*)?$",
+                                       lambda match: f"refs:{(' '+match.group('comment')) if match.group('comment') else ''}\n  {key}: {value}", cred_text, count=1)
                 else:
                     cred_text = cred_text.rstrip("\n") + f"\nrefs:\n  {key}: {value}\n"
             cred_path.write_text(cred_text, encoding="utf-8")
@@ -2227,6 +2246,13 @@ class Hub:
         else:
             data = {"$schema": "https://json.schemastore.org/claude-code-settings.json"}
         env = data.setdefault("env", {})
+        preserve_tiers = ((self.cfg.get("modelSync") or {}).get("overrides", {}).get("claude") or {}).get("preserveTiers", [])
+        preserved_keys = set()
+        for tier in preserve_tiers:
+            if tier == "subagent":
+                preserved_keys.add("CLAUDE_CODE_SUBAGENT_MODEL")
+            elif tier in ("opus", "sonnet", "haiku", "fable"):
+                preserved_keys.update((f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL", f"ANTHROPIC_DEFAULT_{tier.upper()}_MODEL_NAME"))
         if main is None:
             # 没有选定模型：只补平台特性开关，不猜供应商，也不动任何 ANTHROPIC_* 键
             for k, v in self._feature_env_values(feature_env).items():
@@ -2276,10 +2302,14 @@ class Hub:
         env["ANTHROPIC_AUTH_TOKEN"] = conn["apiKey"]
         env["ANTHROPIC_BASE_URL"] = conn["baseUrl"]
         for k, v in model_map.items():
+            if k in preserved_keys:
+                continue
             if v:
                 env[k] = v
                 written_env.add(k)
         for k, v in extra_env.items():
+            if k in preserved_keys:
+                continue
             env[k] = v
             written_env.add(k)
         # hub 自己管理的 env 键命名空间（闭集）：固定别名 + 各 provider 的 Claude 连接
@@ -2292,6 +2322,8 @@ class Hub:
         # 切换 provider 时收回上一个 provider 写入、当前 provider 未声明的 env 键：
         # 否则切到不声明 fable 的供应商后，ANTHROPIC_DEFAULT_FABLE_MODEL 还留着上一家的模型名。
         for k in owned_env:
+            if k in preserved_keys:
+                continue
             if k not in written_env:
                 env.pop(k, None)
         data["env"] = env
@@ -2346,7 +2378,12 @@ class Hub:
                 raise ValueError("Codex 选定的供应商未启用或不适用于此平台")
             conn = agent_connection(entry, "codex")
             if not any(m.get("id") == tier["model"] for m in conn["models"]):
-                raise ValueError("Codex 选定的模型不在该供应商的 Codex 连接模型列表中")
+                # 手填模型放行：与 CLI / 工作台「手动填写模型 ID」同一语义，
+                # 只提示不拦截。端点不认这个 ID 时由 Codex 自己报错。
+                if warnings is not None:
+                    warnings.append(
+                        f"Codex: 模型 {tier['model']} 不在 {tier['provider']} 的 Codex 连接"
+                        "模型库中，按手填值写入；Codex 可能拒绝该 ID。")
             # codex_config 只认归一化后的连接形状：端点、协议与授权三者缺一不可
             provider = dict(entry, baseUrl=conn["baseUrl"], api=conn["api"],
                             apiKeyEnv=conn["apiKeyEnv"], apiKey=conn["apiKey"], openaiApiKey=conn["apiKey"],
@@ -2704,36 +2741,7 @@ class Hub:
                     save_json(p, data)
                     msgs.append(f"  pi/{fname} 已清除")
 
-        # mcode custom_provider
-        mcode = HOME / ".minimax" / "config.yaml"
-        if mcode.exists():
-            text = mcode.read_text(encoding="utf-8")
-            if pid in text or "qwen-token" in text:
-                backup_file(mcode)
-                data = parse_yaml(text) or {}
-                custom = data.get("custom_provider") or {}
-                for rid in list(custom.keys()):
-                    if rid == pid or "token-plan" in (custom[rid].get("options") or {}).get("baseURL", ""):
-                        custom.pop(rid)
-                        msgs.append(f"  mcode custom_provider.{rid} 已清除")
-                data["custom_provider"] = custom
-                mcode.write_text(dump_yaml(data) + "\n", encoding="utf-8")
-
-        # zcode
-        zcode = HOME / ".zcode" / "v2" / "provider_config.json"
-        if zcode.exists():
-            data = load_json(zcode, default={}) or {}
-            rules = data.get("config", {}).get("providerConfigRules", {}).get("providerRules", [])
-            before = len(rules)
-            rules[:] = [
-                r
-                for r in rules
-                if r.get("providerId") != pid and "qwen-token" not in (r.get("providerName") or "")
-            ]
-            if len(rules) != before:
-                backup_file(zcode)
-                save_json(zcode, data)
-                msgs.append("  zcode 已清除")
+        # Historical adapters are retained for reading/tests, never cleaned by daily operations.
 
         # dsh
         imported = HOME / ".dsh" / "settings.yaml.imported"
@@ -2748,26 +2756,6 @@ class Hub:
                         msgs.append(f"  dsh providers.{rid} 已清除")
                 data["llm-pi-ai"]["providers"] = llm
                 imported.write_text(dump_yaml(data) + "\n", encoding="utf-8")
-
-        # cc-switch
-        db_path = HOME / ".cc-switch" / "cc-switch.db"
-        if db_path.exists():
-            con = sqlite3.connect(str(db_path))
-            try:
-                cur = con.cursor()
-                cur.execute(
-                    "DELETE FROM providers WHERE name LIKE ? OR lower(settings_config) LIKE ?",
-                    (f"%{pid}%", f"%{pid}%"),
-                )
-                cur.execute(
-                    "DELETE FROM providers WHERE lower(name) LIKE '%qwen%token%' OR lower(settings_config) LIKE '%qwen-token%'"
-                )
-                n = cur.rowcount
-                con.commit()
-                if n:
-                    msgs.append(f"  cc-switch 删除 {n} 行")
-            finally:
-                con.close()
 
         msgs.append("完成。重启相关 agent 后生效。")
         return msgs
@@ -3067,6 +3055,109 @@ def cmd_model(hub: Hub, args) -> int:
     return 0
 
 
+def _switch_plans_block(cfg: dict) -> dict:
+    """providers.json 里的切换方案块；旧配置没有这一块时给出空结构。"""
+    block = cfg.get("switchPlans")
+    block = block if isinstance(block, dict) else {}
+    plans = block.get("plans")
+    return {"version": 1, "default": block.get("default"),
+            "plans": plans if isinstance(plans, dict) else {}}
+
+
+def _find_plan(block: dict, ref: str) -> tuple[str, dict] | None:
+    if ref in block["plans"]:
+        return ref, block["plans"][ref]
+    for pid, plan in block["plans"].items():
+        if plan.get("name") == ref:
+            return pid, plan
+    return None
+
+
+def cmd_plan(hub: Hub, args) -> int:
+    """切换方案：list / show / apply。
+
+    apply = 把方案编译成 modelSync（写 providers.json）后走一次真正的事务同步；
+    与工作台「应用这次切换」是同一条实现，不另写一套。
+    """
+    from switch_plans import analyze_plan, compile_plan, model_sync_patch_for_write, reference_states
+
+    disk = load_json(HUB_CONFIG, default=None)
+    if isinstance(disk, dict):
+        hub.cfg = copy.deepcopy(disk)
+        hub.providers = hub.cfg.setdefault("providers", {})
+    block = _switch_plans_block(hub.cfg)
+
+    if args.action == "list":
+        if not block["plans"]:
+            print("还没有保存的切换方案。在工作台「平台同步 → 切换方案」里创建，或写入 providers.json 的 switchPlans。")
+            return 0
+        for pid, plan in block["plans"].items():
+            state = reference_states(hub.cfg, plan)
+            mark = "  ⚠ 引用已失效" if state["stale"] else ""
+            default = "（默认）" if block["default"] == pid else ""
+            print(console_safe(f"  {pid}{default}  {plan.get('name', '')}"
+                               f"  → {', '.join(plan.get('targets', []))}{mark}"))
+            if state["stale"]:
+                for ref in state["refs"]:
+                    if not ref["valid"]:
+                        print(console_safe(f"      ✗ {ref['where']}: {ref['provider']} / {ref['model']}"
+                                           f"  ({ref['state']})"))
+        return 0
+
+    found = _find_plan(block, args.plan)
+    if found is None:
+        print(f"方案不存在: {args.plan}（用 hub plan list 查看）", file=sys.stderr)
+        return 1
+    pid, plan = found
+
+    if args.action == "show":
+        report = analyze_plan(hub.cfg, plan, mode_of=lambda name:
+                              (hub.cfg.get("sync", {}).get("targets", {}).get(name) or {}).get("mode", "official"))
+        print(console_safe(f"方案 {pid} · {plan.get('name', '')}"))
+        for detail in report["details"]:
+            effort = detail["effort"]
+            effort_text = (f"强度 {effort['requested']}" if effort.get("requested")
+                           else f"保留当前强度 {effort['current']}" if effort.get("current") else "不改强度")
+            print(console_safe(f"  {detail['status']:<8} {detail['label']}: "
+                               f"{detail['provider'] or '—'} / {detail['model'] or '—'} · {effort_text}"))
+            if detail.get("reason"):
+                print(console_safe(f"           {detail['reason']}"))
+        for issue in report["errors"]:
+            print(console_safe(f"  ✗ {issue['message']}"))
+        print(console_safe(f"  {'可写入' if report['writable'] else '不可写入'}；{report['disclaimer']}"))
+        return 0 if report["writable"] else 1
+
+    # apply
+    scope = args.target or plan.get("targets") or []
+    scope = [canonical_target(name) for name in scope]
+    targets_cfg = hub.cfg.get("sync", {}).get("targets", {})
+    disabled = [name for name in scope if not (targets_cfg.get(name) or {}).get("enabled")]
+    if disabled:
+        print(f"这些目标没有在 sync.targets 里启用，不会写入: {', '.join(disabled)}", file=sys.stderr)
+        return 1
+    mode_of = lambda name: (targets_cfg.get(name) or {}).get("mode", "official")
+    report = analyze_plan(hub.cfg, plan, targets=scope, mode_of=mode_of)
+    for issue in report["errors"]:
+        print(console_safe(f"  ✗ {issue['message']}"), file=sys.stderr)
+    if not report["writable"]:
+        print("方案有未解决的不兼容项，没有写入任何文件。先用 hub plan show 查看。", file=sys.stderr)
+        return 1
+    _patched, patch, _issues, blocked = compile_plan(hub.cfg, plan, targets=scope)
+    if blocked or patch is None:
+        print("方案编译失败，没有写入任何文件。", file=sys.stderr)
+        return 1
+    written = [d["target"] for d in report["details"] if d["status"] in ("ok", "warning")]
+    skipped = [d["target"] for d in report["details"] if d["status"] == "skipped"]
+    for detail in report["details"]:
+        if detail["status"] == "skipped":
+            print(console_safe(f"  -- 跳过 {detail['label']}: {detail['reason']}"))
+    hub.cfg["modelSync"] = model_sync_patch_for_write(hub.cfg, patch)
+    backup_file(HUB_CONFIG)
+    save_json(HUB_CONFIG, hub.cfg)
+    print(console_safe(f"✓ 方案 {pid} 已编译进 modelSync（写入范围: {', '.join(written) or '无'}）"))
+    return cmd_push(hub, argparse.Namespace(targets=written))
+
+
 def cmd_backup(hub: Hub, _args) -> int:
     print("备份目标配置 ...")
     targets = hub.cfg.get("sync", {}).get("targets", {})
@@ -3143,7 +3234,7 @@ def cmd_migrate_agents(hub: Hub, _args) -> int:
     - 删除 ``sync.targets.claude.activeProvider``：Claude Code 与其它 Agent 一样，
       只认 modelSync 解析结果
 
-    重复执行是幂等的；写入前照例备份 providers.json。
+    重复执行是幂等的；只有发生变化时才备份、刷新时间并写入 providers.json。
     """
     disk = load_json(HUB_CONFIG, default=None)
     if not isinstance(disk, dict):
@@ -3221,6 +3312,11 @@ def cmd_migrate_agents(hub: Hub, _args) -> int:
     if active:
         (targets.get("claude") or {}).pop("activeProvider", None)
         print(console_safe(f"  ✓ sync.targets.claude.activeProvider({active}) 已移除"))
+    if disk == before:
+        hub.cfg = disk
+        hub.providers = disk["providers"]
+        print("配置已经是 agents 连接结构，无需迁移。")
+        return 0
     disk["updatedAt"] = now_iso()
     assert_expected_model_changes(before, disk)
     hub.cfg = disk
@@ -3260,6 +3356,12 @@ def main(argv: list[str] | None = None) -> int:
                          help="只对指定客户端生效；不传表示全局主模型")
     p_model.add_argument("--reasoning-effort", choices=list(REASONING_EFFORTS),
                          help="推理强度（可选）")
+    p_plan = sub.add_parser("plan", help="切换方案：一次选择应用到多个 Agent")
+    p_plan.add_argument("action", choices=["list", "show", "apply"], help="list 列出 / show 检查 / apply 应用并同步")
+    p_plan.add_argument("plan", nargs="?", help="方案 ID 或名称（list 不需要）")
+    p_plan.add_argument("--target", action="append",
+                        choices=["pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"],
+                        help="只对指定客户端应用；不传用方案自己的范围")
 
     args = parser.parse_args(argv)
     hub = Hub()
@@ -3277,6 +3379,7 @@ def main(argv: list[str] | None = None) -> int:
         "restore-gold": cmd_restore_gold,
         "migrate-agents": cmd_migrate_agents,
         "model": cmd_model,
+        "plan": cmd_plan,
     }
     return dispatch[args.cmd](hub, args)
 

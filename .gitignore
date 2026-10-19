@@ -4,6 +4,7 @@ providers.json.drop-*
 providers.json.truncated-bak
 state.json
 backups/
+data/
 
 # 测试与构建产物
 tests/node_modules/

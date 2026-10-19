@@ -9,7 +9,11 @@ import launch
 
 class LaunchTests(unittest.TestCase):
     def test_ready_requires_application_and_version(self):
-        for data, expected in (({"app": "agent-hub", "uiVersion": 2}, True),
+        for data, expected in (({"app": "agent-hub", "uiVersion": 6}, True),
+                               ({"app": "agent-hub", "uiVersion": 5}, False),
+                               ({"app": "agent-hub", "uiVersion": 4}, False),
+                               ({"app": "agent-hub", "uiVersion": 3}, False),
+                               ({"app": "agent-hub", "uiVersion": 2}, False),
                                ({"app": "agent-hub", "uiVersion": 1}, False),
                                ({"providerCount": 4}, False),
                                ({"app": "other", "uiVersion": 2}, False)):

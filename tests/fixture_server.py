@@ -24,7 +24,14 @@ def preview(h, only=None, *, reconcile=False):
 def apply(h, plan_id):
     if plan_id not in plans:
         raise ValueError("预览已失效，请重新预览")
-    return {"transactionId": plan_id, "results": fake_push_all(h, plans.pop(plan_id))}
+    return {"transactionId": plan_id, "results": fake_push_all(h, plans[plan_id])}
+
+
+def restore(h, transaction_id):
+    """浏览器回归不写真实客户端，因此事务目录不存在：这里如实模拟恢复回执。"""
+    if not isinstance(transaction_id, str) or not transaction_id.startswith("fixture-"):
+        raise ValueError("Invalid transaction ID")
+    return {"transactionId": transaction_id, "restored": [], "created": [], "reverted": True}
 
 
 
@@ -42,8 +49,9 @@ with isolated(), ExitStack() as stack:
         stack.enter_context(patch.object(engine.Hub, f"push_{name}"))
     stack.enter_context(patch.object(engine.Hub, "preview_push", preview, create=True))
     stack.enter_context(patch.object(engine.Hub, "apply_preview", apply, create=True))
+    stack.enter_context(patch.object(engine.Hub, "restore_transaction", restore, create=True))
     # 验证逐平台失败反馈，绝不写入真实客户端配置。
-    engine.Hub.push_omp.side_effect = RuntimeError("测试平台暂不可用")
+    engine.Hub.push_claude.side_effect = RuntimeError("测试平台暂不可用")
     stack.enter_context(patch.object(server, "discover_models", discover))
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
     print(f"READY {httpd.server_port}", flush=True)

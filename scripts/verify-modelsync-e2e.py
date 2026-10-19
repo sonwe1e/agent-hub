@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import sys
@@ -26,6 +27,7 @@ CLONE = [
     ".dsh/profiles/desktop/cordis.patch.yml",
     ".claude/settings.json",
     ".codex/config.toml",
+    ".zcode/v2/provider_config.json",
 ]
 failures: list[str] = []
 notes: list[str] = []
@@ -53,10 +55,10 @@ def main() -> int:
     cfg = json.loads((ROOT / "providers.json").read_text(encoding="utf-8"))
     providers = cfg["providers"]
     # cc-switch 的 SQLite 库不能原子替换，安全预览会整组拒绝；这里显式排除它，
-    # 只验证 pi / dsh / claude / codex 这些文件型目标。
-    # mcode / zcode / omp 是保留的旧版目标：本机没装对应客户端时适配器会因找不到
+    # 只验证 pi / dsh / claude / codex / zcode 这些文件型目标。
+    # mcode / omp 是保留的旧版目标：本机没装对应客户端时适配器会因找不到
     # 配置文件而失败，同样先排除，避免掩盖真正要验证的目标。
-    for legacy in ("cc-switch", "mcode", "zcode", "omp"):
+    for legacy in ("cc-switch", "mcode", "omp"):
         entry = (cfg.get("sync", {}).get("targets", {}).get(legacy) or {})
         if entry.get("enabled"):
             cfg["sync"]["targets"][legacy] = dict(entry, enabled=False)
@@ -166,8 +168,11 @@ def main() -> int:
               "dsh 子代理可选模型写入")
         llm = by_id["llm-pi-ai"]["config"]["providers"]
         check(all(v.get("apiKeyEnv") for v in llm.values()), "dsh 每个 provider 都有 apiKeyEnv")
+        # dsh 把 models:[] 当作「整个安装目录」，空模型路由会被刻意移除；
+        # 期望集合只包含连接上有模型的供应商。
         expected_routes = {p for p, v in providers.items()
-                           if v.get("enabled", True) and not v.get("targets") and v.get("baseUrl")}
+                           if v.get("enabled", True) and not v.get("targets") and v.get("baseUrl")
+                           and engine.agent_connection(v, "dsh")["models"]}
         check(set(llm) >= expected_routes,
               f"dsh 路由段包含全部启用供应商（期望 ≥ {sorted(expected_routes)}，实际 {sorted(llm)}）")
         # hub 不管的历史路由（例如 dsh 里遗留的 myopenrouter）必须原样保留
@@ -176,9 +181,9 @@ def main() -> int:
             notes.append(f"  --   dsh 保留 hub 未管理的路由: {', '.join(leftovers)}")
         creds = (root / ".dsh/.credentials.yaml").read_text(encoding="utf-8")
         check("deepseek-account-platform/device" in creds, "dsh 凭据文件里的 records 保留")
-        for key in ("FIREWORK_API_KEY", "MCODE_DEEPSEEK_API_KEY", "STEPFUN_API_KEY",
-                    "MYOPENROUTER_API_KEY"):
-            check(f"{key}:" in creds, f"dsh 凭据包含 {key}")
+        # 凭据检查按本次实际路由推导，不再依赖会过时的固定供应商清单
+        for env_name in sorted(engine.DshModelPlan(hub).credentials()):
+            check(f"{env_name}:" in creds, f"dsh 凭据包含 {env_name}")
 
         # --- claude ---
         claude = json.loads((root / ".claude/settings.json").read_text(encoding="utf-8"))
@@ -188,10 +193,16 @@ def main() -> int:
         else:
             notes.append(f"  --   Claude ANTHROPIC_MODEL = {claude['env'].get('ANTHROPIC_MODEL')}"
                          f"（全局是 {pid}/{model}，供应商不匹配时保持原样，符合设计）")
-        # 按 Agent 覆盖：Claude 连接自带端点与密钥，切到另一家时整套换掉
-        claude_pid = next((name for name, p in providers.items()
-                           if p.get("enabled", True) and engine.agent_connection_ready(p, "claude")
-                           and name != pid), None)
+        # 按 Agent 覆盖：Claude 连接自带端点与密钥，切到另一家时整套换掉。
+        # 候选必须有可用模型（空模型库的连接解析不出主模型），并优先挑一家
+        # 与全局、与刚才的覆盖都不同的供应商，真正验证「整套切换」。
+        used = (cfg["modelSync"].get("overrides") or {}).get("claude", {}).get("provider")
+        claude_candidates = [name for name, p in providers.items()
+                             if p.get("enabled", True) and engine.agent_connection_ready(p, "claude")
+                             and (first_model(engine.agent_connection(p, "claude")["models"])
+                                  or first_model(p.get("models")))]
+        ordered = [name for name in claude_candidates if name not in (pid, used)] or claude_candidates
+        claude_pid = ordered[0] if ordered else None
         if claude_pid:
             conn = engine.agent_connection(providers[claude_pid], "claude")
             claude_model = next((m["id"] for m in conn["models"]), None) or \
@@ -230,6 +241,51 @@ def main() -> int:
                 check("requires_openai_auth = false" in text, "Codex 第三方不借用 ChatGPT 凭据")
         else:
             notes.append("  --   没有第二个可用的 Claude 连接，跳过按 Agent 覆盖验证")
+
+        # --- zcode ---
+        zcode_path = root / ".zcode/v2/provider_config.json"
+        if not zcode_path.exists():
+            notes.append("  --   跳过 zcode（克隆环境没有 provider_config.json）")
+        else:
+            official_mode = (cfg["sync"]["targets"].get("zcode") or {}).get("mode", "official") == "official"
+            if official_mode:
+                before_sel = copy.deepcopy(
+                    (json.loads(zcode_path.read_text(encoding="utf-8")).get("config") or {})
+                    .get("defaultModelSelection"))
+            zcode_pid = next((name for name, p in providers.items()
+                              if p.get("enabled", True) and engine.agent_connection_ready(p, "zcode")
+                              and first_model(engine.agent_connection(p, "zcode")["models"])), None)
+            if not zcode_pid:
+                notes.append("  --   没有 zcode 可用的供应商连接，跳过 zcode 验证")
+            else:
+                zconn = engine.agent_connection(providers[zcode_pid], "zcode")
+                zmodel = first_model(zconn["models"])
+                cfg["sync"]["targets"]["zcode"] = {"enabled": True, "mode": "third-party"}
+                cfg["modelSync"].setdefault("overrides", {})["zcode"] = {
+                    "provider": zcode_pid, "model": zmodel}
+                hub_config.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                engine.Hub().push_zcode()
+                zcfg = json.loads(zcode_path.read_text(encoding="utf-8"))
+                selection = (zcfg.get("config") or {}).get("defaultModelSelection") or {}
+                check(selection.get("modelId") == zmodel,
+                      f"ZCode 第三方写入 {zcode_pid} 连接上的模型")
+                if official_mode:
+                    check((zcfg.get("config") or {}).get("defaultModelSelection") is not None
+                          or before_sel is not None,
+                          "ZCode 第三方切换记录了默认模型选择")
+                # 手填模型：不在连接模型库也放行，并补进个人模型列表
+                manual_model = "e2e-manual-model"
+                cfg["modelSync"]["overrides"]["zcode"]["model"] = manual_model
+                hub_config.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+                engine.Hub().push_zcode()
+                zcfg = json.loads(zcode_path.read_text(encoding="utf-8"))
+                selection = (zcfg.get("config") or {}).get("defaultModelSelection") or {}
+                check(selection.get("modelId") == manual_model, "ZCode 手填模型照写（不拦截）")
+                rules = ((zcfg.get("config") or {}).get("providerConfigRules") or {}).get("providerRules") or []
+                rule = next((r for r in rules
+                             if isinstance(r, dict) and r.get("providerId") == selection.get("providerId")), None)
+                check(isinstance(rule, dict) and manual_model in (rule.get("config") or {}).get("personalModelIds", []),
+                      "ZCode 手填模型补进该供应商的个人模型列表")
 
     print("检查项:")
     print("\n".join(notes))

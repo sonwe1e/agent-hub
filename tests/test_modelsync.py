@@ -564,6 +564,16 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertIn('experimental_bearer_token = "sk-codex-literal"', text)
         self.assertNotIn("ENV_KEY", text)
 
+    def test_hand_typed_model_is_written_with_warning(self):
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["modelSync"]["overrides"]["codex"]["model"] = "not-in-codex-library"
+        engine.save_json(server.HUB_CONFIG, cfg)
+        warnings: list[str] = []
+        engine.Hub().push_codex(warnings=warnings)
+        self.assertIn('model = "not-in-codex-library"', self.text())
+        self.assertIn('model_provider = "agent_hub"', self.text())
+        self.assertTrue(any("不在 deepseek 的 Codex 连接" in w for w in warnings))
+
     def test_only_hub_managed_keys_change(self):
         before = self.text()
         engine.Hub().push_codex()

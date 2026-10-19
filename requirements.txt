@@ -1,0 +1,4 @@
+# Only needed for compressed dsh native session logs. Core UI uses Python stdlib.
+zstandard>=0.23,<1
+# Real-client isolation harness: copy dsh YAML config without loading !!js tags.
+PyYAML>=6,<7

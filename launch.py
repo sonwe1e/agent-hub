@@ -22,7 +22,7 @@ def ready(port: int) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=1) as response:
             data = json.load(response)
-            return data.get("app") == "agent-hub" and data.get("uiVersion", 0) >= 2
+            return data.get("app") == "agent-hub" and data.get("uiVersion", 0) >= 6
     except (OSError, ValueError, urllib.error.URLError):
         return False
 

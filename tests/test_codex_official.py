@@ -30,7 +30,7 @@ class CodexRoundTripTests(unittest.TestCase):
         self.assertFalse(parsed["model_providers"]["agent_hub"]["requires_openai_auth"])
         provider_b = dict(PROVIDER, name="B", baseUrl="https://other.example/v1")
         second, state = compile_config(first, state, "third-party", provider_b, {"model":"model-b"})
-        self.assertNotIn("model_reasoning_effort", tomllib.loads(second))
+        self.assertEqual(tomllib.loads(second)["model_reasoning_effort"], "high")
         restored, state = compile_config(second, state, "official")
         self.assertEqual(tomllib.loads(restored), tomllib.loads(BASE))
         self.assertFalse(state["active"])
@@ -95,7 +95,7 @@ class CodexRoundTripTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(restored)["notify"], ["new-hook"])
         without_effort, state = compile_config(BASE,None,"third-party",PROVIDER,{"model":"third-party-model"})
         with self.assertRaisesRegex(ValueError,"外部"):
-            compile_config('model_reasoning_effort = "low"\n'+without_effort,state,"official")
+            compile_config(without_effort.replace('model_reasoning_effort = "medium"', 'model_reasoning_effort = "low"'),state,"official")
 
     def test_invalid_managed_root_record_is_rejected(self):
         third, state = compile_config(BASE,None,"third-party",PROVIDER,SELECTION)
