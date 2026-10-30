@@ -99,6 +99,17 @@ class PiAdapterTests(unittest.TestCase):
         self.assertEqual(len(ids), 7)
         self.assertIn("deepseek/model-7", ids)
 
+    def test_sync_keeps_unmanaged_qwen_and_legacy_named_providers_and_auth(self):
+        models=self.pi_models()
+        names=('qwen-token-plan-cn','volcano','cc-switch-step-fun','provider-0b8770')
+        for name in names:models['providers'][name]={'apiKey':'local','models':[]}
+        (self.pi_dir/'models.json').write_text(json.dumps(models),encoding='utf-8')
+        (self.pi_dir/'auth.json').write_text(json.dumps({name:{'type':'oauth','token':'fixture'} for name in names}),encoding='utf-8')
+        engine.Hub().push_pi()
+        for name in names:
+            self.assertIn(name,self.pi_models()['providers'])
+            self.assertIn(name,json.loads((self.pi_dir/'auth.json').read_text(encoding='utf-8')))
+
 
 class StaleWriteTests(unittest.TestCase):
     def setUp(self):
@@ -137,6 +148,47 @@ class StaleWriteTests(unittest.TestCase):
         for pid, count in before.items():
             if pid != "firework":
                 self.assertEqual(after[pid], count, pid)
+
+    def test_remove_provider_keeps_unrelated_dsh_qwen_entries(self):
+        imported = self.home / '.dsh' / 'settings.yaml.imported'
+        imported.parent.mkdir(parents=True)
+        providers = {'firework': {'api': 'example'},
+                     'qwen-token-unrelated': {'api': 'other'},
+                     'qwen-token-plan-cn': {'api': 'legacy'}}
+        imported.write_text(engine.dump_yaml({'llm-pi-ai': {'providers': providers}}), encoding='utf-8')
+        engine.Hub().remove_provider('firework')
+        after = engine.parse_yaml(imported.read_text(encoding='utf-8'))['llm-pi-ai']['providers']
+        self.assertEqual(after, {k: v for k, v in providers.items() if k != 'firework'})
+
+    def test_removing_named_qwen_provider_leaves_other_qwen_providers(self):
+        imported = self.home / '.dsh' / 'settings.yaml.imported'
+        imported.parent.mkdir(parents=True)
+        providers = {'qwen-token-plan-cn': {'api': 'selected'}, 'qwen-token-other': {'api': 'other'}}
+        imported.write_text(engine.dump_yaml({'llm-pi-ai': {'providers': providers}}), encoding='utf-8')
+        engine.Hub().remove_provider('qwen-token-plan-cn')
+        after = engine.parse_yaml(imported.read_text(encoding='utf-8'))['llm-pi-ai']['providers']
+        self.assertEqual(after, {'qwen-token-other': {'api': 'other'}})
+
+    def test_dsh_sync_keeps_unmanaged_qwen_routes_in_all_three_layers(self):
+        root=self.home/'.dsh';profile=root/'profiles/desktop';profile.mkdir(parents=True)
+        entries={'qwen-token-other':{'api':'untouched'}}
+        imported=root/'settings.yaml.imported';settings=root/'settings.yaml';patch=profile/'cordis.patch.yml'
+        value={'llm-pi-ai':{'providers':entries}}
+        imported.write_text(engine.dump_yaml(value),encoding='utf-8')
+        settings.write_text(engine.dump_yaml(value),encoding='utf-8')
+        patch.write_text(engine.dump_yaml([{'id':'llm-pi-ai','name':'@deepseek-ai/dsh-llm-pi-ai',
+                                          'config':{'providers':entries}}]),encoding='utf-8')
+        engine.Hub().push_dsh()
+        for file in (imported,settings):
+            value=engine.parse_yaml(file.read_text(encoding='utf-8'))
+            self.assertEqual(value['llm-pi-ai']['providers']['qwen-token-other'],{'api':'untouched'})
+        data=engine.parse_yaml(patch.read_text(encoding='utf-8'))
+        item=next(x for x in data if x.get('id')=='llm-pi-ai')
+        self.assertEqual(item['config']['providers']['qwen-token-other'],{'api':'untouched'})
+
+    def test_dsh_sync_creates_missing_configuration_directory(self):
+        engine.Hub().push_dsh()
+        self.assertTrue((self.home/'.dsh/settings.yaml').is_file())
 
     def test_nothing_is_written_when_guard_rejects(self):
         before = server.HUB_CONFIG.read_bytes()

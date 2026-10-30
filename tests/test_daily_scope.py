@@ -22,15 +22,15 @@ class DailyScopeTests(unittest.TestCase):
 
     def test_keep_agent_excluded_from_preview_and_claude_keep_tier_retains_native(self):
         native=self.home/'.claude/settings.json';native.parent.mkdir(parents=True)
-        native.write_text(json.dumps({'env':{'ANTHROPIC_DEFAULT_OPUS_MODEL':'native-kept-opus','ANTHROPIC_DEFAULT_OPUS_MODEL_NAME':'native-label'},'hooks':{'keep':True}}))
-        pi=self.home/'.pi/agent/settings.json';pi.parent.mkdir(parents=True);pi.write_text('{"defaultModel":"native-pi"}')
+        native.write_text(json.dumps({'env':{'ANTHROPIC_DEFAULT_OPUS_MODEL':'native-kept-opus','ANTHROPIC_DEFAULT_OPUS_MODEL_NAME':'native-label'},'hooks':{'keep':True}}), encoding="utf-8")
+        pi=self.home/'.pi/agent/settings.json';pi.parent.mkdir(parents=True);pi.write_text('{"defaultModel":"native-pi"}', encoding="utf-8")
         before=pi.read_bytes()
         plan={'name':'keep','targets':['claude','pi'],'base':{'provider':'deepseek','model':'deepseek/model-1'},'agents':{'pi':{'policy':'keep'},'claude':{'policy':'follow','tiers':{'opus':{'policy':'keep'}}}}}
         result=server.api_switch_plan_apply({'plan':plan})
         self.assertTrue(result['ok'],result)
         self.assertEqual(result['targets'],['claude'])
         self.assertEqual(pi.read_bytes(),before)
-        env=json.loads(native.read_text())['env']
+        env=json.loads(native.read_text(encoding="utf-8"))['env']
         self.assertEqual(env['ANTHROPIC_DEFAULT_OPUS_MODEL'],'native-kept-opus')
         self.assertEqual(env['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'],'native-label')
 

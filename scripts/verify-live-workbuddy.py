@@ -19,7 +19,7 @@ import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
-from observation import redact
+from agent_hub.observability.store import redact
 
 
 def write(path,value):

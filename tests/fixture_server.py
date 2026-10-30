@@ -9,14 +9,17 @@ from test_api import fake_push_all
 
 
 plans = {}
+model_syncs = {}
 sequence = 0
 
 
-def preview(h, only=None, *, reconcile=False):
+def preview(h, only=None, *, reconcile=False, model_sync=None):
     global sequence
     sequence += 1
     plan_id = f"fixture-{sequence}"
     plans[plan_id] = list(only or [])
+    if model_sync is not None:
+        model_syncs[plan_id] = model_sync
     return {"planId": plan_id, "targets": plans[plan_id], "warnings": [],
             "files": [{"path": str(engine.HOME / "test-clients" / f"{name}.json"), "action": "update"} for name in plans[plan_id]]}
 
@@ -24,6 +27,9 @@ def preview(h, only=None, *, reconcile=False):
 def apply(h, plan_id):
     if plan_id not in plans:
         raise ValueError("预览已失效，请重新预览")
+    if plan_id in model_syncs:
+        h.cfg['modelSync'] = model_syncs.pop(plan_id)
+        engine.save_json(engine.HUB_CONFIG, h.cfg)
     return {"transactionId": plan_id, "results": fake_push_all(h, plans[plan_id])}
 
 
@@ -45,7 +51,12 @@ def discover(_provider, agent=None):
 
 
 with isolated(), ExitStack() as stack:
-    for name in ("pi", "mcode", "zcode", "dsh", "claude", "cc_switch", "omp", "codex"):
+    config = engine.load_json(engine.HUB_CONFIG)
+    unknown_model = config['providers']['deepseek']['models'][6]
+    for field in ('contextWindow', 'maxTokens', 'input', 'reasoning'):
+        unknown_model.pop(field)
+    engine.save_json(engine.HUB_CONFIG, config)
+    for name in ("pi", "mcode", "zcode", "dsh", "claude", "cc_switch", "omp", "codex", "opencode"):
         stack.enter_context(patch.object(engine.Hub, f"push_{name}"))
     stack.enter_context(patch.object(engine.Hub, "preview_push", preview, create=True))
     stack.enter_context(patch.object(engine.Hub, "apply_preview", apply, create=True))

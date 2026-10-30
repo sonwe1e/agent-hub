@@ -152,7 +152,7 @@ class PreviewContractTests(unittest.TestCase):
         self.assertTrue(applied['ok'])
         self.assertEqual(applied['details'][0]['target'], 'codex')
         self.assertEqual(server.api_status()['lastTransaction'], applied['transactionId'])
-        self.assertIn('model_provider', (codex / 'config.toml').read_text())
+        self.assertIn('model_provider', (codex / 'config.toml').read_text(encoding="utf-8"))
         restored = server.api_restore({'transactionId': applied['transactionId']})
         self.assertTrue(restored['ok'])
         self.assertEqual((codex / 'config.toml').read_bytes(), original)

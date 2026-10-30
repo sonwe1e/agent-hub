@@ -141,12 +141,12 @@ class CodexRoundTripTests(unittest.TestCase):
 
     def test_monitoring_ignores_legacy_codex_auth_file_entries(self):
         with isolated() as home:
-            cfg=json.loads(server.HUB_CONFIG.read_text())
+            cfg=json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
             cfg["sync"]["targets"]={"codex":{"enabled":True,"files":[str(home/".codex"/"auth.json")]}}
             engine.save_json(server.HUB_CONFIG,cfg)
             directory=home/".codex"
             directory.mkdir()
-            (directory/"auth.json").write_text("do not inspect")
+            (directory/"auth.json").write_text("do not inspect", encoding="utf-8")
             original=Path.open
             def guarded(path,*args,**kwargs):
                 if path == directory/"auth.json":
@@ -170,10 +170,10 @@ class CodexRoundTripTests(unittest.TestCase):
         with isolated() as home:
             directory=home/".codex"
             directory.mkdir()
-            (directory/"config.toml").write_text(BASE)
-            (directory/"auth.json").write_text("fake-auth-must-not-be-read")
-            (directory/"personal.config.toml").write_text("named profile untouched")
-            cfg=json.loads(server.HUB_CONFIG.read_text())
+            (directory/"config.toml").write_text(BASE, encoding="utf-8")
+            (directory/"auth.json").write_text("fake-auth-must-not-be-read", encoding="utf-8")
+            (directory/"personal.config.toml").write_text("named profile untouched", encoding="utf-8")
+            cfg=json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
             cfg["sync"]["targets"]={"codex":{"enabled":True,"mode":"third-party"}}
             cfg["providers"]["deepseek"]["codexWireApi"]="responses"
             engine.save_json(server.HUB_CONFIG,cfg)
@@ -187,7 +187,7 @@ class CodexRoundTripTests(unittest.TestCase):
                 cfg["sync"]["targets"]["codex"]["mode"]="official"
                 engine.save_json(server.HUB_CONFIG,cfg)
                 engine.Hub().push_codex()
-            self.assertEqual(tomllib.loads((directory/"config.toml").read_text()),tomllib.loads(BASE))
-            self.assertEqual((directory/"auth.json").read_text(),"fake-auth-must-not-be-read")
+            self.assertEqual(tomllib.loads((directory/"config.toml").read_text(encoding="utf-8")),tomllib.loads(BASE))
+            self.assertEqual((directory/"auth.json").read_text(encoding="utf-8"),"fake-auth-must-not-be-read")
 
 if __name__ == "__main__": unittest.main()

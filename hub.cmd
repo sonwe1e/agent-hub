@@ -5,6 +5,8 @@ rem with 9009, so probe for a real interpreter instead of trusting PATH.
 rem NOTE: keep this file ASCII-only - cmd.exe parses it in the OEM codepage.
 setlocal EnableExtensions
 set "ROOT=%~dp0"
+if /i "%~1"=="gui" goto desktop
+if /i "%~1"=="desktop" goto desktop
 set "PY="
 
 rem 1) explicit override
@@ -36,10 +38,6 @@ if "%~1"=="ui" (
   start "" "%PYW%" "%ROOT%launch.py" %*
   exit /b 0
 )
-if "%~1"=="gui" (
-  start "" "%PYW%" "%ROOT%launch.py" %*
-  exit /b 0
-)
 if "%~1"=="gui-legacy" (
   start "" "%PYW%" "%ROOT%gui.py"
   exit /b 0
@@ -49,6 +47,10 @@ if "%~1"=="serve" (
   exit /b 0
 )
 "%PY%" "%ROOT%hub.py" %*
+exit /b %ERRORLEVEL%
+
+:desktop
+call "%ROOT%desktop.cmd"
 exit /b %ERRORLEVEL%
 
 :probe

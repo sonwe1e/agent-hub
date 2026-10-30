@@ -169,8 +169,8 @@ class CodexConnectionAuthTests(unittest.TestCase):
             directory = home / ".codex"
             directory.mkdir()
             config = directory / "config.toml"
-            config.write_text(BASE)
-            cfg = json.loads(engine.HUB_CONFIG.read_text())
+            config.write_text(BASE, encoding="utf-8")
+            cfg = json.loads(engine.HUB_CONFIG.read_text(encoding="utf-8"))
             cfg["sync"]["targets"] = {"codex": {"enabled": True, "mode": "third-party"}}
             provider = cfg["providers"]["deepseek"]
             provider.update(apiKey="synthetic-default", openaiApiKey="synthetic-legacy",
@@ -179,7 +179,7 @@ class CodexConnectionAuthTests(unittest.TestCase):
             engine.save_json(engine.HUB_CONFIG, cfg)
             with self.assertRaisesRegex(transaction.TransactionError, "apiKey"):
                 server.api_preview({"targets": ["codex"]})
-            self.assertEqual(config.read_text(), BASE)
+            self.assertEqual(config.read_text(encoding="utf-8"), BASE)
             self.assertFalse((directory / ".agent-hub-state.json").exists())
 
     def test_explicit_empty_env_allows_agent_literal_and_missing_env_still_inherits(self):
@@ -212,14 +212,14 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
         self.root.mkdir()
         self.path = self.root / "config.toml"
         self.sidecar = self.root / ".agent-hub-state.json"
-        self.path.write_text(BASE)
-        self.cfg = json.loads(engine.HUB_CONFIG.read_text())
+        self.path.write_text(BASE, encoding="utf-8")
+        self.cfg = json.loads(engine.HUB_CONFIG.read_text(encoding="utf-8"))
         self.cfg["sync"]["targets"] = {"codex": {"enabled": True, "mode": "third-party"}}
         engine.save_json(engine.HUB_CONFIG, self.cfg)
         initial = server.api_preview({"targets": ["codex"]})
         server.api_apply({"planId": initial["planId"]})
-        self.managed = self.path.read_text()
-        self.path.write_text(self.managed.replace('model = "deepseek/model-1"', 'model = "native-change"'))
+        self.managed = self.path.read_text(encoding="utf-8")
+        self.path.write_text(self.managed.replace('model = "deepseek/model-1"', 'model = "native-change"'), encoding="utf-8")
 
     def test_refreshing_automatic_preview_alone_cannot_resolve_stale_snapshot(self):
         before = (self.path.read_bytes(), self.sidecar.read_bytes())
@@ -236,7 +236,7 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
         self.assertNotIn("native-change", json.dumps(plan))
         self.assertNotIn("test-not-a-real-key", json.dumps(plan))
         self.assertTrue(server.api_apply({"planId": plan["planId"]})["ok"])
-        self.assertEqual(self.path.read_text(), self.managed)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), self.managed)
         # Repaired ownership can subsequently be used by ordinary push.
         self.assertTrue(all("✓" in result for result in engine.Hub().push_all(["codex"])))
 
@@ -250,9 +250,9 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
         for field in FIELDS:
             with self.subTest(field=field):
                 plan = server.api_preview({"targets": ["codex"]})
-                text = self.path.read_text()
+                text = self.path.read_text(encoding="utf-8")
                 value = tomllib.loads(text)[field]
-                self.path.write_text(text.replace(f'{field} = "{value}"', f'{field} = "changed-after-preview"'))
+                self.path.write_text(text.replace(f'{field} = "{value}"', f'{field} = "changed-after-preview"'), encoding="utf-8")
                 before = (self.path.read_bytes(), self.sidecar.read_bytes())
                 with self.assertRaisesRegex(transaction.TransactionError, "stale"):
                     server.api_apply({"planId": plan["planId"]})
@@ -262,7 +262,7 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
 
     def test_provider_table_edit_after_preview_rejects_apply(self):
         plan = server.api_preview({"targets": ["codex"]})
-        self.path.write_text(self.path.read_text().replace("api.deepseek.com", "changed.example"))
+        self.path.write_text(self.path.read_text().replace("api.deepseek.com", "changed.example"), encoding="utf-8")
         before = self.path.read_bytes()
         with self.assertRaisesRegex(transaction.TransactionError, "stale"):
             server.api_apply({"planId": plan["planId"]})
@@ -270,7 +270,7 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
 
     def test_sidecar_edit_after_preview_rejects_apply(self):
         plan = server.api_preview({"targets": ["codex"]})
-        self.sidecar.write_text(self.sidecar.read_text() + "\n")
+        self.sidecar.write_text(self.sidecar.read_text() + "\n", encoding="utf-8")
         before = (self.path.read_bytes(), self.sidecar.read_bytes())
         with self.assertRaisesRegex(transaction.TransactionError, "stale"):
             server.api_apply({"planId": plan["planId"]})
@@ -278,7 +278,7 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
 
     def test_reconciliation_never_opens_native_auth_or_named_profiles(self):
         for name in ("auth.json", "personal.config.toml"):
-            (self.root / name).write_text("synthetic sentinel must never be read")
+            (self.root / name).write_text("synthetic sentinel must never be read", encoding="utf-8")
         original_open = Path.open
         def guarded(path, *args, **kwargs):
             if path.parent == self.root and path.name in ("auth.json", "personal.config.toml"):
@@ -288,7 +288,7 @@ class CodexPreviewReconciliationTests(unittest.TestCase):
             plan = server.api_preview({"targets": ["codex"]})
             server.api_apply({"planId": plan["planId"]})
         for name in ("auth.json", "personal.config.toml"):
-            self.assertEqual((self.root / name).read_text(), "synthetic sentinel must never be read")
+            self.assertEqual((self.root / name).read_text(encoding="utf-8"), "synthetic sentinel must never be read")
 
 
 if __name__ == "__main__":

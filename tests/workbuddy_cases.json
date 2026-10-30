@@ -1,0 +1,1095 @@
+{
+ "comment": "Declarative WorkBuddy conversion cases, in the pattern of magpie-community/plugins' cases.json. Each case is data: the input request/schema/messages and the exact expected output. tests/test_workbuddy_cases.py drives each through workbuddy_protocol the way gateway_server calls it.",
+ "schema": [
+  {
+   "name": "pattern bare NUL becomes \\u0000",
+   "input": {
+    "type": "string",
+    "pattern": "\\0abc"
+   },
+   "expect": {
+    "type": "string",
+    "pattern": "\\u0000abc"
+   }
+  },
+  {
+   "name": "pattern octal escape stays",
+   "input": {
+    "type": "string",
+    "pattern": "\\01"
+   },
+   "expect": {
+    "type": "string",
+    "pattern": "\\01"
+   }
+  },
+  {
+   "name": "pattern escaped backslash before 0 stays",
+   "input": {
+    "type": "string",
+    "pattern": "\\\\0abc"
+   },
+   "expect": {
+    "type": "string",
+    "pattern": "\\\\0abc"
+   }
+  },
+  {
+   "name": "tuple items become one schema any of them fits, booleans dropped",
+   "input": {
+    "type": "array",
+    "items": [
+     {
+      "type": "string"
+     },
+     {
+      "type": "number"
+     },
+     true
+    ]
+   },
+   "expect": {
+    "type": "array",
+    "items": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "empty items list is any schema, additionalItems dropped",
+   "input": {
+    "type": "array",
+    "items": [],
+    "additionalItems": false
+   },
+   "expect": {
+    "type": "array",
+    "items": {}
+   }
+  },
+  {
+   "name": "single items entry unwrapped",
+   "input": {
+    "type": "array",
+    "items": [
+     {
+      "type": "string"
+     }
+    ]
+   },
+   "expect": {
+    "type": "array",
+    "items": {
+     "type": "string"
+    }
+   }
+  },
+  {
+   "name": "type list lowercased, unknown dropped, deduped",
+   "input": {
+    "type": [
+     "String",
+     "any",
+     "NULL",
+     "string"
+    ]
+   },
+   "expect": {
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  {
+   "name": "unknown scalar type dropped",
+   "input": {
+    "type": "any"
+   },
+   "expect": {}
+  },
+  {
+   "name": "required that is not a list left out",
+   "input": {
+    "type": "object",
+    "required": "a"
+   },
+   "expect": {
+    "type": "object"
+   }
+  },
+  {
+   "name": "required non-string entries filtered",
+   "input": {
+    "type": "object",
+    "required": [
+     "a",
+     1,
+     null
+    ],
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    }
+   },
+   "expect": {
+    "type": "object",
+    "required": [
+     "a"
+    ],
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  {
+   "name": "enum without type takes its values' type",
+   "input": {
+    "enum": [
+     "a",
+     "b"
+    ]
+   },
+   "expect": {
+    "enum": [
+     "a",
+     "b"
+    ],
+    "type": "string"
+   }
+  },
+  {
+   "name": "enum with null takes type and null",
+   "input": {
+    "enum": [
+     "a",
+     null
+    ]
+   },
+   "expect": {
+    "enum": [
+     "a",
+     null
+    ],
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  {
+   "name": "enum of several types is an anyOf of typed enums",
+   "input": {
+    "enum": [
+     1,
+     "a"
+    ]
+   },
+   "expect": {
+    "anyOf": [
+     {
+      "type": "integer",
+      "enum": [
+       1
+      ]
+     },
+     {
+      "type": "string",
+      "enum": [
+       "a"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "name": "typed enum unchanged",
+   "input": {
+    "type": "string",
+    "enum": [
+     "a",
+     "b"
+    ]
+   },
+   "expect": {
+    "type": "string",
+    "enum": [
+     "a",
+     "b"
+    ]
+   }
+  },
+  {
+   "name": "empty enum fits nothing and is left out",
+   "input": {
+    "enum": []
+   },
+   "expect": {}
+  },
+  {
+   "name": "enum that is not a list is left out",
+   "input": {
+    "enum": "abc"
+   },
+   "expect": {}
+  },
+  {
+   "name": "nested boolean schemas become {} and not-{}",
+   "input": {
+    "type": "object",
+    "properties": {
+     "x": true,
+     "y": false,
+     "p": {
+      "type": "object",
+      "additionalProperties": true
+     }
+    }
+   },
+   "expect": {
+    "type": "object",
+    "properties": {
+     "x": {},
+     "y": {
+      "not": {}
+     },
+     "p": {
+      "type": "object",
+      "additionalProperties": true
+     }
+    }
+   }
+  },
+  {
+   "name": "boolean additionalProperties itself stays",
+   "input": {
+    "type": "object",
+    "additionalProperties": false
+   },
+   "expect": {
+    "type": "object",
+    "additionalProperties": false
+   }
+  }
+ ],
+ "after_tools": [
+  {
+   "name": "tool results then user get an empty assistant reply",
+   "inserted": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ],
+   "expect_messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ]
+  },
+  {
+   "name": "already separated chat matches nothing",
+   "inserted": false,
+   "messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ],
+   "expect_messages": [
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "next"
+    }
+   ]
+  },
+  {
+   "name": "chat ending with tool results only stays",
+   "inserted": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    }
+   ],
+   "expect_messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    }
+   ]
+  },
+  {
+   "name": "chat ending with the assistant's message is a prefill and stays",
+   "inserted": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "assistant",
+     "content": "pre"
+    }
+   ],
+   "expect_messages": [
+    {
+     "role": "user",
+     "content": "hi"
+    },
+    {
+     "role": "assistant",
+     "content": "pre"
+    }
+   ]
+  },
+  {
+   "name": "a run of trailing user messages is separated before the first",
+   "inserted": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "user",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "expect_messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c",
+     "content": "r"
+    },
+    {
+     "role": "assistant",
+     "content": ""
+    },
+    {
+     "role": "user",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "name": "client metadata normalized, tool results verbatim, billing-only system dropped",
+   "protocol": "chat",
+   "request": {
+    "messages": [
+     {
+      "role": "system",
+      "content": "x-anthropic-billing-header: cc_version=1.0; secretless_test=1;\n"
+     },
+     {
+      "role": "system",
+      "content": "You are Claude Code, Anthropic's official CLI for Claude"
+     },
+     {
+      "role": "user",
+      "content": "Read the requested file."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": "x-anthropic-billing-header: cc_version=1.0;\n"
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are Claude Code, Anthropic's CLI for Claude"
+     },
+     {
+      "role": "user",
+      "content": "Read the requested file."
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": "x-anthropic-billing-header: cc_version=1.0;\n"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    }
+   }
+  },
+  {
+   "name": "anthropic tool result images stay one user turn",
+   "protocol": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "see image"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "c",
+        "name": "view",
+        "input": {}
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "c",
+        "content": [
+         {
+          "type": "text",
+          "text": "image result"
+         },
+         {
+          "type": "image",
+          "source": {
+           "type": "base64",
+           "media_type": "image/png",
+           "data": "AAAA"
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "name": "view",
+      "input_schema": {
+       "type": "object"
+      }
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "see image"
+     },
+     {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+       {
+        "id": "c",
+        "type": "function",
+        "function": {
+         "name": "view",
+         "arguments": "{}"
+        }
+       }
+      ]
+     },
+     {
+      "role": "tool",
+      "tool_call_id": "c",
+      "content": "image result"
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "Attached image(s) from tool result:"
+       },
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,AAAA"
+        }
+       }
+      ]
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "view",
+       "description": "",
+       "parameters": {
+        "type": "object"
+       }
+      }
+     }
+    ]
+   },
+   "expect_names": {
+    "view": "view"
+   }
+  },
+  {
+   "name": "responses developer, images, safe tool names and typed enum root",
+   "protocol": "responses",
+   "request": {
+    "instructions": "system",
+    "max_output_tokens": 200,
+    "reasoning": {
+     "effort": "high"
+    },
+    "input": [
+     {
+      "role": "developer",
+      "content": [
+       {
+        "type": "input_text",
+        "text": "policy"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "input_image",
+        "image_url": "data:image/png;base64,AAAA"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "type": "function",
+      "name": "mcp.read",
+      "parameters": {
+       "anyOf": [
+        {
+         "properties": {
+          "path": {
+           "enum": [
+            "a",
+            "b"
+           ]
+          }
+         }
+        }
+       ]
+      }
+     }
+    ],
+    "tool_choice": {
+     "type": "function",
+     "name": "mcp.read"
+    }
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "system"
+     },
+     {
+      "role": "system",
+      "content": [
+       {
+        "type": "text",
+        "text": "policy"
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "image_url",
+        "image_url": {
+         "url": "data:image/png;base64,AAAA"
+        }
+       }
+      ]
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "max_tokens": 200,
+    "reasoning_effort": "high",
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "mcp_read",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "path": {
+          "enum": [
+           "a",
+           "b"
+          ],
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    ],
+    "tool_choice": "mcp_read"
+   },
+   "expect_names": {
+    "mcp_read": "mcp.read"
+   }
+  },
+  {
+   "name": "responses union-root parameters merge into one object",
+   "protocol": "responses",
+   "request": {
+    "input": "hi",
+    "tools": [
+     {
+      "type": "function",
+      "name": "view",
+      "parameters": {
+       "anyOf": [
+        {
+         "properties": {
+          "path": {
+           "type": "string"
+          }
+         }
+        },
+        {
+         "properties": {
+          "mode": {
+           "type": "string"
+          }
+         }
+        }
+       ]
+      }
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "view",
+       "parameters": {
+        "type": "object",
+        "properties": {
+         "path": {
+          "type": "string"
+         },
+         "mode": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    ]
+   },
+   "expect_names": {
+    "view": "view"
+   }
+  },
+  {
+   "name": "responses allOf parameters resolve local refs and merge whole",
+   "protocol": "responses",
+   "request": {
+    "input": "hi",
+    "tools": [
+     {
+      "type": "function",
+      "name": "view",
+      "parameters": {
+       "allOf": [
+        {
+         "$ref": "#/$defs/base"
+        }
+       ],
+       "$defs": {
+        "base": {
+         "properties": {
+          "a": {
+           "type": "string"
+          }
+         },
+         "required": [
+          "a"
+         ]
+        }
+       }
+      }
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "view",
+       "parameters": {
+        "$defs": {
+         "base": {
+          "properties": {
+           "a": {
+            "type": "string"
+           }
+          },
+          "required": [
+           "a"
+          ]
+         }
+        },
+        "type": "object",
+        "properties": {
+         "a": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "a"
+        ]
+       }
+      }
+     }
+    ]
+   },
+   "expect_names": {
+    "view": "view"
+   }
+  },
+  {
+   "name": "a non-object parameters root becomes an object",
+   "protocol": "responses",
+   "request": {
+    "input": "hi",
+    "tools": [
+     {
+      "type": "function",
+      "name": "echo",
+      "parameters": {
+       "type": "string"
+      }
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    },
+    "tools": [
+     {
+      "type": "function",
+      "function": {
+       "name": "echo",
+       "parameters": {
+        "type": "object",
+        "properties": {}
+       }
+      }
+     }
+    ]
+   },
+   "expect_names": {
+    "echo": "echo"
+   }
+  },
+  {
+   "name": "web_search_call history becomes a synthetic assistant message",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "web_search_call",
+      "id": "ws_1",
+      "action": {
+       "type": "search",
+       "query": "magpie plugins"
+      }
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "role": "assistant",
+      "content": "[Historical web search activity; recorded data only, not a new tool call. Search results are not reconstructed.]\n{\"action\": {\"type\": \"search\", \"query\": \"magpie plugins\"}}"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    }
+   }
+  },
+  {
+   "name": "opaque reasoning items are skipped",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "reasoning",
+      "encrypted_content": "cipher",
+      "summary": []
+     },
+     {
+      "role": "user",
+      "content": "again"
+     }
+    ]
+   },
+   "expect_chat": {
+    "model": "m",
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "role": "user",
+      "content": "again"
+     }
+    ],
+    "stream": true,
+    "stream_options": {
+     "include_usage": true
+    }
+   }
+  }
+ ],
+ "errors": [
+  {
+   "name": "compaction refuses with an actionable message",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "compaction",
+      "encrypted_content": "x"
+     }
+    ]
+   },
+   "expect_error": "加密的压缩或上下文引用"
+  },
+  {
+   "name": "item_reference refuses with an actionable message",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "item_reference",
+      "id": "item_1"
+     }
+    ]
+   },
+   "expect_error": "加密的压缩或上下文引用"
+  },
+  {
+   "name": "ciphertext-bearing items refuse instead of being dropped silently",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "function_call",
+      "call_id": "c",
+      "name": "f",
+      "arguments": "{}",
+      "encrypted_content": "x"
+     }
+    ]
+   },
+   "expect_error": "历史未被静默丢弃"
+  },
+  {
+   "name": "unknown item type names itself",
+   "protocol": "responses",
+   "request": {
+    "input": [
+     {
+      "role": "user",
+      "content": "hi"
+     },
+     {
+      "type": "tool_search_call",
+      "id": "t"
+     }
+    ]
+   },
+   "expect_error": "暂不支持 Responses 输入类型"
+  }
+ ]
+}

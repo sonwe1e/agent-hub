@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from support import engine, isolated
@@ -77,6 +79,114 @@ class SwitchPlanFixture(unittest.TestCase):
 
 class SwitchPlanTestCase(SwitchPlanFixture):
     """切换方案的核心行为：按连接校验、取值语义、模式边界、失效引用、事务与恢复。"""
+
+    def test_preview_stages_hub_and_native_config_and_restore_recovers_both(self):
+        self.enable("pi")
+        native = self.write_pi_settings()
+        before_config = engine.HUB_CONFIG.read_bytes()
+        before_native = native.read_bytes()
+        plan = {"name": "暂存", "targets": ["pi"],
+                "agents": {"pi": {"policy": "fixed", "provider": "deepseek",
+                                    "model": "deepseek/model-2"}}}
+        preview = server.api_switch_plan_preview({"plan": plan})
+        self.assertTrue(preview["ok"], preview)
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before_config)
+        self.assertEqual(native.read_bytes(), before_native)
+        self.assertIn(str(engine.HUB_CONFIG), [row["path"] for row in preview["files"]])
+        applied = server.api_apply({"planId": preview["planId"]})
+        self.assertTrue(applied["ok"], applied)
+        self.assertEqual(self.config()["modelSync"]["overrides"]["pi"]["model"], "deepseek/model-2")
+        self.assertEqual(read_json(native)["defaultModel"], "deepseek/model-2")
+        server.api_restore({"transactionId": applied["transactionId"]})
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before_config)
+        self.assertEqual(native.read_bytes(), before_native)
+
+    def test_failed_preview_does_not_persist_model_selection(self):
+        self.enable("pi")  # dsh is disabled.
+        before = engine.HUB_CONFIG.read_bytes()
+        plan = {"name": "未启用", "targets": ["dsh"],
+                "agents": {"dsh": {"policy": "fixed", "provider": "deepseek",
+                                     "model": "deepseek/model-2"}}}
+        with self.assertRaisesRegex(transaction.TransactionError, "not explicitly enabled"):
+            server.api_switch_plan_preview({"plan": plan})
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before)
+
+    def test_hub_config_write_failure_rolls_back_native_changes(self):
+        self.enable("pi")
+        native = self.write_pi_settings()
+        before_config = engine.HUB_CONFIG.read_bytes()
+        before_native = native.read_bytes()
+        plan = {"name": "回滚", "targets": ["pi"],
+                "agents": {"pi": {"policy": "fixed", "provider": "deepseek",
+                                    "model": "deepseek/model-2"}}}
+        preview = server.api_switch_plan_preview({"plan": plan})
+        original = transaction._atomic_write
+        def fail_config(path, data, mode=None):
+            if path == engine.HUB_CONFIG:
+                raise OSError("simulated Hub config write failure")
+            return original(path, data, mode)
+        with patch.object(transaction, "_atomic_write", side_effect=fail_config):
+            with self.assertRaisesRegex(transaction.TransactionError, "rolled back"):
+                server.api_apply({"planId": preview["planId"]})
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before_config)
+        self.assertEqual(native.read_bytes(), before_native)
+
+    def test_switch_transaction_restores_config_outside_home_with_custom_filename(self):
+        self.enable("pi")
+        self.write_pi_settings()
+        with tempfile.TemporaryDirectory(prefix='hub-external-config-') as directory:
+            config = Path(directory) / 'my-config.jsonc'
+            config.write_bytes(engine.HUB_CONFIG.read_bytes())
+            before = config.read_bytes()
+            with patch.object(engine, 'HUB_CONFIG', config), patch.object(server, 'HUB_CONFIG', config):
+                plan = {"name": "外部配置", "targets": ["pi"],
+                        "agents": {"pi": {"policy": "fixed", "provider": "deepseek",
+                                            "model": "deepseek/model-2"}}}
+                preview = server.api_switch_plan_preview({"plan": plan})
+                self.assertEqual(config.read_bytes(), before)
+                applied = server.api_apply({"planId": preview["planId"]})
+                self.assertNotEqual(config.read_bytes(), before)
+                server.api_restore({"transactionId": applied["transactionId"]})
+                self.assertEqual(config.read_bytes(), before)
+
+    def test_opencode_can_be_enabled_previewed_applied_and_restored_with_gateway_on(self):
+        self.assertNotIn("opencode", self.config()["sync"]["targets"])
+        self.assertFalse(server.api_status()["targets"]["opencode"]["enabled"])
+        server.api_update_targets({"targets": {"opencode": {"enabled": True}}})
+        cfg = self.config()
+        cfg["gateway"] = {"enabled": True}
+        self.save(cfg)
+        before = engine.HUB_CONFIG.read_bytes()
+        native = self.home / ".config" / "opencode" / "opencode.json"
+        native.parent.mkdir(parents=True)
+        native.write_text(json.dumps({"mcp": {"kept": {"type": "local", "command": ["echo"]}}}), encoding="utf-8")
+        before_native = native.read_bytes()
+        plan = {"name": "OpenCode", "targets": ["opencode"],
+                "agents": {"opencode": {"policy": "fixed", "provider": "deepseek",
+                                         "model": "deepseek/model-2"}}}
+        preview = server.api_switch_plan_preview({"plan": plan})
+        self.assertTrue(preview["ok"], preview)
+        self.assertTrue(any("替换" in warning and "provider" in warning for warning in preview["warnings"]))
+        self.assertEqual(preview["analysis"]["details"][0]["effort"]["support"], "unsupported")
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before)
+        self.assertEqual(native.read_bytes(), before_native)
+
+        applied = server.api_apply({"planId": preview["planId"]})
+        self.assertTrue(applied["ok"], applied)
+        self.assertEqual(read_json(native)["model"], "deepseek/deepseek/model-2")
+        self.assertIn("kept", read_json(native)["mcp"])
+        self.assertEqual(self.config()["modelSync"]["overrides"]["opencode"]["model"], "deepseek/model-2")
+        server.api_restore({"transactionId": applied["transactionId"]})
+        self.assertEqual(engine.HUB_CONFIG.read_bytes(), before)
+        self.assertEqual(native.read_bytes(), before_native)
+
+    def test_opencode_uses_the_connection_specific_model_catalog(self):
+        cfg = self.config()
+        provider = cfg["providers"]["deepseek"]
+        provider.setdefault("agents", {})["opencode"] = {"models": [{"id": "private-model"}]}
+        exported = engine.opencode_providers({"deepseek": provider})
+        self.assertEqual(set(exported["deepseek"]["models"]), {"private-model"})
+        self.assertNotIn('api', exported['deepseek']['models']['private-model']['provider'])
 
     # -- 1. 多 Agent 一次应用，核对原生配置产物 --
     def test_one_plan_applies_to_several_agents_and_writes_native_artifacts(self):

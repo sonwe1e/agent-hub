@@ -1,0 +1,405 @@
+/* ============================================================
+   观测页密度层
+   ------------------------------------------------------------
+   只调密度与节奏，**不定义任何颜色 token**（规范 §8.2：
+   旧版这里曾重新定义 :root，导致与 styles.css 两套主题打架）。
+   全部颜色来自 ui/styles.css 的 :root。
+
+   观测是密集表格场景，保留更紧的行高与更小的字号，
+   但分隔方式与主站一致：四级发丝线 + 留白，不用阴影与色带。
+   ============================================================ */
+
+/* ---- 外壳：与 styles.css 同一尺寸体系 ------------------------------------
+   旧版这里另立了一套外壳（206px 侧栏 / 52px 顶栏 / 24px 内容边距 / 16px 品牌），
+   导致 Agent/观测 与 设置/供应商/模型 之间切换时整个外壳跳动，窄屏断点也分叉。
+   现在全部沿用 styles.css 的 token 与断点（1600 / 1200 / 900 / 850 / 620）；
+   保留同值规则是为了维持选择器集合稳定（scripts/verify-css.py 的守恒检查）。 */
+.app-shell { grid-template-columns: var(--sidebar-w) minmax(0, 1fr); }
+.sidebar { padding: 26px 14px 18px; }
+.brand { font-size: 17px; gap: 9px; padding: 0 8px; }
+.brand small { font-size: 9px; letter-spacing: var(--ls-caps); }
+.brand-mark { width: 30px; height: 30px; }
+.nav-caption { margin-top: 28px; }
+.nav-item { padding: 8px 10px; }
+.settings-nav { margin: 10px 0 0 17px; border-left: 1px solid var(--rule); padding-left: 8px; }
+.settings-nav .nav-item { font-size: var(--fs-sm); padding: 6px 9px; }
+.sidebar-note { background: transparent; border-color: var(--rule); padding: 14px 10px; }
+.sidebar-note p { color: var(--ink-3); }
+
+.topbar { height: var(--topbar-h); padding: 0 var(--page-pad-x); }
+#content { padding: var(--page-pad-y) var(--page-pad-x); width: 100%; margin: 0 auto; }
+.page-heading { margin-bottom: var(--block-gap); }
+.page-heading h1 { font-size: var(--fs-2xl); letter-spacing: var(--ls-tight); }
+.page-heading p { font-size: var(--fs-sm); color: var(--ink-3); }
+.eyebrow { font-size: 9px; letter-spacing: .05em; }
+.card { box-shadow: none; }
+.card-heading { padding: 16px 20px; border-bottom: 1px solid var(--rule); }
+.card-heading h2 { font-size: var(--fs-lg); }
+.card-heading p { font-size: var(--fs-xs); line-height: var(--lh-relaxed); }
+.notice { font-size: var(--fs-xs); line-height: var(--lh-relaxed); }
+.button-link {
+  display: inline-flex; gap: 8px; align-items: center;
+  border: 1px solid var(--rule-control); border-radius: var(--r-sm);
+  padding: 7px 11px; font-size: var(--fs-sm); background: var(--surface); white-space: nowrap;
+  font-weight: var(--w-medium); min-height: 32px;
+}
+.button-link:hover { background: var(--surface-sunk); border-color: var(--ink-3); }
+
+/* ---- Agent 表 ---- */
+.agent-list { overflow: hidden; }
+.agent-table-wrap { overflow-x: auto; }
+.agent-table { width: 100%; min-width: 890px; border-collapse: collapse; table-layout: fixed; }
+.agent-table th {
+  background: transparent; text-align: left; color: var(--ink-3);
+  font-size: var(--fs-2xs); font-weight: var(--w-semibold); letter-spacing: 0;
+  padding: 8px var(--row-px); border-bottom: 1px solid var(--rule-strong);
+}
+.agent-table th:nth-child(1) { width: 24%; }
+.agent-table th:nth-child(2) { width: 13%; }
+.agent-table th:nth-child(3) { width: 22%; }
+.agent-table th:nth-child(4) { width: 13%; }
+.agent-table th:last-child { width: 28%; }
+.agent-table td { vertical-align: middle; padding: var(--row-py-lg) var(--row-px); border-bottom: 1px solid var(--rule-faint); line-height: var(--lh-snug); }
+.agent-table tr:last-child td { border: 0; }
+.agent-table tbody tr:hover td { background: var(--surface-sunk); }
+.agent-table small, .agent-table .cell-secondary { display: block; font-size: var(--fs-xs); color: var(--ink-2); margin-top: 4px; line-height: var(--lh-relaxed); }
+.agent-identity { display: flex; gap: 12px; align-items: center; }
+.agent-identity strong { font-size: var(--fs-md); font-weight: var(--w-semibold); }
+/* Agent 标识：统一墨框，按 cat 色区分 */
+.agent-symbol {
+  display: grid; place-items: center; flex-shrink: 0;
+  width: 32px; height: 32px; border: 1px solid var(--rule-strong);
+  background: var(--surface); border-radius: 1px;
+  font-family: var(--font-display); font-size: 15px; font-weight: var(--w-bold); color: var(--ink-2);
+}
+.agent-symbol.claude { color: var(--cat-4); border-color: var(--cat-4); background: transparent; }
+.agent-symbol.codex { color: var(--cat-1); border-color: var(--cat-1); background: transparent; }
+.agent-symbol.pi { color: var(--cat-3); border-color: var(--cat-3); background: transparent; }
+.instance-picker { font-size: var(--fs-2xs); padding: 3px 22px 3px 7px; min-height: 25px; margin-top: 10px; max-width: 200px; border-color: var(--rule-control); }
+.version-number { font: var(--fs-xs) var(--font-mono); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.agent-table .tag { font-size: var(--fs-2xs); white-space: normal; }
+.agent-table .row-actions { gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.agent-table .row-actions button { font-size: var(--fs-2xs); padding: 4px 7px; }
+.agent-table .row-actions .icon-button { width: 26px; height: 26px; min-height: 26px; }
+.model-current { min-width: 0; }
+.model-current span { font-size: var(--fs-xs); color: var(--ink-2); }
+.model-current strong { display: block; font-size: var(--fs-sm); font-weight: var(--w-medium); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 3px; }
+.align-right { text-align: right !important; }
+
+.workspace-note { display: flex; justify-content: space-between; align-items: center; padding: 18px; margin-top: var(--block-gap); }
+.workspace-note strong { font-size: var(--fs-sm); margin-left: 10px; }
+.workspace-note p { font-size: var(--fs-xs); color: var(--ink-3); margin: 6px 0 0 26px; }
+.job-list { margin-top: var(--sp-4); }
+.job-row { padding: 13px 18px; border-bottom: 1px solid var(--rule-faint); }
+.job-row strong { font-size: var(--fs-sm); margin-right: 12px; }
+.job-row p, .job-row small { font-size: var(--fs-xs); color: var(--ink-3); margin-top: 7px; }
+/* 进度条：一条 2px 墨线在涨 */
+.job-row progress { display: block; width: 100%; height: 2px; margin-top: 11px; accent-color: var(--accent); border: 0; background: var(--rule-faint); }
+.job-row progress::-webkit-progress-value { background: var(--accent); }
+.job-row progress::-webkit-progress-bar { background: var(--rule-faint); }
+
+.instance-detail { padding: 16px 0; border-bottom: 1px solid var(--rule-faint); }
+.instance-detail h3 { font-size: var(--fs-sm); }
+.path-line { overflow-wrap: anywhere; color: var(--ink-2); font-size: var(--fs-xs); line-height: var(--lh-relaxed); }
+dl { display: grid; grid-template-columns: 125px minmax(0, 1fr); gap: 10px 16px; font-size: var(--fs-sm); margin: 14px 0 20px; }
+dt { color: var(--ink-3); }
+dd { margin: 0; overflow-wrap: anywhere; }
+.error-full { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--danger); }
+.detail-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; font-size: var(--fs-sm); }
+.tag.red { color: var(--danger); border-color: var(--danger); background: var(--danger-wash); }
+.tag.amber { color: var(--warn); border-color: var(--warn); background: var(--warn-wash); }
+
+/* 采集状态行。链接是这一行的出口，触达目标必须 ≥24px（WCAG 2.2 AA 目标尺寸），
+   实测原来只有 56×16px：10px 字号 + 12px 图标撑不起高度。用 padding 把可点区域
+   撑到 24px 高，视觉上仍是「小字 + 箭头」的一行边注，不改成按钮。 */
+.collection-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--fs-2xs); color: var(--ink-2); margin: 0 0 18px; }
+.collection-line strong { font-size: var(--fs-xs); font-weight: var(--w-medium); color: var(--ink); }
+.collection-line a { margin-left: auto; display: flex; align-items: center; gap: 4px; min-height: 24px; padding: 0 4px; border-radius: var(--r-xs); }
+.collection-line a:hover { color: var(--ink); background: var(--surface-sunk); }
+.collection-line a .icon { width: 12px; }
+/* 离线 / 未确认：空心 = 未确认。未知不是故障，不用红色 */
+.offline-dot { width: 6px; height: 6px; background: transparent; border: 1px solid var(--unknown); border-radius: 50%; display: inline-block; }
+.obs-tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--rule-strong); margin-bottom: 18px; }
+.obs-tabs button { border: 0; border-bottom: 2px solid transparent; background: none; border-radius: 0; padding: 9px 3px; font-size: var(--fs-sm); color: var(--ink-3); font-weight: var(--w-medium); min-height: 0; }
+.obs-tabs button:hover { color: var(--ink); background: none; border-color: transparent; }
+.obs-tabs button.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: var(--w-semibold); }
+.obs-filters { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.obs-filters label { display: block; min-width: 110px; flex: 1; }
+.obs-filters label span { font-size: var(--fs-2xs); display: block; margin-bottom: 5px; color: var(--ink-3); }
+.obs-filters input, .obs-filters select { min-height: 30px; padding: 6px 9px; border-radius: var(--r-sm); font-size: var(--fs-xs); }
+.obs-filters .filter-model { flex: 1.5; min-width: 160px; }
+.obs-filters .filter-search { flex: 1.7; min-width: 160px; }
+.obs-filters button { min-height: 30px; font-size: var(--fs-xs); }
+.range-detail { margin: 11px 0 18px; font-size: var(--fs-2xs); color: var(--ink-3); }
+.range-detail summary { cursor: pointer; }
+.range-detail .actions { margin: 11px 0; align-items: flex-end; flex-wrap: wrap; }
+.range-detail input { font-size: var(--fs-xs); min-height: 29px; }
+.range-detail small { font-size: var(--fs-2xs); }
+.loading-inline { display: flex; gap: 12px; align-items: center; font-size: var(--fs-sm); color: var(--ink-3); padding: 11px; }
+.obs-empty { text-align: center; padding: 46px 24px; color: var(--ink-3); }
+.obs-empty > .icon { width: 22px; height: 22px; margin-bottom: 11px; }
+.obs-empty h3 { font-size: var(--fs-md); font-weight: var(--w-semibold); color: var(--ink); margin-bottom: 7px; }
+.obs-empty p { font-size: var(--fs-sm); max-width: 550px; margin: auto; line-height: var(--lh-relaxed); }
+.empty-actions { display: flex; justify-content: center; gap: 12px; margin: 0 0 22px; }
+
+/* 指标卡：四卡并排，发丝线分隔，无阴影无色带 */
+.metric-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-bottom: var(--block-gap); background: var(--rule); border: 1px solid var(--rule-strong); border-radius: var(--r-md); overflow: hidden; }
+/* 分布三卡的基础规则必须放在下方 @media 之前：旧版它落在媒体块之后，
+   同特异性下后到的基础规则压掉了 ≤900 的单列规则，窄屏三卡挤爆。 */
+.distribution-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.metric { display: block; text-align: left; border: 0; border-radius: 0; padding: 15px 17px; white-space: normal; box-shadow: none; background: var(--surface); }
+.metric:hover { background: var(--surface-sunk); }
+.metric > span { display: block; font-size: var(--fs-xs); color: var(--ink-3); }
+.metric strong { display: block; font-family: var(--font-display); font-size: var(--fs-3xl); font-weight: var(--w-bold); letter-spacing: var(--ls-tight); margin: 7px 0 5px; color: var(--ink); line-height: var(--lh-tight); font-variant-numeric: tabular-nums; font-feature-settings: var(--fs-num); }
+.metric small { font-size: var(--fs-2xs); color: var(--ink-3); font-weight: var(--w-regular); }
+/* 主指标卡 = 页面主题（已记录调用）。不用数值大小驱动：量纲不可比，且 30s 轮询会让焦点跳走 */
+.metric.lead { background: var(--accent-wash); box-shadow: inset 2px 0 0 var(--accent); }
+.metric.lead:hover { background: var(--accent-wash); }
+/* 语义状态：border-left 实线 = 已确认的失败，点线 = 未确认。不填色（不与三张纸面卡竞争层级），
+   静态类别标记（失败 = 0 时边线仍在，严重度由数字承载，不随 30s 轮询闪烁）。
+   选择器必须带 .metric 前缀：distribution 按钮也用 data-value，但值是模型名/Agent 名。 */
+.metric[data-value="failed"] { border-left: 2px solid var(--danger); }
+.metric[data-value="unknown"] { border-left: 2px dotted var(--unknown); }
+/* 类别标签上语义色，大数字保持 --ink：未确认的计数本身是已测得事实，
+   把数字也涂灰会把 measured 误读成 missing */
+.metric[data-value="failed"] > span { color: var(--danger); }
+.metric[data-value="unknown"] > span { color: var(--unknown); }
+/* hover 守卫：button:hover:not(:disabled)（styles.css:151）会重设 border-color，
+   必须配这条（0-3-0 压 0-2-1），否则 hover 时点线变灰丢语义 */
+.metric[data-value="failed"]:hover { border-left-color: var(--danger); }
+.metric[data-value="unknown"]:hover { border-left-color: var(--unknown); }
+.token-card { margin-bottom: var(--block-gap); }
+.token-grid { display: grid; grid-template-columns: repeat(5, 1fr); padding: 18px; }
+.token-grid > div { border-right: 1px solid var(--rule); padding: 0 17px; }
+.token-grid > div:first-child { padding-left: 0; }
+.token-grid > div:last-child { border: 0; }
+.token-grid span { font-size: var(--fs-2xs); color: var(--ink-3); }
+.token-grid strong { display: block; font-family: var(--font-display); font-size: 22px; font-weight: var(--w-bold); margin: 6px 0; font-variant-numeric: tabular-nums; font-feature-settings: var(--fs-num); }
+.token-grid small { display: block; font-size: 9px; color: var(--ink-3); }
+.performance-row { display: flex; flex-wrap: wrap; gap: 13px 26px; font-size: var(--fs-2xs); border-top: 1px solid var(--rule); padding: 13px 17px; color: var(--ink-3); }
+.performance-row b { color: var(--ink-2); font-size: var(--fs-2xs); font-weight: var(--w-medium); margin-left: 6px; font-variant-numeric: tabular-nums; }
+.performance-row small { font-size: var(--fs-2xs); }
+.obs-columns { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; margin-bottom: var(--block-gap); }
+.trend-chart { display: flex; height: 186px; align-items: flex-end; gap: 7px; padding: 22px 17px 18px; overflow-x: auto; position: relative; }
+/* 基线：一条 rule-strong 发丝线托住所有柱底（18px 底距 + 日期行 14px + 7px 列距 = 39px）。
+   印刷图表的坐标线仍是四级 rule 体系的一员；柱色与线同墨，柱底「坐」在线上。 */
+.trend-chart::after { content: ""; position: absolute; left: 17px; right: 17px; bottom: 39px; height: 1px; background: var(--rule-strong); pointer-events: none; }
+.trend-column { border: 0; background: none; min-width: 32px; max-width: 100px; flex: 1; padding: 0 6px; display: flex; flex-direction: column; gap: 7px; font-size: var(--fs-2xs); align-items: center; font-variant-numeric: tabular-nums lining-nums; }
+.trend-column:hover { background: none; }
+/* 图表柱默认是墨；一图一朱砂：焦点柱由 JS 加 .active（当前限定日 / 最新一天） */
+.trend-column i { display: block; width: 100%; min-width: 11px; background: var(--rule-strong); border-radius: 1px 1px 0 0; }
+.trend-column:hover i { background: var(--ink-3); }
+.trend-column.active i { background: var(--accent); }
+.trend-column.active:hover i { background: var(--accent-strong); }
+.trend-column.active span { color: var(--accent); font-weight: var(--w-semibold); }
+.trend-column small { font-size: 9px; color: var(--ink-2); }
+.trend-column.active small { color: var(--accent); }
+.coverage-list { padding: 11px 17px; }
+.coverage-list > div { display: flex; justify-content: space-between; font-size: var(--fs-xs); padding: 6px 0; border-bottom: 1px solid var(--rule-faint); }
+.coverage-list > div:last-child { border-bottom: 0; }
+.coverage-list strong { font-weight: var(--w-medium); font-variant-numeric: tabular-nums; }
+.coverage-list span { color: var(--ink-2); }
+.card-footnote { font-size: var(--fs-2xs); line-height: var(--lh-relaxed); color: var(--ink-3); padding: 0 17px 14px; }
+.quota-snapshot { padding: 14px 17px; border-top: 1px solid var(--rule); }
+.related-requests { padding: 0 17px 14px; }
+/* 按钮基础规则须在下方 @media 之前：否则 ≤620 的字号收窄会被同特异性的后到规则压掉 */
+.related-requests button { white-space: normal; text-align: left; justify-content: flex-start; font-size: var(--fs-xs); }
+
+.obs-table-scroll { overflow: auto; }
+.requests-table { width: 100%; min-width: 1000px; border-collapse: collapse; table-layout: fixed; }
+.requests-table th {
+  text-align: left; font-size: var(--fs-2xs); color: var(--ink-3); font-weight: var(--w-semibold);
+  letter-spacing: 0; padding: 8px var(--row-px); background: transparent;
+  border-bottom: 1px solid var(--rule-strong);
+}
+.requests-table th:nth-child(1) { width: 16%; }
+.requests-table th:nth-child(2) { width: 25%; }
+.requests-table th:nth-child(3) { width: 14%; }
+.requests-table th:nth-child(4) { width: 13%; }
+.requests-table th:nth-child(5) { width: 13%; }
+.requests-table th:last-child { width: 8%; }
+.requests-table td { padding: 11px var(--row-px); font-size: var(--fs-xs); border-bottom: 1px solid var(--rule-faint); vertical-align: top; line-height: var(--lh-snug); font-variant-numeric: tabular-nums lining-nums; }
+.requests-table tbody tr:hover { background: var(--surface-sunk); }
+.requests-table small { display: block; font-size: var(--fs-2xs); color: var(--ink-2); margin-top: 4px; }
+.request-model strong { display: block; font-size: var(--fs-xs); font-weight: var(--w-medium); margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.request-model small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.error-excerpt { color: var(--danger); font-size: var(--fs-2xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; margin-top: 5px; }
+.requests-table .tag { font-size: var(--fs-2xs); }
+.table-footer { font-size: var(--fs-2xs); }
+.conversation-row { padding: 18px; border-bottom: 1px solid var(--rule-faint); display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px 22px; }
+.conversation-main { display: flex; gap: 12px; min-width: 0; }
+.conversation-main > div { min-width: 0; }
+/* min-height 24px：实测 96×21px 低于 WCAG 2.2 AA 的 24px 目标尺寸。
+   padding 上下各 2px，视觉仍是「无边框文字按钮」（hover 才出下划线），
+   只是把可点区域从 21px 撑到 24px——不改成带边框的按钮，那会把它从
+   「句子级标题」抬成「控件」，与同列的路径、时间戳抢层级。 */
+.text-button { font-size: var(--fs-sm); font-weight: var(--w-medium); border: 0; padding: 2px 0; display: block; min-height: 24px; white-space: normal; text-align: left; overflow-wrap: anywhere; line-height: var(--lh-relaxed); background: none; color: var(--ink); }
+.text-button:hover { background: none; color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+.conversation-main small { font-size: var(--fs-2xs); color: var(--ink-2); }
+.conversation-count { text-align: right; display: flex; flex-direction: column; gap: 4px; font-variant-numeric: tabular-nums; }
+.conversation-count strong { font-size: var(--fs-sm); font-weight: var(--w-medium); }
+.conversation-count small { font-size: var(--fs-2xs); color: var(--ink-2); }
+.model-tags { grid-column: 1 / -1; padding-left: 44px; }
+.model-tags .tag { font-size: 9px; overflow-wrap: anywhere; white-space: normal; }
+.context-session { margin-bottom: var(--block-gap); }
+.context-session h2 { overflow-wrap: anywhere; }
+
+.settings-links { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 15px; margin-bottom: var(--block-gap); }
+.settings-links > a { display: block; padding: 18px; }
+.settings-links > a:hover { border-color: var(--rule-control); }
+.settings-links strong { font-size: var(--fs-sm); display: block; margin: 10px 0 6px; }
+.settings-links p { font-size: var(--fs-xs); color: var(--ink-3); margin-bottom: 9px; line-height: var(--lh-relaxed); }
+.settings-links > a > .icon:last-child { width: 13px; color: var(--ink-4); }
+.setting-row { display: flex; align-items: center; justify-content: space-between; padding: 18px; gap: 28px; border-bottom: 1px solid var(--rule-faint); }
+.setting-row strong { font-size: var(--fs-sm); font-weight: var(--w-medium); }
+.setting-row small { display: block; font-size: var(--fs-2xs); color: var(--ink-3); margin-top: 6px; line-height: var(--lh-relaxed); max-width: 760px; }
+.setting-row > select { width: 120px; flex-shrink: 0; font-size: var(--fs-sm); }
+.collection-path { font-size: var(--fs-2xs); color: var(--ink-2); padding: 14px 17px; overflow-wrap: anywhere; }
+.danger-zone { padding: 18px; border-top: 1px solid var(--rule); display: flex; align-items: center; gap: 28px; justify-content: space-between; }
+.danger-zone strong { font-size: var(--fs-sm); font-weight: var(--w-medium); }
+.danger-zone p { font-size: var(--fs-2xs); color: var(--ink-3); margin-top: 6px; }
+.collection-settings { margin-bottom: var(--block-gap); }
+
+@media (min-width: 1600px) { .agent-table td { padding-top: 18px; padding-bottom: 18px; } }
+@media (max-width: 1200px) {
+  .agent-table { min-width: 900px; }
+  .agent-table th:nth-child(3) { width: 20%; }
+  .agent-table th:last-child { width: 30%; }
+  .metric { padding: 14px; } .metric strong { font-size: var(--fs-2xl); }
+  .distribution-grid { gap: 11px; }
+  .token-grid > div { padding: 0 11px; }
+  .token-grid strong { font-size: 19px; }
+}
+/* 外壳断点与 styles.css 对齐：≤850 切 icon-rail，外壳样式由 styles.css 接管。
+   子导航是纯文字项，在 64px 图标栏里放不下，随之收起（设置页首排链接卡可达）。 */
+@media (max-width: 850px) {
+  .sidebar .settings-nav { display: none; }
+}
+/* 平板宽度：宽表横向滚动时操作列贴右缘常驻，不再被裁走。
+   背景要随行状态走（hover/选中各有底色），粘性单元必须显式跟色。 */
+@media (max-width: 900px) {
+  .agent-table th:last-child, .agent-table td:last-child,
+  .requests-table th:last-child, .requests-table td:last-child {
+    position: sticky; right: 0; box-shadow: inset 1px 0 0 var(--rule-faint);
+  }
+  .agent-table th:last-child, .agent-table td:last-child,
+  .requests-table th:last-child, .requests-table td:last-child { background: var(--surface); }
+  .agent-table tbody tr:hover td:last-child,
+  .requests-table tbody tr:hover td:last-child { background: var(--surface-sunk); }
+}
+@media (max-width: 900px) {
+  .page-heading { align-items: flex-start; gap: 13px; }
+  .page-heading .actions { flex-wrap: wrap; justify-content: flex-end; }
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .obs-columns { grid-template-columns: 1fr; }
+  .distribution-grid { grid-template-columns: 1fr; }
+  .settings-links { grid-template-columns: 1fr; }
+  .settings-links > a { padding: 14px; }
+  .settings-links strong { display: inline-block; margin: 0 0 7px 9px; }
+  .settings-links p { margin: 0; }
+  .settings-links > a > .icon:last-child { display: none; }
+  .token-grid { grid-template-columns: repeat(3, 1fr); gap: 20px 0; }
+  .token-grid > div:nth-child(3) { border: 0; }
+  .token-grid > div:nth-child(4) { padding-left: 0; }
+  .workspace-note { gap: 18px; } .workspace-note p { margin-left: 0; }
+  .collection-line a { margin-left: 0; }
+  .obs-tabs { gap: 24px; }
+}
+@media (max-width: 620px) {
+  /* 顶栏形态与 styles.css ≤620 同值：这里覆盖的是本文件基础段的同属性规则 */
+  .sidebar { position: static; width: 100%; height: auto; display: block; padding: 12px 16px; border-right: 0; border-bottom: 1px solid var(--rule-strong); }
+  .sidebar > nav { display: flex; gap: 6px; }
+  .nav-item { flex: 1; justify-content: center; padding: 10px 14px; font-size: var(--fs-sm); gap: 6px; }
+  .sidebar .settings-nav { display: flex; margin: 7px 0 0; padding: 0; border: 0; }
+  .topbar { height: 52px; padding: 0 16px; }
+  #content { padding: 22px 16px; }
+  .breadcrumb { font-size: var(--fs-2xs); }
+  .page-heading { display: block; }
+  .page-heading .actions { justify-content: flex-start; margin-top: 13px; }
+  .page-heading h1 { font-size: var(--fs-xl); }
+  .obs-tabs { gap: 15px; justify-content: space-between; }
+  .obs-tabs button { font-size: var(--fs-sm); }
+  .metric-grid { gap: 9px; } .metric { padding: 12px; }
+  .metric strong { font-size: var(--fs-2xl); } .metric small { font-size: var(--fs-2xs); }
+  .token-grid { padding: 15px; grid-template-columns: repeat(2, 1fr); }
+  .token-grid > div { padding: 0 9px; border: 0; }
+  .token-grid > div:nth-child(odd) { padding-left: 0; }
+  .token-grid strong { font-size: 20px; }
+  .obs-filters label { min-width: 120px; }
+  .obs-filters .filter-search { min-width: 220px; }
+  .obs-filters .filter-model { min-width: 160px; }
+  .card-heading { padding: 14px; }
+  .conversation-row { grid-template-columns: 1fr; padding: 14px; gap: 9px; }
+  .conversation-count { padding-left: 44px; text-align: left; flex-direction: row; flex-wrap: wrap; }
+  .conversation-count small { font-size: var(--fs-2xs); }
+  .context-caption { font-size: var(--fs-2xs); }
+  .context-session .card-heading { align-items: flex-start; gap: 11px; }
+  .context-session .card-heading button { font-size: var(--fs-2xs); }
+  .setting-row { padding: 15px; gap: 18px; }
+  .danger-zone { padding: 15px; align-items: flex-start; gap: 13px; }
+  .collection-settings .table-footer { flex-wrap: wrap; gap: 11px; }
+  .workspace-note { display: block; } .workspace-note > a { margin-top: 13px; }
+  dl { grid-template-columns: 90px minmax(0, 1fr); font-size: var(--fs-xs); gap: 9px; }
+  .workspace-footer { padding: 11px 14px; }
+  .agent-table-wrap { max-width: 100%; }
+  .related-requests button { font-size: var(--fs-2xs); }
+}
+
+.version-number { white-space: nowrap; font-size: var(--fs-xs); }
+.service-settings { padding: 18px; margin-bottom: var(--block-gap); font-size: var(--fs-sm); }
+.service-settings p { font-size: var(--fs-xs); color: var(--ink-3); margin: 7px 0 13px; line-height: var(--lh-relaxed); }
+.gateway-settings { margin-bottom: var(--block-gap); }
+.gateway-settings > p, .gateway-settings > .actions, .gateway-settings > small { margin: 11px 17px; }
+.gateway-settings > p, .gateway-settings > small { font-size: var(--fs-xs); line-height: var(--lh-relaxed); color: var(--ink-3); overflow-wrap: anywhere; }
+.gateway-settings > small { display: block; }
+.gateway-settings > .actions { flex-wrap: wrap; }
+.workbuddy-settings { margin-bottom: var(--block-gap); }
+.workbuddy-settings > p, .workbuddy-settings > .actions { margin: 11px 17px; font-size: var(--fs-xs); line-height: var(--lh-relaxed); overflow-wrap: anywhere; }
+.workbuddy-settings > .actions { flex-wrap: wrap; }
+.subscription-monitor { margin: 0 17px 13px; padding: 13px 0 2px; border-top: 1px solid var(--rule); font-size: var(--fs-xs); line-height: var(--lh-relaxed); overflow-wrap: anywhere; }
+.subscription-monitor h3 { margin: 0 0 7px; font-size: var(--fs-xs); font-weight: var(--w-semibold); }
+.subscription-monitor p { margin: 5px 0; }
+.subscription-source, .subscription-empty { color: var(--ink-3); }
+.subscription-alert { color: var(--accent); }
+.subscription-windows { margin-top: 6px; }
+.subscription-windows > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 3px 18px; padding: 4px 0; }
+.subscription-windows span { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.workbuddy-settings > p:not(.notice) { color: var(--ink-3); }
+/* notice 内的行内链接：默认只有 14px 高（10px 字号），低于 WCAG 2.2 的 24px 目标尺寸。
+   用内边距把可点区域撑到 24px，视觉仍是「正文里的一条下划线链接」。
+   注意：不能给 display:block/flex——那会把链接从句子末尾推到下一行。 */
+.notice a:not(.button-link) { display: inline; min-height: 24px; padding: 5px 2px; border-radius: var(--r-xs); text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--rule-control); }
+.notice a:not(.button-link):hover { color: var(--ink); background: var(--surface-sunk); text-decoration-color: var(--ink-3); }
+.workbuddy-login-link { display: inline-block; margin-left: 7px; }
+.context-parts { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); margin: 13px 0; }
+.context-parts th, .context-parts td { padding: 9px 11px; border-bottom: 1px solid var(--rule-faint); text-align: left; }
+.context-parts th:last-child, .context-parts td:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+.context-parts th { color: var(--ink-3); font-weight: var(--w-semibold); }
+
+/* ---- 观测详情：上下文构成 / 压缩事件 / 分布 / 消息事件 ---- */
+.context-caption { padding: 12px 17px; border-top: 1px solid var(--rule); font-size: var(--fs-2xs); color: var(--ink-3); display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.context-chart { display: flex; align-items: flex-end; height: 170px; gap: 3px; padding: 24px 17px 12px; overflow-x: auto; position: relative; }
+/* 基线：与调用趋势图同一条 rule-strong 发丝线（12px 底距 + 序号 8px + 8px 列距 = 28px） */
+.context-chart::after { content: ""; position: absolute; left: 17px; right: 17px; bottom: 28px; height: 1px; background: var(--rule-strong); pointer-events: none; }
+.context-chart button { background: none; border: 0; display: flex; flex-direction: column; gap: 8px; min-width: 17px; flex: 1; padding: 0 2px; align-items: center; }
+.context-chart i { display: block; width: 100%; max-width: 55px; min-width: 6px; border-radius: 1px 1px 0 0; background: var(--rule-strong); }
+.context-chart button:hover i { background: var(--accent); }
+/* 峰值柱 = 卡片标题已宣布的「单次输入峰值」，数字与柱子互相印证 */
+.context-chart button.peak i { background: var(--accent); }
+.context-chart button.peak:hover i { background: var(--accent-strong); }
+.context-chart small { font-size: 8px; line-height: 1; color: var(--ink-2); }
+.compaction-list { padding: 12px 17px; display: flex; flex-wrap: wrap; gap: 16px; font-size: var(--fs-2xs); color: var(--warn); }
+.message-event { border: 1px solid var(--rule); border-radius: var(--r-sm); margin-top: 10px; padding: 10px; font-size: var(--fs-xs); }
+.message-event pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 400px; overflow: auto; font-size: var(--fs-2xs); line-height: 1.8; margin-top: 12px; }
+.quota-snapshot small { display: block; color: var(--ink-3); margin: 5px 0; }
+.distribution-list { padding: 10px 17px; max-height: 340px; overflow: auto; }
+.distribution-list button { display: grid; grid-template-columns: minmax(0, 1fr) 30px; gap: 7px; width: 100%; text-align: left; font-size: var(--fs-xs); border: 0; padding: 10px 0; border-radius: 0; background: none; white-space: normal; }
+.distribution-list button:hover { background: var(--surface-sunk); }
+.distribution-list button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.distribution-list b { text-align: right; font-variant-numeric: tabular-nums; }
+/* 份额条：数据即墨，只有 hover 那一条用朱砂。图表绝不整片强调色 */
+.distribution-list i { grid-column: 1 / -1; height: 3px; background: linear-gradient(to right, var(--ink-3) var(--share, 0%), var(--rule-faint) var(--share, 0%)); border-radius: 2px; }
+.distribution-list button:hover i { background: linear-gradient(to right, var(--accent) var(--share, 0%), var(--rule-faint) var(--share, 0%)); }
+/* 份额首行（sort 后 index 0 = 最大来源）*/
+.distribution-list button.lead i { background: linear-gradient(to right, var(--accent) var(--share, 0%), var(--rule-faint) var(--share, 0%)); }
+.distribution-list button.lead:hover i { background: linear-gradient(to right, var(--accent-strong) var(--share, 0%), var(--rule-faint) var(--share, 0%)); }

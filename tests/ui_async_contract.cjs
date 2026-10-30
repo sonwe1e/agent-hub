@@ -15,7 +15,7 @@ const node = key => {
 const document = { querySelector: node, querySelectorAll: () => [], body: node('body'),
   createElement: () => node('created'), addEventListener: (name, fn) => listeners.set(name, fn) };
 const context = vm.createContext({ document, window: { addEventListener() {} },
-  location: { hash: '#sync' }, history: { replaceState: (_state, _title, url) => historyWrites.push(url) },
+  location: { hash: '#models' }, history: { replaceState: (_state, _title, url) => historyWrites.push(url) },
   AbortController, setTimeout: () => 0, clearTimeout() {}, console });
 let source = fs.readFileSync(path.resolve(__dirname, '../ui/app.js'), 'utf8');
 source = source.slice(0, source.lastIndexOf('state.page = PAGES[location.hash.slice(1)]'));
@@ -23,7 +23,9 @@ vm.runInContext(source, context);
 const run = code => vm.runInContext(code, context);
 const click = action => listeners.get('click')({ target: { closest: () => ({ disabled: false, dataset: { action } }) } });
 const ticks = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
-run(`state.page='sync';state.loaded=true;state.codexMode='official';state.targetDraft={codex:true};
+// 载体页用 models（旧独立 sync 页已并入 #models、死分支已删）；断言本质是
+// 「busy 期间导航被拦下并回写当前 hash」，与具体是哪两页无关。
+run(`state.page='models';state.loaded=true;state.targetDraft={codex:true};
   state.status={lastResults:[]};var requests=[];var pendingResolve;
   renderChrome=()=>{};renderPage=()=>{};reload=async()=>{};saveTargets=async()=>{};toast=()=>{};
   api=async(method,path,body)=>{requests.push({method,path,body});return new Promise(resolve=>pendingResolve=resolve)};`);
@@ -33,9 +35,9 @@ run(`state.page='sync';state.loaded=true;state.codexMode='official';state.target
   assert.equal(run('state.busy'), true);
   await run('runSync()');
   assert.equal(run('requests.length'), 1, 'Repeated preview must not start a second request');
-  await run(`navigate('models')`);
-  assert.equal(run('state.page'), 'sync');
-  assert.equal(historyWrites.at(-1), '#sync', 'Busy navigation must restore current history hash');
+  await run(`navigate('agents')`);
+  assert.equal(run('state.page'), 'models');
+  assert.equal(historyWrites.at(-1), '#models', 'Busy navigation must restore current history hash');
   run(`pendingResolve({planId:'synthetic-preview',targets:['codex'],files:[],warnings:['external edit warning']})`);
   await first;
   assert.equal(run('state.busy'), false);

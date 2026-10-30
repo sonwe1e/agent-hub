@@ -7,13 +7,16 @@ const nodes = new Map();
 const listeners = new Map();
 const node = key => {
   if (!nodes.has(key)) nodes.set(key, { innerHTML: '', textContent: '', hidden: false, disabled: false,
+    open: false, showModal() { this.open = true; }, close() { this.open = false; },
     addEventListener() {}, setAttribute() {}, removeAttribute() {}, scrollIntoView() {}, focus() {}, append() {}, remove() {},
+    querySelector() { return null; }, querySelectorAll() { return []; },
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } } });
   return nodes.get(key);
 };
-const document = { querySelector: node, querySelectorAll: () => [], body: node('body'),
+const document = { querySelector: node, querySelectorAll: () => [], body: node('body'), activeElement: null,
   createElement: () => node('created'), addEventListener: (type, callback) => listeners.set(type, callback) };
 const context = vm.createContext({ document, window: { addEventListener() {} }, location: { hash: '#sync' },
+  FormData: class { entries() { return []; } },
   AbortController, setTimeout: () => 0, clearTimeout() {}, console });
 let source = fs.readFileSync(path.resolve(__dirname, '../ui/app.js'), 'utf8');
 source = source.slice(0, source.lastIndexOf('state.page = PAGES[location.hash.slice(1)]'));
@@ -28,7 +31,7 @@ let passed = 0;
 const test = async (name, task) => { await task(); passed++; console.log(`PASS ${name}`); };
 (async () => {
   await test('new supplier targets are explicit and focus on core agents', () => {
-    assert.equal(run('DEFAULT_PROVIDER_TARGETS.join(",")'), 'claude,codex,pi,dsh');
+    assert.equal(run('DEFAULT_PROVIDER_TARGETS.join(",")'), 'claude,codex,pi,dsh,opencode');
     const selected = { has: () => false, getAll: () => ['claude','codex','pi','dsh'] };
     context.selected = selected;
     assert.equal(run('providerTargetsFromForm(selected).join(",")'), 'claude,codex,pi,dsh');
@@ -44,9 +47,15 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.match(html, /恢复.*官方 model/);
     assert.doesNotMatch(html, /只登记|ms-client readonly|data-action="ms-override"/);
   });
-  await test('daily selectors contain exactly the four supported agents', () => {
-    assert.equal(run(`AGENT_OVERRIDES.map(x=>x[0]).join(',')`),'claude,codex,pi,dsh');
+  await test('daily selectors contain exactly the supported agents', () => {
+    // opencode 于 2026-10-20 接入，与 claude/codex/pi/dsh 并列
+    assert.equal(run(`AGENT_OVERRIDES.map(x=>x[0]).join(',')`),'claude,codex,pi,dsh,opencode');
     assert.equal(run(`IMPORT_CLIENTS.map(x=>x[0]).includes('zcode')`),false);
+  });
+  await test('plan results display escaped preview warnings', () => {
+    const html = run(`planResultRows({warnings:['替换 <provider>'],results:[]})`);
+    assert.match(html, /替换 &lt;provider&gt;/);
+    assert.doesNotMatch(html, /<provider>/);
   });
   await test('ZCode import list renders candidates and empty state', () => {
     const html = run(`importListHtml([{id:'atria',name:'Atria',baseUrl:'https://api.atria.example/v1',api:'openai-completions',modelCount:2,models:[]}])`);
@@ -54,6 +63,19 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.match(html, /Atria/);
     assert.match(html, /2 个模型/);
     assert.match(run(`importListHtml([])`), /没有 Hub 尚未管理/);
+  });
+  await test('scanImportClient fills the import dialog and opens it only once ready', async () => {
+    // 成功路径契约：候选列表就绪后才 showModal，按钮不再「看似无响应」。
+    run(`$("#import-dialog").open=false;
+      $("#import-dialog").showModal=function(){this.open=true;};
+      var __scanned=[];
+      api=async(method,path)=>{__scanned.push(path);return {candidates:[{id:'g1',name:'Gateway',baseUrl:'https://g.example/v1',api:'openai-completions',modelCount:2,models:[]}]}};`);
+    await run(`scanImportClient("pi")`);
+    assert.equal(run('state.importTarget'), 'pi');
+    assert.equal(JSON.stringify(run('__scanned')), JSON.stringify(['/api/import/pi']));
+    assert.match(node('#import-body').innerHTML, /id="import-client"/);
+    assert.match(node('#import-footer').innerHTML, /导入 1 个供应商/);
+    assert.equal(run('$("#import-dialog").open'), true, 'candidates ready -> dialog must be open');
   });
   await test('third-party opt-in is explicit and override is editable', () => {
     run(`state.clientMode.codex='third-party';state.clientOptIn.codex=false`);
@@ -319,6 +341,77 @@ const test = async (name, task) => { await task(); passed++; console.log(`PASS $
     assert.equal(run('state.planPreviewResult'), null);
     const html = run('planCard()');
     assert.doesNotMatch(html, /确认应用并写入客户端/);
+  });
+  // ---- D2：dialog 关闭还焦 ----
+  await test('closeEditor returns focus to the opener, #content when detached, and the original opener through confirm chains', async () => {
+    const fakeFocusable = (inDialog = false, connected = true) => ({
+      isConnected: connected, disabled: false, focused: 0,
+      focus() { this.focused++; },
+      closest: sel => (sel === 'dialog' && inDialog) ? { dialog: true } : null,
+    });
+    const opener = fakeFocusable();
+    document.activeElement = opener;
+    run(`state.editor=null;showEditor('read-only','标题','正文','页脚');`);
+    assert.equal(run('editorDialogOpener'), opener);
+    run('closeEditor()');
+    assert.equal(opener.focused, 1, 'focus returns to the opener');
+    assert.equal(run('$("#editor-dialog").open'), false);
+
+    const detached = fakeFocusable(false, false);
+    const contentNode = node('#content'); let contentFocus = 0;
+    contentNode.focus = () => { contentFocus++; };
+    document.activeElement = detached;
+    run(`showEditor('read-only','T','b','f');`);
+    run('closeEditor()');
+    assert.equal(contentFocus, 1, 'detached opener falls back to #content');
+
+    const opener2 = fakeFocusable();
+    const editorBtn = fakeFocusable(true);
+    document.activeElement = opener2;
+    run(`showEditor('read-only','T','b','f');`);
+    document.activeElement = editorBtn;
+    const decision = run(`confirmDialog('确认操作？','描述',[],'确认',false);`);
+    node('#confirm-ok').onclick();
+    assert.equal(await decision, true);
+    assert.equal(editorBtn.focused, 1, 'confirm restores its in-dialog trigger first');
+    run('closeEditor()');
+    assert.equal(opener2.focused, 1, 'final landing is the original page opener');
+  });
+
+  await test('renderModelSyncCard restores focus to the same-container effort selector', async () => {
+    context.byId = { id: 'ms-default-effort' };
+    assert.equal(run('focusSelectorFor(byId)'), '#ms-default-effort');
+    context.noId = { id: '', dataset: {} };
+    assert.equal(run('focusSelectorFor(noId)'), '');
+    const cardNode = node('#modelsync-card'), detailNode = node('#model-detail');
+    const cardRestore = { focused: 0, focus() { this.focused++; } };
+    const detailRestore = { focused: 0, focus() { this.focused++; } };
+    const cardSels = [];
+    cardNode.querySelector = sel => { cardSels.push(sel); return cardRestore; };
+    detailNode.querySelector = () => detailRestore;
+    // 两份同属性下拉：焦点在卡片侧的那份上，还焦必须落在同一容器内。
+    // 注意实现里 closest 收到的是组合选择器 "#modelsync-card, #model-detail"。
+    document.activeElement = { dataset: { msEffort: '', scope: 'clients', target: 'codex' },
+      closest: sel => (sel.includes('#modelsync-card') ? cardNode : sel.includes('#model-detail') ? detailNode : null) };
+    run(`state.modelDetail=null;renderModelSyncCard();`);
+    assert.deepEqual(cardSels, ['[data-ms-effort][data-scope="clients"][data-target="codex"]'],
+      'locator derives from the select\'s own data-* attributes only');
+    assert.equal(cardRestore.focused, 1, 'focus lands on the card-side select');
+    assert.equal(detailRestore.focused, 0, 'the identical detail-side select must not steal focus');
+  });
+
+  await test('retired default remains visible but cannot be newly selected', () => {
+    run(`state.providers['old']={name:'Old WorkBuddy',kind:'workbuddy-ai',enabled:true,models:[{id:'old-model'}]};
+      state.modelSync={modelSync:{default:{provider:'old',model:'old-model'}},resolved:{},tiers:{},options:{},optionsByTarget:{},retiredSelections:{pi:'pi 的模型选择使用已停用的 WorkBuddy 订阅'}};
+      state.modelSyncDraft=null;state.modelSyncDraftKey='';`);
+    assert.equal(run(`enabledProviders().includes('old')`),false);
+    const html=run('modelSyncCard()');
+    assert.match(html,/Old WorkBuddy（当前不可用）/);
+    assert.match(html,/已取消的 WorkBuddy/);
+    assert.equal(run(`agentSyncStatus('pi').text`),'线路已停用');
+    const agentSelect=run(`providerSelect('clients','pi','','old')`);
+    assert.match(agentSelect,/Old WorkBuddy（当前不可用）/);
+    assert.match(agentSelect,/selected disabled/);
   });
   console.log(`PASS ${passed} UI contract checks (DOM stub; no browser layout assertion)`);
 })().catch(error => { console.error(error); process.exitCode=1; });

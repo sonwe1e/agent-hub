@@ -20,9 +20,9 @@ class InventoryTests(unittest.TestCase):
         prefix=self.home/folder
         meta=prefix/'node_modules'/pkg/'package.json'
         meta.parent.mkdir(parents=True)
-        meta.write_text(json.dumps({'name':pkg,'version':version,'bin':{agent:'cli.js'}}))
+        meta.write_text(json.dumps({'name':pkg,'version':version,'bin':{agent:'cli.js'}}), encoding="utf-8")
         path=prefix/(agent+'.cmd')
-        path.write_text(f'node "%~dp0node_modules\\{pkg.replace("/",chr(92))}\\cli.js" %*')
+        path.write_text(f'node "%~dp0node_modules\\{pkg.replace("/",chr(92))}\\cli.js" %*', encoding="utf-8")
         return self.inventory._entry(agent,path,source='npm',version=version,launch=['node',str(meta.parent/'cli.js')],
                                       manifest=str(meta),prefix=str(prefix),package=pkg)
 
@@ -39,7 +39,7 @@ class InventoryTests(unittest.TestCase):
         header=json.dumps({'files':{'package.json':{'size':len(package),'offset':'0'}}}).encode()
         archive=self.home/'app.asar'
         archive.write_bytes(struct.pack('<IIII',4,len(header)+8,len(header)+4,len(header))+header+package)
-        (self.home/'version').write_text('44.0.0')
+        (self.home/'version').write_text('44.0.0', encoding="utf-8")
         self.assertEqual(ai.asar_app_version(archive),'1.2.3-rc.2')
 
     def test_exit_success_without_expected_version_is_failed(self):
@@ -60,9 +60,9 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(run.call_args.args[0],[str(self.home/'claude.exe'),'update'])
 
     def test_real_isolated_updater_process_and_startup_probe(self):
-        version=self.home/'version.txt';version.write_text('1.0.0')
+        version=self.home/'version.txt';version.write_text('1.0.0', encoding="utf-8")
         updater=self.home/'updater.py'
-        updater.write_text("import pathlib,sys\np=pathlib.Path(__file__).with_name('version.txt')\nif sys.argv[1]=='update':p.write_text('2.0.0')\nelse:print(p.read_text())\n")
+        updater.write_text("import pathlib,sys\np=pathlib.Path(__file__).with_name('version.txt')\nif sys.argv[1]=='update':p.write_text('2.0.0')\nelse:print(p.read_text())\n", encoding="utf-8")
         e=self.inventory._entry('claude',updater,source='claude-native',version='1.0.0',launch=[sys.executable,str(updater)])
         job={'state':'running','messages':[]}
         with patch.object(self.inventory,'detect'):
@@ -73,10 +73,10 @@ class InventoryTests(unittest.TestCase):
     def test_npm_targets_exact_prefix_and_checks_startup_not_manifest_only(self):
         e=self.npm('isolated','pi','@earendil-works/pi-coding-agent')
         node=self.home/'runtime/node.exe';npm=node.parent/'node_modules/npm/bin/npm-cli.js'
-        npm.parent.mkdir(parents=True);npm.write_text('')
+        npm.parent.mkdir(parents=True);npm.write_text('', encoding="utf-8")
         job={'state':'running','messages':[]}
         def installed(*args,**kwargs):
-            data=json.loads(Path(e['manifest']).read_text());data['version']='2.0.0';Path(e['manifest']).write_text(json.dumps(data))
+            data=json.loads(Path(e['manifest']).read_text(encoding="utf-8"));data['version']='2.0.0';Path(e['manifest']).write_text(json.dumps(data), encoding="utf-8")
             return 0,'',''
         with patch.object(ai.shutil,'which',return_value=str(node)),patch.object(ai,'run',side_effect=installed) as run,patch.object(ai,'version_of',return_value='2.0.0'),patch.object(self.inventory,'detect'):
             self.inventory._update(e,{'latestVersion':'2.0.0'},job)

@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import re
+import secrets
 import sys
 import threading
 import webbrowser
@@ -19,13 +21,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 # 整个目录可以任意搬迁（例如从 ~/.agent-hub 移到 G:\workspaces\agent-hub）。
 HUB_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(HUB_DIR))
-from hub import (Hub, HUB_CONFIG, ModelLossError, ZCODE_API_TYPES, assert_expected_model_changes, backup_file,
+from hub import (Hub, HUB_CONFIG, ModelLossError, ZCODE_API_TYPES, assert_expected_model_changes, assert_no_retired_workbuddy_selection, backup_file,
                  agent_connection, agent_connection_ready, agent_connections,
                  canonical_target, provider_targets,
                  configure_stdio, expand, file_hash, load_json, save_json, now_iso, target_files)  # noqa: E402
 from discover import discover_models  # noqa: E402
-from agent_inventory import Inventory, AGENTS  # noqa: E402
-from observation import Store  # noqa: E402
+from agent_hub.agents.inventory import BulkBusy, Inventory, AGENTS  # noqa: E402
+from agent_hub.observability.store import Store  # noqa: E402
 from switch_plans import (DEFAULT_CLEAR, PLAN_TARGETS, PlanError,  # noqa: E402
                           analyze_plan, compile_plan, connection_snapshot,
                           diagnose_fallback, model_sync_patch_for_write,
@@ -41,24 +43,26 @@ except ImportError:  # pragma: no cover
     REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
     agent_model_options = agent_model_tiers_public = resolve_agent_model = None
 
-UI_DIR = HUB_DIR / "ui"
+UI_DIR = (Path(getattr(sys, "_MEIPASS", HUB_DIR)) / "ui") if getattr(sys, "frozen", False) else HUB_DIR / "ui"
 LOCK = threading.RLock()
-SUPPORTED_TARGETS = {"pi", "mcode", "zcode", "dsh", "dsh-desktop", "claude", "cc-switch", "omp", "codex"}
-PREVIEW_TARGETS = SUPPORTED_TARGETS - {"cc-switch"}
+SUPPORTED_TARGETS = {"pi", "mcode", "zcode", "dsh", "dsh-desktop", "claude", "cc-switch", "omp", "codex", "opencode"}
 PREVIEW_TARGETS = set(AGENTS) | {"dsh-desktop"}
 PROTOCOLS = {"openai-completions", "openai-responses", "openai-chat-completions", "anthropic-messages"}
 # 每个 Agent 连接允许的协议：Claude Code 只走 Anthropic Messages，Codex 第三方只走 Responses。
 AGENT_APIS = {"claude": {"anthropic-messages"}, "codex": {"openai-responses"},
-              "zcode": set(ZCODE_API_TYPES)}
+              "zcode": set(ZCODE_API_TYPES),
+              # OpenCode 通过 ai-sdk 适配多种协议，四类端点都能接。
+              "opencode": set(PROTOCOLS)}
 # providers.json 里可以按 Agent 覆盖连接的目标名（dsh-desktop 归一化成 dsh）。
-AGENT_CONNECTION_KEYS = ("claude", "codex", "pi", "dsh")
+AGENT_CONNECTION_KEYS = ("claude", "codex", "pi", "dsh", "opencode")
 
 # modelSync 可写的目标 -> 落盘时使用的键。dsh 桌面版与 CLI 共用同一份配置，
 # 写入时归一化成 dsh，避免出现两份互相漂移的覆盖。
 MODELSYNC_TARGETS = {"pi": "pi", "dsh": "dsh", "dsh-desktop": "dsh",
-                     "zcode": "zcode", "claude": "claude", "codex": "codex"}
+                     "zcode": "zcode", "claude": "claude", "codex": "codex",
+                     "opencode": "opencode"}
 # status / GET 需要给出解析结果的目标，顺序即界面展示顺序。
-MODELSYNC_RESOLVED_TARGETS = ("pi", "dsh", "dsh-desktop", "zcode", "claude", "codex")
+MODELSYNC_RESOLVED_TARGETS = ("pi", "dsh", "dsh-desktop", "zcode", "claude", "codex", "opencode")
 # 已经没有只读目标：codex 从 v2 起只写 model_provider / model 与 [model_providers.custom]，
 # ChatGPT 登录态仍然由 Codex 自己维护。
 MODELSYNC_READONLY_TARGETS: set[str] = set()
@@ -77,62 +81,120 @@ INVENTORY = Inventory()
 _OBSERVATIONS = {}
 _GATEWAYS = {}
 _GATEWAY_PREVIEWS = {}
-_WORKBUDDY_LOGINS = {}
+_CAPABILITY_LIBRARIES = {}
+_WORKSPACE_SERVICES = {}
 
 
-def workbuddy_login():
-    from workbuddy import Accounts, Login
-    directory=HUB_CONFIG.parent/'data/gateway/config/agent-hub'
+def api_codex_subscription():
+    from codex_subscription import status
+    p = hub().providers.get('codex-chatgpt') or {}
+    return {**status(), 'connected': p.get('kind') == 'codex-chatgpt' and p.get('enabled', True),
+            'models': len(p.get('models') or [])}
+
+
+def api_codex_subscription_connect():
+    from codex_subscription import models, provider_config, read_auth
+    before = read_auth()
+    catalog = models(before)
     with LOCK:
-        return _WORKBUDDY_LOGINS.setdefault(str(directory),Login(Accounts(directory)))
-
-
-def api_workbuddy():
-    login=workbuddy_login()
-    p=hub().providers.get('workbuddy-ai') or {}
-    return {**login.accounts.status(),'login':login.status(),
-            'connected':p.get('kind')=='workbuddy-ai' and p.get('enabled',True),
-            'models':len(p.get('models') or [])}
-
-
-def api_workbuddy_connect():
-    from workbuddy import provider_config
-    login=workbuddy_login()
-    with login.accounts.locked():before=login.accounts.read()
-    models=login.accounts.models()
-    with LOCK:
-        with login.accounts.locked():after=login.accounts.read()
-        identity=lambda auth:(auth.get('uid'),auth.get('enterpriseId'),auth.get('account'))
-        if not after.get('access') or identity(before)!=identity(after):
-            raise ValueError('读取模型期间账号已退出或切换，请刷新状态后重试')
-        h=hub()
-        old=h.providers.get('workbuddy-ai')
-        if old and old.get('kind')!='workbuddy-ai':
-            raise ValueError('workbuddy-ai ID 已被普通供应商占用，请先为它更名后再接入')
-        # Refresh metadata and add new models, retaining existing selections.
-        merged={m['id']:m for m in (old or {}).get('models',[])}
-        for m in models: merged[m['id']]={**merged.get(m['id'],{}),**m}
-        p=provider_config(h.cfg,list(merged.values()),old)
+        after = read_auth()
+        if before['account'] != after['account'] or (not before['account'] and before['access'] != after['access']):
+            raise ValueError('读取模型期间 Codex 账号已切换，请重新接入')
+        h = hub()
+        old = h.providers.get('codex-chatgpt')
+        if old and old.get('kind') != 'codex-chatgpt':
+            raise ValueError('codex-chatgpt ID 已被普通供应商占用，请先为它更名后再接入')
+        merged = {m['id']: m for m in (old or {}).get('models', [])}
+        for model in catalog:
+            merged[model['id']] = {**merged.get(model['id'], {}), **model}
+        p = provider_config(h.cfg, list(merged.values()), old)
         _validate_provider(p)
-        h.providers['workbuddy-ai']=p
-        h.cfg.get('removedProviders',{}).pop('workbuddy-ai',None)
+        h.providers['codex-chatgpt'] = p
+        h.cfg.get('removedProviders', {}).pop('codex-chatgpt', None)
         _save_config(h)
     gateway().start(observations().settings()['content'])
-    return {'ok':True,**api_workbuddy()}
+    return {'ok': True, **api_codex_subscription()}
 
 
-def api_workbuddy_logout():
-    login=workbuddy_login()
-    login.cancel()
+def api_codex_subscription_disconnect():
     with LOCK:
-        with login.accounts.locked(): login.accounts.path.unlink(missing_ok=True)
-        h=hub()
-        p=h.providers.get('workbuddy-ai')
-        if p and p.get('kind')=='workbuddy-ai':
-            p['enabled']=False
+        h = hub()
+        p = h.providers.get('codex-chatgpt')
+        if p and p.get('kind') == 'codex-chatgpt':
+            p['enabled'] = False
             _save_config(h)
         gateway().configure(observations().settings()['content'])
-    return {'ok':True,**api_workbuddy()}
+    return {'ok': True, **api_codex_subscription()}
+
+
+def api_codex_subscription_quota():
+    from codex_subscription import read_auth, client_version
+    from agent_hub.quota.usage import codex_quota
+    before=read_auth()
+    value=codex_quota(before,client_version())
+    after=read_auth()
+    if before['account'] != after['account'] or (not before['account'] and before['access'] != after['access']):
+        raise ValueError('查询额度期间 Codex 账号已切换，请重新查询')
+    return {'ok':True,'quota':value}
+
+
+def api_zcode_subscription():
+    from zcode_subscription import status, read_auth, binding, ZCodeSubscriptionError
+    p = hub().providers.get('zcode-subscription') or {}
+    value=status();changed=False
+    if value.get('signedIn') and p.get('subscriptionBinding') and p.get('apiKey'):
+        try:changed=not secrets.compare_digest(p['subscriptionBinding'],binding(read_auth(),p['apiKey']))
+        except ZCodeSubscriptionError:changed=True
+    if changed:value['message']='ZCode 账号或套餐已切换，请刷新模型并恢复服务'
+    return {**value, 'connected': p.get('kind') == 'zcode-subscription' and p.get('enabled', True),
+            'needsRefresh':changed,'models': len(p.get('subscriptionModels') or p.get('models') or [])}
+
+
+def api_zcode_subscription_connect():
+    from zcode_subscription import models, provider_config, read_auth, resolve_auth, _current_identity
+    before = read_auth()
+    catalog = models(resolve_auth(before))
+    with LOCK:
+        after = read_auth()
+        if _current_identity(before) != _current_identity(after):
+            raise ValueError('读取模型期间 ZCode 账号已切换，请重新接入')
+        h = hub()
+        old = h.providers.get('zcode-subscription')
+        if old and old.get('kind') != 'zcode-subscription':
+            raise ValueError('zcode-subscription ID 已被普通供应商占用，请先为它更名后再接入')
+        merged = {m['id']: m for m in (old or {}).get('models', [])}
+        for model in catalog:
+            merged[model['id']] = {**merged.get(model['id'], {}), **model}
+        p = provider_config(h.cfg, list(merged.values()), old, after)
+        p['subscriptionModels']=[m['id'] for m in catalog]
+        _validate_provider(p)
+        h.providers['zcode-subscription'] = p
+        h.cfg.get('removedProviders', {}).pop('zcode-subscription', None)
+        _save_config(h)
+    gateway().start(observations().settings()['content'])
+    return {'ok': True, **api_zcode_subscription()}
+
+
+def api_zcode_subscription_disconnect():
+    with LOCK:
+        h = hub()
+        p = h.providers.get('zcode-subscription')
+        if p and p.get('kind') == 'zcode-subscription':
+            p['enabled'] = False
+            _save_config(h)
+        gateway().configure(observations().settings()['content'])
+    return {'ok': True, **api_zcode_subscription()}
+
+
+def api_zcode_subscription_quota():
+    from zcode_subscription import read_auth, resolve_auth, _current_identity
+    from agent_hub.quota.usage import zcode_quota
+    before=read_auth()
+    value=zcode_quota(resolve_auth(before))
+    after=read_auth()
+    if _current_identity(before) != _current_identity(after):
+        raise ValueError('查询额度期间 ZCode 账号已切换，请重新查询')
+    return {'ok':True,'quota':value}
 
 
 def gateway():
@@ -148,7 +210,7 @@ def gateway():
 
 
 def api_gateway_preview(body):
-    from agent_inventory import AGENTS
+    from agent_hub.agents.inventory import AGENTS
     with LOCK:
         h=hub()
         if type(body.get('enabled')) is not bool:
@@ -194,6 +256,171 @@ def observations():
         return _OBSERVATIONS[str(root)]
 
 
+def capability_library():
+    from agent_hub.capabilities.library import CapabilityLibrary
+    import hub as engine
+    root = HUB_CONFIG.parent / "data"
+    with LOCK:
+        key = (str(root), str(engine.HOME))
+        if key not in _CAPABILITY_LIBRARIES:
+            _CAPABILITY_LIBRARIES[key] = CapabilityLibrary(root, engine.HOME)
+        return _CAPABILITY_LIBRARIES[key]
+
+
+def _quota_identity_codex():
+    from codex_subscription import read_auth
+    auth = read_auth(allow_expired=True)
+    return auth.get("account") or auth.get("access")
+
+
+def _quota_identity_zcode():
+    from zcode_subscription import read_auth
+    auth = read_auth()
+    # Credentials can rotate without changing the account. Only fall back to
+    # a credential when the login store supplies no stable account identity.
+    account = auth.get("account") or auth.get("key") or auth.get("token") or auth.get("jwt")
+    return (auth.get("family"), auth.get("kind"), account, auth.get("org"), auth.get("project")) if account else None
+
+
+def _quota_connected(provider):
+    entry = hub().providers.get(provider) or {}
+    return entry.get("kind") == provider and entry.get("enabled", True) is not False
+
+
+def _recent_subscription_failures(since):
+    # Select only public event metadata. Provider errors and transcript bodies
+    # stay in the existing observation store and never enter the monitor.
+    with observations().db() as db:
+        rows = db.execute(
+            "SELECT id, at, json_extract(data,'$.provider'), json_extract(data,'$.httpStatus') "
+            "FROM requests WHERE at >= ? "
+            "AND json_extract(data,'$.sourceType') IN ('gateway','gateway+native') "
+            "AND (json_extract(data,'$.provider') IN ('codex-chatgpt','zcode-subscription') "
+            "OR (agent='codex' AND json_extract(data,'$.provider') IS NULL "
+            "AND json_extract(data,'$.evidence') LIKE 'Agent Hub usage.jsonl%')) "
+            "AND json_extract(data,'$.status')='failed' ORDER BY at ASC, id ASC",
+            (since,)).fetchall()
+    return [{"id": row[0], "time": row[1], "provider": row[2] or "codex-native", "httpStatus": row[3]} for row in rows]
+
+
+def workspace_services():
+    from agent_hub.quota.monitor import QuotaMonitor
+    from agent_hub.workspace.services import WorkspaceServices
+    root = HUB_CONFIG.parent / "data"
+    with LOCK:
+        key = str(root)
+        if key not in _WORKSPACE_SERVICES:
+            quota = QuotaMonitor(root,
+                queries={"codex-chatgpt": api_codex_subscription_quota,
+                         "zcode-subscription": api_zcode_subscription_quota},
+                identities={"codex-chatgpt": _quota_identity_codex,
+                            "zcode-subscription": _quota_identity_zcode},
+                connected={"codex-chatgpt": lambda: _quota_connected("codex-chatgpt"),
+                           "zcode-subscription": lambda: _quota_connected("zcode-subscription")},
+                recent_failures=_recent_subscription_failures)
+            _WORKSPACE_SERVICES[key] = WorkspaceServices(capability_library(), quota)
+        return _WORKSPACE_SERVICES[key]
+
+
+def api_recent_sessions():
+    from agent_hub.sessions.handoff import recent_sessions
+    return recent_sessions(observations())
+
+
+def api_set_session_title(body):
+    from agent_hub.sessions.handoff import set_session_title
+    return set_session_title(observations(), body.get('agent'), body.get('sessionId'), body.get('title'))
+
+
+def api_resume_preview(body):
+    from agent_hub.sessions.handoff import preview_resume
+    return preview_resume(observations(), body.get("agent"), body.get("sessionId"),
+                          INVENTORY, body.get("instanceId"))
+
+
+def api_resume(body):
+    from agent_hub.sessions.handoff import resume_session
+    return resume_session(observations(), body.get("agent"), body.get("sessionId"),
+                          INVENTORY, body.get("instanceId"))
+
+
+def api_handoff(body):
+    from agent_hub.sessions.handoff import draft_handoff
+    return draft_handoff(observations(), body.get("agent"), body.get("sessionId"), body.get("target"))
+
+
+def api_handoff_target(body):
+    from agent_hub.sessions.handoff import handoff_target_capabilities
+    return handoff_target_capabilities(INVENTORY, body.get("target"), body.get("instanceId"))
+
+
+def api_handoff_open(body):
+    from agent_hub.sessions.handoff import launch_target
+    return launch_target(observations(), body.get("agent"), body.get("sessionId"), body.get("target"),
+                         INVENTORY, body.get("instanceId"))
+
+
+def api_handoff_start(body):
+    from agent_hub.sessions.handoff import start_handoff
+    return start_handoff(observations(), body.get("agent"), body.get("sessionId"), body.get("target"),
+                         body.get("text"), INVENTORY, body.get("instanceId"))
+
+
+def api_summary_routes():
+    from agent_hub.sessions.summary import list_summary_routes
+    return {"routes": list_summary_routes(hub().cfg)}
+
+
+def _summary_identity(cfg, selection):
+    if not isinstance(selection, dict):
+        return None
+    provider = (cfg.get("providers") or {}).get(selection.get("provider")) or {}
+    kind = provider.get("kind")
+    if kind == "codex-chatgpt":
+        return _quota_identity_codex()
+    if kind == "zcode-subscription":
+        return _quota_identity_zcode()
+    return None
+
+
+def api_summary_preview(body):
+    from agent_hub.sessions.summary import preview_summary
+    cfg = hub().cfg
+    return preview_summary(cfg, body.get("selection"), body.get("material"),
+                           account_identity=_summary_identity(cfg, body.get("selection")))
+
+
+def api_summary_generate(body):
+    from agent_hub.sessions.summary import generate_summary, preview_summary
+    # Synchronize the confirmed route while the config is stable, then release
+    # the application lock before waiting on the remote model. Keep only the
+    # gateway route lock so its watcher cannot swap the recipient mid-request.
+    with LOCK:
+        cfg = hub().cfg
+        selection = body.get("selection")
+        identity = _summary_identity(cfg, selection)
+        preview = preview_summary(cfg, selection, body.get("material"), account_identity=identity)
+        if not isinstance(body.get("digest"), str) or not secrets.compare_digest(preview["digest"], body["digest"]):
+            raise ValueError("线路或材料已改变，请重新预览后再生成")
+        runtime = gateway()
+        runtime.lock.acquire()
+        try:
+            content = observations().settings()["content"]
+            runtime.start(content)
+            runtime.configure(content, cfg=cfg)
+            current = _summary_identity(cfg, selection)
+            if current != identity:
+                raise ValueError("账号或套餐已改变，请重新预览后再生成")
+        except BaseException:
+            runtime.lock.release()
+            raise
+    try:
+        return generate_summary(cfg, selection, body.get("material"), body.get("digest"),
+                                account_identity=current)
+    finally:
+        runtime.lock.release()
+
+
 def query_values(query):
     return {k: v[0] for k, v in (query or {}).items() if v}
 
@@ -206,6 +433,11 @@ def api_observations(query=None):
     result['status']['gateway']=gateway().status()
     result['status']['coverage']='原生会话 + 已经过本机 Hub 网关的调用；按响应 ID 合并。直连线路只有原生日志视图，没有记录不等于零请求。'
     return result
+
+
+def api_subscription_activity(query=None):
+    provider=query_values(query).get('provider')
+    return observations().subscription_activity(provider)
 
 
 def api_observation_settings(body):
@@ -224,8 +456,37 @@ def api_observation_cleanup(body):
     return result
 
 
+def api_observation_retry(body):
+    """Re-read failed sources, bypassing the fingerprint short-circuit.
+
+    Paths are validated inside Store.retry against the native roots, so a body
+    cannot turn this into an arbitrary local file read.
+    """
+    return observations().retry(body.get('paths'))
+
+
 def api_inventory(detect=False):
     return INVENTORY.detect() if detect or INVENTORY.checked_at is None else INVENTORY.view()
+
+
+def api_agents_check_all() -> dict:
+    """一键检测：后台并发查询所有 Agent 的发布渠道。
+
+    立即返回，进度写在 GET /api/agents 的 bulk 里。已有批量任务时
+    start_check_all 抛 BulkBusy，由 dispatch_api 翻成 409。
+    """
+    INVENTORY.start_check_all()
+    return {"ok": True, "bulk": INVENTORY.bulk_state()}
+
+
+def api_agents_update_all() -> dict:
+    """一键更新：后台串行把已确认可更新的 Agent 升到最新。
+
+    安全边界与单实例更新完全一致——只执行 agent_inventory._update 里既有的
+    npm / 原生 updater 两条路径，没有任何来自请求体的命令片段。
+    """
+    INVENTORY.start_update_all()
+    return {"ok": True, "bulk": INVENTORY.bulk_state()}
 
 
 def _save_config(h: Hub, allowed_removed: dict[str, set[str]] | None = None) -> None:
@@ -403,6 +664,17 @@ def _modelsync_view(cfg: dict) -> tuple[dict, dict]:
     return resolved, tiers
 
 
+def _modelsync_retired_selections(cfg: dict) -> dict:
+    """Expose existing retired selections without preventing their replacement."""
+    blocked = {}
+    for target in MODELSYNC_RESOLVED_TARGETS:
+        try:
+            assert_no_retired_workbuddy_selection(cfg, target)
+        except ValueError as exc:
+            blocked[target] = str(exc)
+    return blocked
+
+
 def _validate_modelsync_entry(h: Hub, entry: object, where: str, *, allow_tiers: bool = False) -> dict:
     """校验 modelSync.default / overrides.<target> 的一条模型映射。"""
     if not isinstance(entry, dict):
@@ -527,6 +799,7 @@ def api_modelsync() -> dict:
     per_target = {target: agent_model_options(h.cfg, target)
                   for target in MODELSYNC_RESOLVED_TARGETS if target != "dsh-desktop"}
     return {"modelSync": block, "resolved": resolved, "tiers": tiers,
+            "retiredSelections": _modelsync_retired_selections(h.cfg),
             "options": options, "optionsByTarget": per_target,
             "configured": bool(block.get("default") or block.get("overrides"))}
 
@@ -544,7 +817,7 @@ def api_update_modelsync(body: dict) -> dict:
         _save_config(h)
         resolved, tiers = _modelsync_view(h.cfg)
     return {"ok": True, "modelSync": block, "warnings": warnings,
-            "resolved": resolved, "tiers": tiers}
+            "resolved": resolved, "tiers": tiers, "retiredSelections": _modelsync_retired_selections(h.cfg)}
 
 
 def api_providers() -> dict:
@@ -732,7 +1005,7 @@ def api_switch_plan_analyze(body: dict) -> dict:
 
 
 def api_switch_plan_preview(body: dict) -> dict:
-    """POST /api/switch-plans/preview：编译方案 -> 落盘 modelSync -> 生成原生预览。
+    """POST /api/switch-plans/preview：在隔离事务中预览模型选择与原生配置。
 
     只在"这次会写入的目标"参与预览：方案没选中的 Agent 一个文件都不碰。
     """
@@ -759,16 +1032,9 @@ def api_switch_plan_preview(body: dict) -> dict:
             return {"ok": False, "writable": False, "analysis": report,
                     "error": f"编译结果未通过 modelSync 校验: {exc}"}
         warnings = _modelsync_warnings(h, normalized)
-        previous = copy.deepcopy(h.cfg.get("modelSync"))
-        h.cfg["modelSync"] = normalized
-        try:
-            _save_config(h)
-            write_scope = [item["target"] for item in report["details"] if item["status"] in ("ok", "warning")]
-            preview = h.preview_push(only=write_scope, reconcile=True)
-        except Exception:
-            h.cfg["modelSync"] = previous
-            raise
-        report["appliedModelSync"] = normalized
+        write_scope = [item["target"] for item in report["details"] if item["status"] in ("ok", "warning")]
+        preview = h.preview_push(only=write_scope, reconcile=True, model_sync=normalized)
+        report["proposedModelSync"] = normalized
         report["modelSyncWarnings"] = warnings
     return {"ok": True, "writable": True, "planId": preview["planId"],
             "targets": preview["targets"],
@@ -797,7 +1063,7 @@ def _plan_result_rows(report: dict, preview: dict | None = None) -> list[dict]:
                "needsClientAction": item.get("needsClientAction", ""),
                "effort": item["effort"], "tiers": item.get("tiers", [])}
         if status == "ok":
-            row["message"] = f"{item['provider']} / {item['model']} 已写入该客户端的原生配置"
+            row["message"] = f"将把 {item['provider']} / {item['model']} 写入该客户端的原生配置"
             if target in files_by_target:
                 row["files"] = files_by_target[target]
         elif status == "warning":
@@ -886,7 +1152,11 @@ def api_status() -> dict:
     h = hub()
     changed = set(h.changed_files())
     targets = {}
-    for name, t in (h.cfg.get("sync", {}).get("targets") or {}).items():
+    configured_targets = dict(h.cfg.get("sync", {}).get("targets") or {})
+    # Older configurations predate OpenCode. Show it as disabled without writing
+    # anything until the user explicitly enables it.
+    configured_targets.setdefault("opencode", {"enabled": False})
+    for name, t in configured_targets.items():
         if name not in PREVIEW_TARGETS:
             continue
         files = [{"path": str(expand(f)), "exists": expand(f).exists(),
@@ -1008,7 +1278,7 @@ def api_apply(body: dict) -> dict:
             h=hub()
             h.cfg['gateway'].pop('activeEnabled',None)
             _save_config(h)
-            if enabled or any(p.get('kind')=='workbuddy-ai' and p.get('enabled',True) for p in h.providers.values()):gateway().start(observations().settings()['content'])
+            if enabled or any(p.get('kind') in ('codex-chatgpt','zcode-subscription') and p.get('enabled',True) for p in h.providers.values()):gateway().start(observations().settings()['content'])
             else:gateway().stop()
         # Applying may update Hub configuration; reload before recording status.
         return _record_sync(hub(), result["results"], transaction_id=result["transactionId"])
@@ -1046,10 +1316,12 @@ def api_update_targets(body: dict) -> dict:
         targets = h.cfg.get("sync", {}).get("targets", {})
         proposed = {name: dict(t) for name, t in targets.items()}
         for name, update in updates.items():
-            if name not in targets or name not in PREVIEW_TARGETS or targets[name].get("aliasOf"):
+            if (name not in PREVIEW_TARGETS or (name not in targets and name != "opencode")
+                    or (targets.get(name) or {}).get("aliasOf")):
                 raise ValueError(f"无法单独设置此平台: {name}")
             if not isinstance(update, dict):
                 raise ValueError("平台设置必须是对象")
+            proposed.setdefault(name, {"enabled": False})
             if "enabled" in update:
                 if not isinstance(update["enabled"], bool):
                     raise ValueError("enabled 必须是布尔值")
@@ -1065,7 +1337,7 @@ def api_update_targets(body: dict) -> dict:
         for name, t in proposed.items():
             if t.get("aliasOf"):
                 t["enabled"] = proposed.get(t["aliasOf"], {}).get("enabled", False)
-        h.cfg["sync"]["targets"] = proposed
+        h.cfg.setdefault("sync", {})["targets"] = proposed
         _save_config(h)
     return {"ok": True}
 
@@ -1135,18 +1407,23 @@ def api_delete_provider(pid: str) -> dict:
     return {"ok": True, "messages": msgs}
 
 
-def _normalize_model(body: dict) -> dict:
+def _normalize_model(body: dict, *, fill_defaults: bool = False) -> dict:
     if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not body["id"].strip():
         raise ValueError("模型 ID 不能为空")
     if "name" in body and not isinstance(body["name"], str):
         raise ValueError("模型名称必须是字符串")
-    inp = body.get("input", ["text"])
-    if isinstance(inp, str):
-        inp = [s.strip() for s in inp.split(",") if s.strip()]
-    if not isinstance(inp, list) or not inp or any(not isinstance(v, str) or not v.strip() for v in inp):
+    inp = body.get("input", ["text"] if fill_defaults else None)
+    if inp is not None:
+        if isinstance(inp, str):
+            inp = [s.strip() for s in inp.split(",") if s.strip()]
+        if not isinstance(inp, list) or not inp or any(not isinstance(v, str) or not v.strip() for v in inp):
+            raise ValueError("至少选择一种输入类型")
+    elif "input" in body:
         raise ValueError("至少选择一种输入类型")
     numbers = {}
     for field, default in (("contextWindow", 128000), ("maxTokens", 32768)):
+        if not fill_defaults and field not in body:
+            continue
         value = body.get(field, default)
         try:
             n = int(value)
@@ -1157,11 +1434,24 @@ def _normalize_model(body: dict) -> dict:
         numbers[field] = n
     if not isinstance(body.get("reasoning", True), bool):
         raise ValueError("reasoning 必须是布尔值")
+    if "cost" in body:
+        cost = body["cost"]
+        if not isinstance(cost, dict):
+            raise ValueError("模型参考单价必须是对象")
+        for field in ("input", "output", "cacheRead", "cacheWrite"):
+            value = cost.get(field)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not math.isfinite(value) or value < 0):
+                raise ValueError(f"{field} 参考单价必须是非负有限数字，或留空表示未知")
     # 编辑时保留 cost / compat 等非 UI 字段，不悄悄丢弃高级配置。
     # agent 是「这条模型属于哪个连接」的路由参数，不是模型字段，不能落进配置。
     fields = {k: v for k, v in body.items() if k != "agent"}
-    return {**fields, "id": body["id"].strip(), "name": body.get("name") or body["id"].strip(),
-            **numbers, "input": list(dict.fromkeys(inp)), "reasoning": body.get("reasoning", True)}
+    result = {**fields, "id": body["id"].strip(), "name": body.get("name") or body["id"].strip(), **numbers}
+    if inp is not None:
+        result["input"] = list(dict.fromkeys(inp))
+    if "reasoning" in body or fill_defaults:
+        result["reasoning"] = body.get("reasoning", True)
+    return result
 
 
 def _connection_models(h: Hub, pid: str, agent: str | None) -> list[dict]:
@@ -1213,7 +1503,12 @@ def api_update_model(pid: str, mid: str, body: dict) -> dict:
         old = next((m for m in models if m.get("id") == mid), None)
         if old is None:
             raise ValueError(f"模型不存在: {mid}")
-        new = _normalize_model({**old, **body})
+        merged = {**old, **body}
+        # 对已有模型，缺失和显式清空都表示未知；只改价格不能补写猜测值。
+        for field in ("contextWindow", "maxTokens", "input", "reasoning"):
+            if field in body and body[field] is None:
+                merged.pop(field, None)
+        new = _normalize_model(merged, fill_defaults=False)
         if any(m is not old and m.get("id") == new["id"] for m in models):
             raise ValueError(f"模型 ID 已存在: {new['id']}")
         old.clear()
@@ -1251,7 +1546,16 @@ def api_batch_delete_models(pid: str, body: dict) -> dict:
 def api_discover_models(pid: str, agent: str | None = None) -> dict:
     h = hub()
     p=_provider(h,pid)
-    models = workbuddy_login().accounts.models() if p.get('kind')=='workbuddy-ai' else discover_models(p,agent)
+    if p.get('kind') == 'workbuddy-ai':
+        raise ValueError('WorkBuddy 订阅反代已取消，请选择其他可用线路')
+    elif p.get('kind') == 'codex-chatgpt':
+        from codex_subscription import models as codex_models, read_auth
+        models = codex_models(read_auth())
+    elif p.get('kind') == 'zcode-subscription':
+        from zcode_subscription import models as zcode_models, read_auth
+        models = zcode_models(read_auth())
+    else:
+        models = discover_models(p,agent)
     return {"ok": True, "count": len(models), "models": models}
 
 
@@ -1333,11 +1637,39 @@ def api_import_apply(target: str, body: dict) -> dict:
 
 # URL 编码必须在路由匹配之后解码：openrouter 等模型 ID 自带 /。
 ROUTES = [
-    ("GET", r"^/api/workbuddy$", lambda m,b,q=None: api_workbuddy()),
-    ("POST", r"^/api/workbuddy/login$", lambda m,b,q=None: workbuddy_login().start()),
-    ("DELETE", r"^/api/workbuddy/login$", lambda m,b,q=None: workbuddy_login().cancel() or {"ok":True}),
-    ("POST", r"^/api/workbuddy/connect$", lambda m,b,q=None: api_workbuddy_connect()),
-    ("POST", r"^/api/workbuddy/logout$", lambda m,b,q=None: api_workbuddy_logout()),
+    ("GET", r"^/api/capabilities$", lambda m,b,q=None: capability_library().list_items()),
+    ("GET", r"^/api/capabilities/discover$", lambda m,b,q=None: capability_library().discover()),
+    ("POST", r"^/api/capabilities/import$", lambda m,b,q=None: capability_library().import_item(b)),
+    ("PUT", r"^/api/capabilities/([a-f0-9]{32})$", lambda m,b,q=None: capability_library().update_item(m[1], b)),
+    ("DELETE", r"^/api/capabilities/([a-f0-9]{32})$", lambda m,b,q=None: capability_library().remove_item(m[1])),
+    ("POST", r"^/api/capabilities/([a-f0-9]{32})/preview$", lambda m,b,q=None: capability_library().preview(m[1], b)),
+    ("GET", r"^/api/capabilities/([a-f0-9]{32})/history$", lambda m,b,q=None: capability_library().history(m[1])),
+    ("POST", r"^/api/capabilities/apply$", lambda m,b,q=None: capability_library().apply(b.get("planId"))),
+    ("POST", r"^/api/capabilities/discard$", lambda m,b,q=None: capability_library().discard_preview(b.get("planId"))),
+    ("POST", r"^/api/capabilities/restore$", lambda m,b,q=None: capability_library().restore(b.get("transactionId"))),
+    ("GET", r"^/api/quota-monitor$", lambda m,b,q=None: workspace_services().quota.status()),
+    ("GET", r"^/api/workspace/status$", lambda m,b,q=None: workspace_services().status()),
+    ("PUT", r"^/api/quota-monitor/settings$", lambda m,b,q=None: workspace_services().quota.update_settings(b)),
+    ("POST", r"^/api/quota-monitor/refresh$", lambda m,b,q=None: workspace_services().quota.refresh(b.get("provider"))),
+    ("GET", r"^/api/sessions/recent$", lambda m,b,q=None: api_recent_sessions()),
+    ("PUT", r"^/api/sessions/title$", lambda m,b,q=None: api_set_session_title(b)),
+    ("POST", r"^/api/sessions/resume/preview$", lambda m,b,q=None: api_resume_preview(b)),
+    ("POST", r"^/api/sessions/resume$", lambda m,b,q=None: api_resume(b)),
+    ("POST", r"^/api/sessions/handoff$", lambda m,b,q=None: api_handoff(b)),
+    ("POST", r"^/api/sessions/target$", lambda m,b,q=None: api_handoff_target(b)),
+    ("POST", r"^/api/sessions/target/open$", lambda m,b,q=None: api_handoff_open(b)),
+    ("POST", r"^/api/sessions/handoff/start$", lambda m,b,q=None: api_handoff_start(b)),
+    ("GET", r"^/api/sessions/summary/routes$", lambda m,b,q=None: api_summary_routes()),
+    ("POST", r"^/api/sessions/summary/preview$", lambda m,b,q=None: api_summary_preview(b)),
+    ("POST", r"^/api/sessions/summary/generate$", lambda m,b,q=None: api_summary_generate(b)),
+    ("GET", r"^/api/zcode-subscription$", lambda m,b,q=None: api_zcode_subscription()),
+    ("POST", r"^/api/zcode-subscription/connect$", lambda m,b,q=None: api_zcode_subscription_connect()),
+    ("POST", r"^/api/zcode-subscription/disconnect$", lambda m,b,q=None: api_zcode_subscription_disconnect()),
+    ("POST", r"^/api/zcode-subscription/quota$", lambda m,b,q=None: api_zcode_subscription_quota()),
+    ("GET", r"^/api/codex-subscription$", lambda m,b,q=None: api_codex_subscription()),
+    ("POST", r"^/api/codex-subscription/connect$", lambda m,b,q=None: api_codex_subscription_connect()),
+    ("POST", r"^/api/codex-subscription/disconnect$", lambda m,b,q=None: api_codex_subscription_disconnect()),
+    ("POST", r"^/api/codex-subscription/quota$", lambda m,b,q=None: api_codex_subscription_quota()),
     ("GET", r"^/api/gateway$", lambda m,b,q=None: gateway().status()),
     ("POST", r"^/api/gateway/start$", lambda m,b,q=None: gateway().start(observations().settings()['content'])),
     ("POST", r"^/api/gateway/preview$", lambda m,b,q=None: api_gateway_preview(b)),
@@ -1345,8 +1677,12 @@ ROUTES = [
     ("POST", r"^/api/agents/detect$", lambda m, b, q=None: api_inventory(True)),
     ("POST", r"^/api/agents/check$", lambda m, b, q=None: INVENTORY.check(b.get("instanceId"))),
     ("POST", r"^/api/agents/update$", lambda m, b, q=None: INVENTORY.start_update(b.get("instanceId"))),
+    ("POST", r"^/api/agents/check-all$", lambda m, b, q=None: api_agents_check_all()),
+    ("POST", r"^/api/agents/update-all$", lambda m, b, q=None: api_agents_update_all()),
     ("GET", r"^/api/observation$", lambda m, b, q=None: api_observations(q)),
+    ("GET", r"^/api/subscriptions/activity$", lambda m, b, q=None: api_subscription_activity(q)),
     ("GET", r"^/api/observation/status$", lambda m, b, q=None: observations().status()),
+    ("POST", r"^/api/observation/retry$", lambda m, b, q=None: api_observation_retry(b)),
     ("PUT", r"^/api/observation/settings$", lambda m, b, q=None: api_observation_settings(b)),
     ("POST", r"^/api/observation/refresh$", lambda m, b, q=None: observations().refresh()),
     ("POST", r"^/api/observation/cleanup$", lambda m, b, q=None: api_observation_cleanup(b)),
@@ -1382,6 +1718,36 @@ ROUTES = [
     ("GET", r"^/api/import/([a-z-]+)$", lambda m, b, q=None: api_import_scan(m[1])),
     ("POST", r"^/api/import/([a-z-]+)$", lambda m, b, q=None: api_import_apply(m[1], b)),
 ]
+
+
+def dispatch_api(method: str, path: str, query: dict | None = None, body: dict | None = None) -> tuple[int, dict | list]:
+    """在进程内直接调用 ROUTES，不经过 HTTP。返回 (状态码, 载荷)。
+
+    HTTP 处理器与桌面壳（desktop_app.py）共用同一份分发逻辑：
+    桌面壳借此完全摆脱监听端口，页面里的 fetch 经 WebView2
+    WebMessage 直达这里。URL 解码由各路由自行处理（openrouter
+    等模型 ID 自带 /），与旧行为一致。
+    """
+    body = body or {}
+    query = query or {}
+    try:
+        for verb, pattern, fn in ROUTES:
+            if verb != method:
+                continue
+            match = re.match(pattern, path)
+            if match:
+                return 200, fn(match, body, query)
+        return 404, {"error": f"unknown api: {method} {path}"}
+    except BulkBusy as e:
+        # 批量检测/更新已在跑：409 是「当前状态不允许」，不是参数错误。
+        return 409, {"error": str(e), "bulk": e.bulk}
+    except ValueError as e:
+        return 400, {"error": str(e)}
+    except ModelLossError as e:
+        # 护栏拒绝写入：说明这次请求会丢掉预期之外的模型
+        return 409, {"error": str(e)}
+    except Exception as e:
+        return 500, {"error": f"{type(e).__name__}: {e}"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1429,13 +1795,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "message": "本地服务正在退出"})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
-            query = parse_qs(split.query)
-            for verb, pattern, fn in ROUTES:
-                match = re.match(pattern, path) if verb == method else None
-                if match:
-                    self._send_json(200, fn(match, body, query))
-                    return
-            self._send_json(404, {"error": f"unknown api: {method} {path}"})
+            status, payload = dispatch_api(method, path, parse_qs(split.query), body)
+            self._send_json(status, payload)
+        except BulkBusy as e:
+            # 批量检测/更新已在跑：409 是「当前状态不允许」，不是参数错误。
+            self._send_json(409, {"error": str(e), "bulk": e.bulk})
         except ValueError as e:
             self._send_json(400, {"error": str(e)})
         except ModelLossError as e:
@@ -1495,6 +1859,8 @@ def main() -> int:
     collector.start()
     managed_gateway=gateway()
     managed_gateway.watch(collector.settings)
+    workspace=workspace_services()
+    workspace.start()
     url = f"http://{args.host}:{args.port}/"
     print(f"Agent Hub 工作台: {url}\nCtrl+C 退出")
     if args.open:
@@ -1504,7 +1870,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        workbuddy_login().cancel()
+        workspace.close()
         managed_gateway.close()
         collector.close()
         server.server_close()

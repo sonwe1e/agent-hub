@@ -20,7 +20,7 @@ with isolated() as home:
     store = server.observations()
     with sqlite3.connect(report/'data/observability.sqlite3') as source, store.db() as dest:
         source.backup(dest)
-    store.settings_path.write_text(json.dumps({'enabled':False,'content':True,'retentionDays':30,'clearedBefore':0}))
+    store.settings_path.write_text(json.dumps({'enabled':False,'content':True,'retentionDays':30,'clearedBefore':0}), encoding="utf-8")
     store.progress.update(evidence['status']['collector'])
     # The observation pages use the recorded real data; no model sync, vendor
     # updater, or native client is invoked by this read-only review server.

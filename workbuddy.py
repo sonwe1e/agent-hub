@@ -8,15 +8,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import copy
+import http.client
 import json
 import os
 from pathlib import Path
 import secrets
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+from agent_hub.gateway.transport import ProxyError, connection_for
 
 ENDPOINT = 'https://www.workbuddy.ai'
 UA = 'WorkBuddy/5.5.6'
@@ -31,22 +31,24 @@ class WorkBuddyError(ValueError):
 
 
 def call(path, method='GET', headers=None, body=None):
-    request = urllib.request.Request(ENDPOINT + path,
-        data=json.dumps(body).encode() if body is not None else None, method=method,
-        headers={'Content-Type':'application/json', 'Accept':'application/json',
-                 'User-Agent':UA, **(headers or {})})
+    conn = None
     try:
-        response = urllib.request.urlopen(request, timeout=25)
-    except urllib.error.HTTPError as exc:
-        response = exc
-    except OSError:
-        raise WorkBuddyError('无法连接 WorkBuddy AI，请检查网络后重试') from None
-    with response:
+        conn, target, proxy_headers = connection_for(ENDPOINT + path, timeout=25)
+        conn.request(method, target, body=json.dumps(body).encode() if body is not None else None,
+                     headers={'Content-Type':'application/json', 'Accept':'application/json',
+                              'User-Agent':UA, **(headers or {}), **proxy_headers})
+        response = conn.getresponse()
         status = response.status
-        try:
-            data = json.loads(response.read(8 * 1024 * 1024))
-        except (ValueError, OSError):
-            raise WorkBuddyError('WorkBuddy AI 返回无效数据', status=status) from None
+        data = json.loads(response.read(8 * 1024 * 1024))
+    except ProxyError as exc:
+        raise WorkBuddyError(str(exc)) from None
+    except (OSError, http.client.HTTPException):
+        raise WorkBuddyError('无法连接 WorkBuddy AI，请检查网络后重试') from None
+    except ValueError:
+        raise WorkBuddyError('WorkBuddy AI 返回无效数据', status=locals().get('status', 502)) from None
+    finally:
+        if conn is not None:
+            conn.close()
     if not isinstance(data,dict): raise WorkBuddyError('WorkBuddy AI 返回无效数据')
     try:code=int(data.get('code') or 0)
     except (TypeError,ValueError):raise WorkBuddyError('WorkBuddy AI 返回无效错误码') from None
@@ -250,9 +252,10 @@ def provider_config(cfg, models, existing=None):
     p.update(name='WorkBuddy AI', displayName='WorkBuddy AI（海外版）', kind=PROVIDER,
              baseUrl=gateway_url(cfg)+'/workbuddy/pi/v1', api='openai-completions',
              apiKey=p.get('apiKey') or secrets.token_urlsafe(32), enabled=True,
-             targets=['claude','codex','pi','dsh'], models=models)
+             targets=['claude','codex','pi','dsh','opencode'], models=models)
     p['agents'] = {a:{'baseUrl':gateway_url(cfg)+'/workbuddy/'+a+('' if a=='claude' else '/v1'),
                        'api':api} for a,api in [('claude','anthropic-messages'),('codex','openai-responses'),
-                                                ('pi','openai-completions'),('dsh','openai-completions')]}
+                                                 ('pi','openai-completions'),('dsh','openai-completions'),
+                                                 ('opencode','openai-completions')]}
     p['notes'] = 'WorkBuddy AI 海外版订阅，经 Hub 本地网关转换。登录凭据只保存在 data/gateway 中；使用时请保持 Hub 运行。'
     return p

@@ -97,7 +97,7 @@ class LiveFormatTests(unittest.TestCase):
         path = self.file(self.dsh({'kind':'stop'}),'.dsh/sessions/work/session.v4.jsonl')
         store = Store(self.home/'data',self.home)
         self.addCleanup(store.close)
-        store.settings_path.write_text(json.dumps({'enabled':True,'content':False,'retentionDays':30,'clearedBefore':0}))
+        store.settings_path.write_text(json.dumps({'enabled':True,'content':False,'retentionDays':30,'clearedBefore':0}), encoding="utf-8")
         st = path.stat()
         with store.db() as db:
             db.execute('INSERT INTO sources VALUES(?,?)',(str(path),f'{st.st_size}:{st.st_mtime_ns}:False'))

@@ -50,7 +50,7 @@ class ObservationDefaultsTests(unittest.TestCase):
         self.assertEqual(len(native['messages']),2)
 
     def test_native_read_does_not_create_a_body_copy_or_enable_collection(self):
-        self.store.settings_path.write_text(json.dumps(self.paused))
+        self.store.settings_path.write_text(json.dumps(self.paused), encoding="utf-8")
         self.store.ingest(self.session(),self.paused)
         result=self.store.session_detail('pi','native-work')
         self.assertEqual(result['contentSource'],'native-on-demand')
@@ -61,7 +61,7 @@ class ObservationDefaultsTests(unittest.TestCase):
 
     def test_missing_native_file_uses_only_unexpired_opt_in_copy(self):
         s={**self.paused,'content':True}
-        self.store.settings_path.write_text(json.dumps(s))
+        self.store.settings_path.write_text(json.dumps(s), encoding="utf-8")
         self.store.ingest(self.session(),s)
         self.path.unlink()
         result=self.store.session_detail('pi','native-work')
@@ -74,7 +74,7 @@ class ObservationDefaultsTests(unittest.TestCase):
     def test_body_limit_discards_oldest_records(self):
         s={**self.paused,'content':True}
         parsed=self.session()
-        self.store.settings_path.write_text(json.dumps(s))
+        self.store.settings_path.write_text(json.dumps(s), encoding="utf-8")
         self.store.ingest(parsed,s)
         limit=max(len(json.dumps(m).encode()) for m in parsed.messages)+1
         with patch.object(observation,'CONTENT_MAX_BYTES',limit):
@@ -88,7 +88,7 @@ class ObservationDefaultsTests(unittest.TestCase):
 
     def test_copy_older_than_seven_days_is_removed_without_removing_usage(self):
         s={**self.paused,'content':True}
-        self.store.settings_path.write_text(json.dumps(s))
+        self.store.settings_path.write_text(json.dumps(s), encoding="utf-8")
         self.store.ingest(self.session(),s)
         with self.store.db() as db:
             db.execute('UPDATE messages SET at=?',(time.time()-8*86400,))
@@ -97,7 +97,7 @@ class ObservationDefaultsTests(unittest.TestCase):
         self.assertEqual(self.store.query()['total'],1)
 
     def test_native_text_respects_clear_watermark(self):
-        self.store.settings_path.write_text(json.dumps(self.paused))
+        self.store.settings_path.write_text(json.dumps(self.paused), encoding="utf-8")
         self.store.ingest(self.session(),self.paused)
         self.store.cleanup(clear=True)
         mark=self.store.settings()['clearedBefore']

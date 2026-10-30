@@ -31,10 +31,12 @@ TARGET_FILES = {
     "mcode": (".minimax/config.yaml",),
     "zcode": (".zcode/v2/provider_config.json", ".zcode/v2/.agent-hub-state.json"),
     "dsh": (".dsh/.credentials.yaml", ".dsh/settings.yaml.imported",
-            ".dsh/profiles/desktop/cordis.patch.yml", ".dsh/settings.yaml"),
+            ".dsh/profiles/desktop/cordis.patch.yml", ".dsh/settings.yaml",
+            ".dsh/.agent-hub-state.json"),
     "claude": (".claude/settings.json",),
     "codex": (".codex/config.toml", ".codex/.agent-hub-state.json", ".codex/.agent-hub-gateway.json"),
     "omp": (".omp/agent/config.yml",),
+    "opencode": (".config/opencode/opencode.json",),
 }
 ALIASES = {"dsh-desktop": "dsh"}
 MAX_PLANS = 32
@@ -154,8 +156,11 @@ def _select(cfg: dict, only: list[str] | None) -> list[str]:
         raise TransactionError("sync.targets must be an object")
     if only is not None and (not isinstance(only, list) or any(not isinstance(x, str) for x in only)):
         raise TransactionError("targets must be an array of target names")
+    # 只有这几个目标参与「全量同步」；mcode / zcode / omp 需要显式启用。
+    # 新增 Agent 时必须同时加进这里，否则它永远不会被默认同步选中。
+    default_selected = ("claude", "codex", "pi", "dsh", "dsh-desktop", "opencode")
     selected = only if only is not None else [name for name, entry in targets.items()
-                                            if name in ("claude", "codex", "pi", "dsh", "dsh-desktop")
+                                            if name in default_selected
                                             and isinstance(entry, dict) and entry.get("enabled") is True]
     canonical = []
     for name in selected:
@@ -194,6 +199,16 @@ def _validate_config(cfg: Any) -> None:
                                              not isinstance(model.get("id"), str) or
                                              not model["id"].strip() for model in models):
             raise TransactionError(f"Provider {name} has an invalid model list")
+
+
+def _validate_hub_config_bytes(data: bytes | None, module) -> None:
+    if data is None:
+        raise TransactionError("Hub configuration cannot be deleted by a transaction")
+    try:
+        cfg = json.loads(module.strip_json_comments(data.decode("utf-8")))
+    except (UnicodeError, ValueError) as exc:
+        raise TransactionError("Hub configuration is invalid JSON") from exc
+    _validate_config(cfg)
 
 
 def _yaml_subset(text: str) -> Any:
@@ -501,10 +516,21 @@ def _compile(engine: Path, root: Path, targets: list[str], *, reconcile=False) -
            if key in os.environ}
     env.update(HOME=str(root / "home"), USERPROFILE=str(root / "home"),
                CODEX_HOME=str(root / "home" / ".codex"), PYTHONUTF8="1")
+    if getattr(sys, "frozen", False):
+        # 冻结后 sys.executable 是 exe 本身，不是 Python 解释器：
+        # `exe -I sync_transaction.py --compile ...` 会被 exe 的 argparse 拒绝，
+        # stdout 为空，最终表现成 "Isolated native configuration compilation failed"。
+        # 走 exe 自己的隐藏入口，把参数原样转交给 _worker。
+        argv = [sys.executable, "--compile-worker", str(engine), str(root),
+                json.dumps(targets), json.dumps(reconcile)]
+        timeout = 120
+    else:
+        argv = [sys.executable, "-I", str(Path(__file__).absolute()), "--compile",
+                str(engine), str(root), json.dumps(targets), json.dumps(reconcile)]
+        timeout = 45
     try:
-        result = subprocess.run([sys.executable, "-I", str(Path(__file__).absolute()), "--compile",
-                                 str(engine), str(root), json.dumps(targets), json.dumps(reconcile)],
-                                env=env, capture_output=True, text=True, encoding="utf-8", timeout=45)
+        result = subprocess.run(argv, env=env, capture_output=True, text=True,
+                                encoding="utf-8", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise TransactionError("Isolated native configuration compilation did not finish") from exc
     try:
@@ -516,18 +542,29 @@ def _compile(engine: Path, root: Path, targets: list[str], *, reconcile=False) -
     return report.get("warnings", [])
 
 
-def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
-    cfg = copy.deepcopy(hub.cfg)
+def preview(hub, only: list[str] | None = None, *, reconcile=False, model_sync=None) -> dict:
+    original_cfg = copy.deepcopy(hub.cfg)
+    cfg = copy.deepcopy(original_cfg)
+    if model_sync is not None and model_sync != original_cfg.get("modelSync"):
+        cfg["modelSync"] = copy.deepcopy(model_sync)
+        cfg["updatedAt"] = _module(hub).now_iso()
     _validate_config(cfg)
     targets = _select(cfg, only)
+    module = _module(hub)
+    for agent in targets:
+        try:
+            module.assert_no_retired_workbuddy_selection(cfg, agent)
+        except ValueError as exc:
+            raise TransactionError(str(exc)) from exc
     if (cfg.get('gateway') or {}).get('enabled'):
         # The gateway, rather than the eventual client shell, must possess the
         # selected connection's credential. Reject unresolved env references
         # before generating any client writes.
         from gateway_runtime import export_connections, route_id
         available=export_connections(cfg)[1]
-        module=_module(hub)
         for agent in targets:
+            if agent == 'opencode':
+                continue  # OpenCode currently uses its own direct connection.
             if agent=='codex' and (cfg.get('sync',{}).get('targets',{}).get('codex') or {}).get('mode','official')!='third-party':
                 continue # Native ChatGPT authentication is supplied by the client.
             for selection in module.agent_model_tiers(cfg,agent).values():
@@ -535,18 +572,24 @@ def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
                     raise TransactionError(f'{agent}: 网关无法解析选定连接的认证信息，请检查 API 密钥或环境变量；未改写客户端')
     home, config, backups, engine = _context(hub)
     relative_files = sorted({rel for name in targets for rel in TARGET_FILES[name]})
+    if config in {home / rel for rel in relative_files}:
+        raise TransactionError("Hub configuration cannot also be a native target file")
     sources = {path: _snapshot(path) for path in
                (config, engine, engine.with_name("codex_config.py"), Path(__file__).absolute())}
     if 'gateway' in cfg:
         for name in ('gateway_runtime.py','gateway_server.py'):
             path=engine.with_name(name)
             sources[path]=_snapshot(path)
+        # Gateway route export uses AGENTS from its actual implementation.
+        # Record that source as well so a changed agent list invalidates preview.
+        path = engine.with_name('agent_hub') / 'agents' / 'inventory.py'
+        sources[path] = _snapshot(path)
     # A long-lived Hub instance must not compile an obsolete in-memory config.
     try:
         disk_cfg = json.loads(_module(hub).strip_json_comments(sources[config].data.decode("utf-8")))
     except (AttributeError, UnicodeError, ValueError) as exc:
         raise TransactionError("The saved Hub configuration is invalid; reload it before previewing") from exc
-    if _json_hash(disk_cfg) != _json_hash(cfg):
+    if _json_hash(disk_cfg) != _json_hash(original_cfg):
         raise TransactionError("Hub configuration is stale; reload it before previewing")
     for rel in relative_files:
         path = home / rel
@@ -556,6 +599,8 @@ def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
     warnings = []
     if "claude" in targets:
         warnings.append("Claude sync covers settings.json only; cc-switch is a separate, unsupported database target.")
+    if "opencode" in targets:
+        warnings.append("OpenCode 同步会用 Hub 的供应商清单替换 opencode.json 的 provider 段；手写供应商请先加入 Hub。应用后可恢复原配置。")
     with tempfile.TemporaryDirectory(prefix="agent-hub-preview-") as directory:
         root = Path(directory)
         (root / "home").mkdir()
@@ -580,11 +625,13 @@ def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
             if staged.data != sources[home / rel].data:
                 outputs[home / rel] = staged.data
         # All selected adapters compile successfully before a plan becomes applicable.
+    if cfg != original_cfg:
+        outputs[config] = (json.dumps(cfg, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     for name in targets:
         if not any(home / rel in outputs for rel in TARGET_FILES[name]):
             warnings.append(f"{name}: no native file changes are needed")
     plan_id = uuid.uuid4().hex
-    plan = Plan(time.monotonic(), home, config, backups, engine, _json_hash(cfg), targets,
+    plan = Plan(time.monotonic(), home, config, backups, engine, _json_hash(original_cfg), targets,
                 sources, outputs, warnings)
     with _LOCK:
         _PLANS[plan_id] = plan
@@ -594,7 +641,8 @@ def preview(hub, only: list[str] | None = None, *, reconcile=False) -> dict:
     return {"planId": plan_id, "targets": list(targets), "warnings": list(warnings),
             "files": [{"path": str(path), "action": "delete" if data is None else
                        ("create" if sources[path].data is None else "update"),
-                       "targets": [name for name in targets if path.relative_to(home).as_posix() in TARGET_FILES[name]]}
+                       "targets": [] if path == config else
+                                  [name for name in targets if path.relative_to(home).as_posix() in TARGET_FILES[name]]}
                       for path, data in outputs.items()]}
 
 
@@ -665,7 +713,8 @@ def _assert_sources(sources: dict[Path, Snapshot]) -> None:
 
 
 def _commit(home: Path, root: Path, targets: list[str], sources: dict[Path, Snapshot],
-            outputs: dict[Path, bytes | None], *, restored_from: str | None = None) -> dict:
+            outputs: dict[Path, bytes | None], *, config_path: Path | None = None,
+            restored_from: str | None = None) -> dict:
     _assert_sources(sources)
     transaction_id = uuid.uuid4().hex
     folder = root / transaction_id
@@ -680,7 +729,9 @@ def _commit(home: Path, root: Path, targets: list[str], sources: dict[Path, Snap
         filename = f"{index:04d}.before" if before.data is not None else None
         if filename:
             _atomic_write(folder / filename, before.data, 0o600)
-        manifest["files"].append({"path": path.relative_to(home).as_posix(), "backup": filename,
+        location = ({"kind": "hub-config", "path": str(config_path)} if path == config_path
+                    else {"path": path.relative_to(home).as_posix()})
+        manifest["files"].append({**location, "backup": filename,
                                   "beforeHash": _digest(before.data), "afterHash": _digest(data),
                                   "beforeMode": before.mode,
                                   "afterMode": _effective_mode(
@@ -745,16 +796,20 @@ def apply(hub, plan_id: str) -> dict:
             raise TransactionError("Preview is stale because the Hub configuration changed; preview again")
         _assert_sources(plan.sources)
         for path, data in plan.outputs.items():
-            _validate_file(path, data, _module(hub), output=True)
+            if path == plan.config:
+                _validate_hub_config_bytes(data, _module(hub))
+            else:
+                _validate_file(path, data, _module(hub), output=True)
         with _disk_lock(plan.backups) as root:
             _PLANS.pop(plan_id, None)
-            return _commit(plan.home, root, plan.targets, plan.sources, plan.outputs)
+            return _commit(plan.home, root, plan.targets, plan.sources, plan.outputs,
+                           config_path=plan.config)
 
 
 def restore(hub, transaction_id: str) -> dict:
     if not isinstance(transaction_id, str) or re.fullmatch(r"[0-9a-f]{32}", transaction_id) is None:
         raise TransactionError("Invalid transaction ID")
-    home, _config, backups, _engine = _context(hub)
+    home, config, backups, _engine = _context(hub)
     with _LOCK, _disk_lock(backups) as root:
         folder = root / transaction_id
         manifest_path = folder / "manifest.json"
@@ -774,14 +829,18 @@ def restore(hub, transaction_id: str) -> dict:
             raise TransactionError("Transaction has invalid native targets")
         allowed = {rel for name in targets for rel in TARGET_FILES[name]}
         files = manifest.get("files")
-        if not isinstance(files, list) or len(files) > len(allowed):
+        if not isinstance(files, list) or len(files) > len(allowed) + 1:
             raise TransactionError("Transaction file manifest is invalid")
         sources, outputs = {}, {}
         for entry in files:
-            if (not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or
-                    entry["path"] not in allowed):
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                 raise TransactionError("Transaction contains a non-allowlisted native file")
-            path = home / entry["path"]
+            if entry.get("kind") == "hub-config" and entry["path"] == str(config):
+                path = config
+            elif entry.get("kind") is None and entry["path"] in allowed:
+                path = home / entry["path"]
+            else:
+                raise TransactionError("Transaction contains a non-allowlisted file")
             if path in sources:
                 raise TransactionError("Transaction contains a duplicate native file")
             current = _snapshot(path)
@@ -794,10 +853,14 @@ def restore(hub, transaction_id: str) -> dict:
             data = _snapshot(folder / filename).data if filename else None
             if (filename is not None and data is None) or _digest(data) != entry.get("beforeHash"):
                 raise TransactionError("Transaction backup is missing or its integrity check failed")
-            _validate_file(path, data, _module(hub))
+            if path == config:
+                _validate_hub_config_bytes(data, _module(hub))
+            else:
+                _validate_file(path, data, _module(hub))
             sources[path] = current
             outputs[path] = data
-        result = _commit(home, root, targets, sources, outputs, restored_from=transaction_id)
+        result = _commit(home, root, targets, sources, outputs, config_path=config,
+                         restored_from=transaction_id)
         result["restored"] = transaction_id
         return result
 
@@ -824,10 +887,15 @@ def _worker(engine: Path, root: Path, targets: list[str], *, reconcile=False) ->
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(engine.parent))
     sys.addaudithook(guard)
-    spec = importlib.util.spec_from_file_location("_agent_hub_compile", engine)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    if getattr(sys, "frozen", False):
+        # 打包后 hub.py 已编译进 PYZ，_MEIPASS 下没有可加载的源文件；
+        # 直接用已导入的模块。子进程只做编译就退出，改动全局路径是安全的。
+        import hub as module
+    else:
+        spec = importlib.util.spec_from_file_location("_agent_hub_compile", engine)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
     module.HOME = root / "home"
     module.HUB_DIR = root / "hub"
     module.HUB_CONFIG = root / "hub" / "providers.json"
@@ -849,6 +917,8 @@ def _worker(engine: Path, root: Path, targets: list[str], *, reconcile=False) ->
                     compile_codex_native(module.HOME, hub.cfg)
             elif target == "zcode":
                 hub.push_zcode(reconcile=reconcile, warnings=warnings)
+            elif target == "dsh":
+                hub.push_dsh(reconcile=reconcile, warnings=warnings)
             elif target == "pi":
                 hub.push_pi(warnings=warnings)
             else:

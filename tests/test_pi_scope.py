@@ -12,7 +12,7 @@ class PiScopeTests(unittest.TestCase):
         self.addCleanup(context.__exit__, None, None, None)
         self.directory = self.home / '.pi' / 'agent'
         self.directory.mkdir(parents=True)
-        self.cfg = json.loads(server.HUB_CONFIG.read_text())
+        self.cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
         self.cfg['providers'] = {'openrouter': self.cfg['providers']['openrouter']}
         self.cfg['providers']['openrouter']['models'] = [{'id': 'openrouter/spacebunny:free'}]
         self.cfg['modelSync'] = {'default': {'provider': 'openrouter', 'model': 'openrouter/spacebunny:free'}}
@@ -25,7 +25,7 @@ class PiScopeTests(unittest.TestCase):
         engine.save_json(self.directory / filename, data)
 
     def read(self, filename='settings.json'):
-        return json.loads((self.directory / filename).read_text())
+        return json.loads((self.directory / filename).read_text(encoding="utf-8"))
 
     def push(self):
         warnings = []

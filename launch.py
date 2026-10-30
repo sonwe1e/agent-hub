@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""复用本地服务，以 Edge 独立应用窗口（或默认浏览器）打开工作台。"""
+"""默认打开桌面工作台；ui/serve 显式使用本地 HTTP 服务。"""
 from __future__ import annotations
 
 import argparse
@@ -74,14 +74,18 @@ def open_workspace(port: int, browser: bool = False) -> None:
     webbrowser.open(url)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Agent Hub 工作台启动器")
-    parser.add_argument("mode", nargs="?", choices=("gui", "ui", "serve"), default="gui")
+    parser.add_argument("mode", nargs="?", choices=("gui", "desktop", "ui", "serve"), default="gui")
     parser.add_argument("--port", type=int, default=8787)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error("端口必须在 1–65535 之间")
     try:
+        if args.mode in ("gui", "desktop"):
+            from desktop_app import main as desktop_main
+
+            return desktop_main([])
         port = ensure_server(args.port)
         if Path(sys.executable).stem.lower() != "pythonw":
             print(f"Agent Hub: http://127.0.0.1:{port}/")

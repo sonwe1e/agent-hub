@@ -70,7 +70,7 @@ class GatewayTests(unittest.TestCase):
     def test_route_parts_have_estimate_provenance_and_no_body_fragments(self):
         routes=self.path.parent/'routing';routes.mkdir()
         (routes/'day.jsonl').write_text(json.dumps({'id':123,'done':True,'prompt':{
-            'tokens':150,'counted':True,'window':128000,'parts':[{'kind':'system','tokens':75,'items':[{'name':'private fragment','tokens':75}]}]}})+'\n')
+            'tokens':150,'counted':True,'window':128000,'parts':[{'kind':'system','tokens':75,'items':[{'name':'private fragment','tokens':75}]}]}})+'\n', encoding="utf-8")
         self.ledger([self.row()])
         r=read_requests(self.path)[0]
         self.assertEqual(r['contextParts']['parts'],[{'kind':'system','tokens':75}])
@@ -98,11 +98,11 @@ class GatewayTests(unittest.TestCase):
         self.store.set_settings({'enabled':False})
         self.store.ingest_gateway(self.path)
         self.assertEqual(self.store.query()['total'],0)
-        self.store.settings_path.write_text(json.dumps({'enabled':True,'content':False,'retentionDays':0,'clearedBefore':0}))
+        self.store.settings_path.write_text(json.dumps({'enabled':True,'content':False,'retentionDays':0,'clearedBefore':0}), encoding="utf-8")
         self.store.ingest_gateway(self.path)
         self.assertEqual(self.store.query()['total'],1)
         self.store.cleanup(clear=True)
-        self.store.settings_path.write_text(json.dumps({**self.store.settings(),'enabled':True}))
+        self.store.settings_path.write_text(json.dumps({**self.store.settings(),'enabled':True}), encoding="utf-8")
         self.store.ingest_gateway(self.path)
         self.assertEqual(self.store.query()['total'],0)
 
@@ -113,16 +113,24 @@ class GatewayTests(unittest.TestCase):
             self.assertTrue(all(not r['fallback'] for r in rows['providers']))
             self.assertNotEqual(route_id('pi','deepseek'),route_id('claude','deepseek'))
 
+    def test_chat_completions_alias_is_exported_as_chat(self):
+        with isolated():
+            h=engine.Hub()
+            h.cfg['providers']['deepseek']['agents']['pi']={'api':'openai-chat-completions'}
+            rows,_=export_connections(h.cfg)
+            route=next(row for row in rows['providers'] if row['id']==route_id('pi','deepseek'))
+            self.assertIn('chat',route)
+
     def test_existing_transaction_renders_namespaces_and_restores_original_bytes(self):
         with isolated() as home:
             h=engine.Hub();h.cfg['gateway']={'enabled':True};engine.save_json(engine.HUB_CONFIG,h.cfg)
             (home/'.pi/agent').mkdir(parents=True,exist_ok=True)
-            (home/'.pi/agent/models.json').write_text('{"providers":{},"custom":"preserve"}')
+            (home/'.pi/agent/models.json').write_text('{"providers":{},"custom":"preserve"}', encoding="utf-8")
             original=(home/'.pi/agent/models.json').read_bytes()
             p=h.preview_push(['pi','claude'])
             self.assertEqual((home/'.pi/agent/models.json').read_bytes(),original)
             result=h.apply_preview(p['planId'])
-            block=json.loads((home/'.pi/agent/models.json').read_text())['providers']['deepseek']
+            block=json.loads((home/'.pi/agent/models.json').read_text(encoding="utf-8"))['providers']['deepseek']
             self.assertEqual(block['baseUrl'],'http://127.0.0.1:8789/v1')
             self.assertTrue(block['models'][0]['id'].startswith(route_id('pi','deepseek')+'/'))
             h.restore_transaction(result['transactionId'])
@@ -130,30 +138,30 @@ class GatewayTests(unittest.TestCase):
 
     def test_native_codex_preserves_login_config_and_restores_external_base(self):
         p=self.root/'.codex/config.toml';p.parent.mkdir()
-        p.write_text('model="native-model"\nopenai_base_url="https://my-route.invalid/backend-api/codex"\n')
+        p.write_text('model="native-model"\nopenai_base_url="https://my-route.invalid/backend-api/codex"\n', encoding="utf-8")
         compile_codex_native(self.root,{'gateway':{'enabled':True}})
-        self.assertIn('model="native-model"',p.read_text())
+        self.assertIn('model="native-model"',p.read_text(encoding="utf-8"))
         compile_codex_native(self.root,{'gateway':{'enabled':False}})
-        self.assertIn('https://my-route.invalid/backend-api/codex',p.read_text())
+        self.assertIn('https://my-route.invalid/backend-api/codex',p.read_text(encoding="utf-8"))
         self.assertFalse((p.parent/'auth.json').exists())
 
     def test_native_codex_external_edit_is_not_overwritten(self):
-        p=self.root/'.codex/config.toml';p.parent.mkdir();p.write_text('model="native"\n')
+        p=self.root/'.codex/config.toml';p.parent.mkdir();p.write_text('model="native"\n', encoding="utf-8")
         compile_codex_native(self.root,{'gateway':{'enabled':True}})
-        p.write_text('openai_base_url="https://external.invalid"\n')
+        p.write_text('openai_base_url="https://external.invalid"\n', encoding="utf-8")
         with self.assertRaisesRegex(ValueError,'外部修改'):
             compile_codex_native(self.root,{'gateway':{'enabled':False}})
 
     def test_runtime_default_settings_and_content_cleanup_are_isolated(self):
         r=Runtime(self.root/'managed')
         r.configure()
-        settings=json.loads((r.directory/'settings.json').read_text())
+        settings=json.loads((r.directory/'settings.json').read_text(encoding="utf-8"))
         self.assertFalse(settings['accountDiscovery'])
         self.assertEqual(settings['engine'],'agent-hub')
         self.assertFalse(settings['gatewayConversations'])
         self.assertFalse(settings['requestArchive'])
         (r.directory/'gateway-conversations').mkdir()
-        (r.directory/'gateway-conversations/old.jsonl').write_text('body')
+        (r.directory/'gateway-conversations/old.jsonl').write_text('body', encoding="utf-8")
         r.configure(False)
         self.assertFalse((r.directory/'gateway-conversations').exists())
 
@@ -166,6 +174,20 @@ class GatewayTests(unittest.TestCase):
             self.assertIsNone(r.process)
             self.assertEqual(r.status()['state'],'failed')
 
+    def test_runtime_passes_only_required_zcode_secret_to_subscription_worker(self):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
+        cfg={'gateway':{'port':port},'providers':{'fixture':{'kind':'zcode-subscription','enabled':True}}}
+        runtime=Runtime(self.root/'managed-secret',lambda:cfg)
+        captured={}
+        def capture(*args,**kwargs):
+            captured.update(kwargs['env']);raise OSError('fixture stopped before spawning')
+        with patch.dict(os.environ,{'ZCODE_CREDENTIAL_SECRET':'fixture-seed','OTHER_SECRET':'must-not-pass'}), \
+             patch('gateway_runtime.subprocess.Popen',side_effect=capture):
+            with self.assertRaises(ValueError):runtime.start()
+        self.assertEqual(captured.get('ZCODE_CREDENTIAL_SECRET'),'fixture-seed')
+        self.assertNotIn('OTHER_SECRET',captured)
+
     def test_gateway_body_fallback_is_opt_in_bounded_and_explicitly_replayed(self):
         import hashlib
         self.ledger([self.row()]);self.store.ingest_gateway(self.path)
@@ -173,9 +195,9 @@ class GatewayTests(unittest.TestCase):
         directory=self.store.root/'gateway/config/magpie/gateway-conversations/2026-10-17'/digest
         directory.mkdir(parents=True)
         (directory/'turns.jsonl').write_text(json.dumps({'agent':'pi','session':'native-session','time':time.time(),
-            'input':[{'role':'user','text':'history'}],'output':[{'role':'assistant','text':'answer'}]})+'\n')
+            'input':[{'role':'user','text':'history'}],'output':[{'role':'assistant','text':'answer'}]})+'\n', encoding="utf-8")
         self.assertEqual(self.store.session_detail('pi','native-session')['messages'],[])
-        self.store.settings_path.write_text(json.dumps({**self.store.settings(),'content':True}))
+        self.store.settings_path.write_text(json.dumps({**self.store.settings(),'content':True}), encoding="utf-8")
         detail=self.store.session_detail('pi','native-session')
         self.assertEqual(detail['contentSource'],'gateway-on-demand')
         self.assertIn('重放历史',detail['messages'][0]['role'])
@@ -185,23 +207,23 @@ class GatewayTests(unittest.TestCase):
         with isolated() as home:
             h=engine.Hub();h.cfg['gateway']={'enabled':True};engine.save_json(engine.HUB_CONFIG,h.cfg)
             file=home/'.pi/agent/models.json';file.parent.mkdir(parents=True)
-            file.write_text(json.dumps({'providers':{'deepseek':{'models':[{'id':'deepseek/model-1','headers':{'custom':'preserve'},'compat':{'customFlag':True}}]}}}))
+            file.write_text(json.dumps({'providers':{'deepseek':{'models':[{'id':'deepseek/model-1','headers':{'custom':'preserve'},'compat':{'customFlag':True}}]}}}), encoding="utf-8")
             plan=h.preview_push(['pi']);h.apply_preview(plan['planId'])
-            model=json.loads(file.read_text())['providers']['deepseek']['models'][0]
+            model=json.loads(file.read_text(encoding="utf-8"))['providers']['deepseek']['models'][0]
             self.assertEqual(model['headers']['custom'],'preserve')
             self.assertTrue(model['compat']['customFlag'])
 
     def test_codex_gateway_uses_existing_transaction_for_official_connect_disconnect(self):
         with isolated() as home:
             h=engine.Hub();h.cfg['gateway']={'enabled':True};h.cfg['sync']['targets']['codex']['enabled']=True
-            file=home/'.codex/config.toml';file.parent.mkdir();file.write_text('model = "native-model"\n')
+            file=home/'.codex/config.toml';file.parent.mkdir();file.write_text('model = "native-model"\n', encoding="utf-8")
             engine.save_json(engine.HUB_CONFIG,h.cfg)
             plan=h.preview_push(['codex']);h.apply_preview(plan['planId'])
-            self.assertIn('/backend-api/codex',file.read_text())
-            self.assertIn('native-model',file.read_text())
+            self.assertIn('/backend-api/codex',file.read_text(encoding="utf-8"))
+            self.assertIn('native-model',file.read_text(encoding="utf-8"))
             h.cfg['gateway']['enabled']=False;engine.save_json(engine.HUB_CONFIG,h.cfg)
             plan=h.preview_push(['codex']);h.apply_preview(plan['planId'])
-            self.assertNotIn('openai_base_url',file.read_text())
+            self.assertNotIn('openai_base_url',file.read_text(encoding="utf-8"))
             self.assertFalse((file.parent/'auth.json').exists())
 
     def test_claude_preserved_tier_uses_same_model_and_keeps_display_label(self):
@@ -209,10 +231,10 @@ class GatewayTests(unittest.TestCase):
             h=engine.Hub();h.cfg['gateway']={'enabled':True}
             h.cfg['modelSync']['overrides']={'claude':{'provider':'deepseek','model':'deepseek/model-1','preserveTiers':['opus']}}
             file=home/'.claude/settings.json';file.parent.mkdir()
-            file.write_text(json.dumps({'env':{'ANTHROPIC_DEFAULT_OPUS_MODEL':'deepseek/model-2','ANTHROPIC_DEFAULT_OPUS_MODEL_NAME':'My Opus label'},'permissions':{'custom':'keep'}}))
+            file.write_text(json.dumps({'env':{'ANTHROPIC_DEFAULT_OPUS_MODEL':'deepseek/model-2','ANTHROPIC_DEFAULT_OPUS_MODEL_NAME':'My Opus label'},'permissions':{'custom':'keep'}}), encoding="utf-8")
             engine.save_json(engine.HUB_CONFIG,h.cfg)
             plan=h.preview_push(['claude']);h.apply_preview(plan['planId'])
-            data=json.loads(file.read_text());env=data['env']
+            data=json.loads(file.read_text(encoding="utf-8"));env=data['env']
             self.assertEqual(env['ANTHROPIC_DEFAULT_OPUS_MODEL'],route_id('claude','deepseek')+'/deepseek/model-2')
             self.assertEqual(env['ANTHROPIC_DEFAULT_OPUS_MODEL_NAME'],'My Opus label')
             self.assertEqual(data['permissions']['custom'],'keep')
@@ -221,12 +243,12 @@ class GatewayTests(unittest.TestCase):
         with isolated() as home:
             h=engine.Hub();h.cfg['gateway']={'enabled':True};h.cfg['sync']['targets']['pi']['enabled']=False
             file=home/'.pi/agent/models.json';file.parent.mkdir(parents=True)
-            file.write_text('{"providers":{"p":{"baseUrl":"http://127.0.0.1:8789/v1"}}}')
+            file.write_text('{"providers":{"p":{"baseUrl":"http://127.0.0.1:8789/v1"}}}', encoding="utf-8")
             engine.save_json(engine.HUB_CONFIG,h.cfg)
             with self.assertRaisesRegex(ValueError,'请先重新启用'):
                 server.api_gateway_preview({'enabled':False})
             self.assertTrue(server.hub().cfg['gateway']['enabled'])
-            self.assertIn('8789/v1',file.read_text())
+            self.assertIn('8789/v1',file.read_text(encoding="utf-8"))
 
     def test_known_nonstandard_credential_is_removed_from_gateway_errors(self):
         self.store.config=lambda:{'providers':{'fixture':{'apiKey':'fixture-private-credential-value'}}}

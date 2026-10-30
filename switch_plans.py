@@ -63,10 +63,11 @@ from hub import (AGENT_CONNECTION_TARGETS, CODEX_REASONING_EFFORTS, REASONING_EF
 # ---------------------------------------------------------------------------
 
 #: 本阶段接入的 Agent（顺序 = 界面与状态展示顺序）。
-PLAN_TARGETS: tuple[str, ...] = ("claude", "codex", "pi", "dsh")
+PLAN_TARGETS: tuple[str, ...] = ("claude", "codex", "pi", "dsh", "opencode")
 
 TARGET_LABELS = {"claude": "Claude Code", "codex": "Codex", "pi": "pi",
-                 "dsh": "dsh（含桌面版）", "zcode": "ZCode"}
+                 "dsh": "dsh（含桌面版）", "zcode": "ZCode",
+                 "opencode": "OpenCode"}
 
 EFFORT_BY_TARGET: dict[str, tuple[str, ...]] = {
     "codex": CODEX_REASONING_EFFORTS,
@@ -74,6 +75,7 @@ EFFORT_BY_TARGET: dict[str, tuple[str, ...]] = {
     "pi": REASONING_EFFORTS,
     "dsh": REASONING_EFFORTS,
     "zcode": REASONING_EFFORTS,
+    "opencode": REASONING_EFFORTS,
 }
 
 #: 该 Agent 能否表达推理强度，落到原生配置的哪个字段，改完要不要客户端动手。
@@ -91,6 +93,8 @@ EFFORT_TRAITS: dict[str, dict[str, Any]] = {
             "note": "dsh 的强度随模型选择一起写入"},
     "zcode": {"support": "applied", "native": "~/.zcode/v2/provider_config.json 的 options.reasoningLevel",
               "note": "ZCode 第三方模式下写入 reasoningLevel"},
+    "opencode": {"support": "unsupported", "native": "~/.config/opencode/opencode.json 的 model",
+                 "note": "Hub 只写入 OpenCode 的模型选择，不设置推理强度"},
 }
 
 #: 写入后需要用户自己再做一步的客户端。
@@ -100,6 +104,7 @@ CLIENT_ACTION: dict[str, str] = {
     "pi": "写入后需重启 pi；旧版本或项目级 enabledModels / --models 可能覆盖全局设置。",
     "dsh": "写入的是 dsh 配置文件；正在运行的 dsh 会话要重启后才会用新模型。",
     "zcode": "第三方模式下写入默认模型选择；正在运行的 ZCode 会话与账号官方线路需要重启确认。",
+    "opencode": "写入后请重新加载或重启 OpenCode 服务，再确认模型列表。",
 }
 
 #: 官方模式门控：这些客户端处于官方模式时，方案只更新供应商目录，不改运行中的模型指针。
@@ -834,7 +839,11 @@ def compile_plan(cfg: dict, plan: dict, *, targets: list[str] | None = None) -> 
                 continue
             overrides[target] = {"provider": base["provider"], "model": base["model"]}
             if base.get("reasoningEffort"):
-                overrides[target]["reasoningEffort"] = base["reasoningEffort"]
+                if EFFORT_TRAITS[target]["support"] == "unsupported":
+                    issues.append(_issue("effort-unsupported", EFFORT_TRAITS[target]["note"],
+                                         target=target, severity="warning"))
+                else:
+                    overrides[target]["reasoningEffort"] = base["reasoningEffort"]
             if _apply_tiers(cfg, target, spec, overrides[target], issues):
                 overrides.pop(target, None)
                 blocked.add(target)

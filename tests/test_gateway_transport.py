@@ -12,6 +12,7 @@ from unittest.mock import patch
 from gateway_server import Server, Handler, State, Observation, packed
 from gateway_runtime import Runtime, route_id
 from gateway_observation import read_requests
+from test_proxy_transport import PROXY_ENV
 
 
 class TransportTests(unittest.TestCase):
@@ -128,6 +129,17 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.calls[0][1]['ChatGPT-Account-Id'],'account-fixture')
         stored=''.join(p.read_text(encoding='utf-8') for p in self.directory.rglob('*.jsonl'))
         self.assertNotIn('native-access-fixture',stored);self.assertNotIn('account-fixture',stored)
+
+    def test_invalid_proxy_fails_closed_without_sending_to_upstream(self):
+        env = {**PROXY_ENV, 'HTTP_PROXY': 'socks4://user:fixture-password@invalid'}
+        with patch.dict('os.environ', env):
+            conn, response = self.request()
+            payload = response.read().decode('utf-8')
+            conn.close()
+        self.assertEqual(response.status, 502)
+        self.assertIn('未改为直连', payload)
+        self.assertNotIn('fixture-password', payload)
+        self.assertEqual(self.calls, [])
 
     def test_python_child_starts_without_downloading_external_binary(self):
         import socket

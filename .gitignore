@@ -7,11 +7,15 @@ backups/
 data/
 
 # 测试与构建产物
+.venv-build/
 tests/node_modules/
 tests/artifacts/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+dist/
+build/
+*.spec
 
 # 临时诊断脚本（本机一次性脚本，不属于项目）
 _tmp_*
@@ -24,3 +28,7 @@ desktop.ini
 
 # ZCode 工具在本仓库的会话状态
 .zcode/
+
+# 其他本机工具状态与权限恢复备份
+.workbuddy/
+.acl-recovery/

@@ -15,6 +15,7 @@ from observation import parse_native
 
 with isolated() as home, ExitStack() as stack:
     cfg=json.loads(engine.HUB_CONFIG.read_text(encoding='utf-8'))
+    cfg['sync']['targets']['opencode']={'enabled':True}
     cfg['providers']['deepseek']['models'].append({'id':LONG_MODEL,'name':LONG_MODEL,'contextWindow':128000})
     engine.HUB_CONFIG.write_text(json.dumps(cfg),encoding='utf-8')
     for name,fn in [('preview_push',preview),('apply_preview',apply),('restore_transaction',restore)]:
@@ -26,7 +27,7 @@ with isolated() as home, ExitStack() as stack:
     inventory.checked_at=1
     stack.enter_context(patch.object(server,'INVENTORY',inventory))
     store=server.observations()
-    store.settings_path.write_text(json.dumps({'enabled':False,'content':True,'retentionDays':30,'clearedBefore':0}))
+    store.settings_path.write_text(json.dumps({'enabled':False,'content':True,'retentionDays':30,'clearedBefore':0}), encoding="utf-8")
     for agent,path in seed(home):store.ingest(parse_native(agent,path,True,secrets=['fixture-secret-do-not-use']))
     store.progress.update(state='complete',finishedAt=__import__('time').time(),sources=[{'agent':a,'exists':True,'files':1} for a in ('claude','codex','pi','dsh')])
     httpd=ThreadingHTTPServer(('127.0.0.1',0),server.Handler)

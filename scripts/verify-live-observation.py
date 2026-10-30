@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from observation import Store, parse_native, open_lines, fresh_input
+from agent_hub.observability.store import Store, parse_native, open_lines, fresh_input
 
 
 def dump(path, value):

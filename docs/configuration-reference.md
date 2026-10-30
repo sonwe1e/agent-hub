@@ -1,6 +1,6 @@
 # 配置引擎参考（保留原有详细说明）
 
-日常支持范围已收敛到 Claude Code、Codex、pi、dsh。以下保留迁移与配置事务的历史说明；历史适配器不再出现在日常界面或默认批量操作中。当前使用入口以根目录 README 为准。
+日常支持范围为 Claude Code、Codex、pi、dsh 和 OpenCode。以下保留迁移与配置事务的历史说明；历史适配器不再出现在日常界面或默认批量操作中。当前使用入口以根目录 README 为准。
 
 # Agent Hub — 统一 Provider 配置
 
@@ -19,7 +19,7 @@
 5. Codex 可选「官方线路」或支持 Responses 的第三方 Plan。首次切到第三方前，在 Codex 内准备好官方配置；Hub 会保存并在切回时恢复官方模型、provider 和推理强度，保留原生登录态。
 6. ZCode 同样有「官方模式 / 第三方模式」：官方模式只维护供应商目录、不碰默认模型选择；第三方模式才把 `defaultModelSelection` 切到 Hub 选的模型，切回官方时恢复接管前保存的选择。
 
-其他订阅在这里指提供兼容 API 地址与密钥的 Coding Plan。Claude Code、pi、dsh 的原生账号订阅登录态不由 Hub 复制或转换。cc-switch 数据库目标不参与工作台的安全预览同步。
+除手动配置兼容 API 的 Coding Plan 外，Codex ChatGPT 和 ZCode 个人订阅也可通过本机只读登录共享；条件和边界见[订阅共享说明](subscription-sharing.md)。Claude Code、pi、dsh 的其他原生账号登录态不由 Hub 复制。cc-switch 数据库目标不参与工作台的安全预览同步。
 
 **连接模型**：每个供应商 = 一条顶层默认连接（`baseUrl` / `apiKey` / `api` / `models`）+ 可选的
 `agents.<agent>` 按 Agent 覆盖。未声明的 Agent 直接用默认连接，因此「所有供应商都能给所有
@@ -307,6 +307,15 @@ Codex 线路用 `none / minimal / low / medium / high / xhigh / max / ultra`（`
 - **没配置 `modelSync` 时不动客户端。** pi 的 `defaultProvider` / `defaultModel`、
   dsh 的 `agent-default-model` 都保持原样，只有点同步并配置过才接管。
   （例外：`sync.targets.claude.featureEnv` 是平台级特性开关，配置了就会写入。）
+- **dsh 的模型选择有外部编辑防护。** 接管期间用户在 dsh 里改过 `agent-default-model`
+  或子代理可选模型时，自动同步 / CLI push / 网关开关一律拒绝覆盖并提示；只有同步页或
+  工作台生成的新预览（显式 reconcile）才按 Hub 选择重新设置。写入的选择指纹记在
+  `~/.dsh/.agent-hub-state.json`，损坏的托管记录会拒绝同步并指向备份。
+- **dsh 的协议词表先翻译。** dsh 的 llm-pi-ai 只认 `openai-completions` /
+  `openai-responses` / `anthropic-messages`，其中 `openai-completions` 就是 Chat
+  Completions 协议；Hub 的 `openai-chat-completions` 写入前会翻译成
+  `openai-completions`，不把 dsh 不认识的值透传过去——一个坏值会让整个
+  llm-pi-ai 激活失败，所有自定义模型从选择器消失。
 - **手填的模型 ID 会被标记但照样写。** 不在该连接模型库里的 ID 在状态里带 ⚠，客户端可能拒绝。
   Claude Code、Codex（第三方线路）与 ZCode（第三方模式）都按此语义放行：ZCode 会把手填模型
   补进该供应商的个人模型列表，否则默认选择指向一个看不见的模型；Codex 只写 `model` 字符串，

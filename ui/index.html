@@ -5,12 +5,22 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light" />
   <title>Agent Hub · 模型工作台</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-  <link rel="stylesheet" href="/styles.css" />
-  <link rel="stylesheet" href="/daily.css" />
-  <script src="/app.js" defer></script>
-  <script src="/workbench.js" defer></script>
-  <script src="/workbuddy.js" defer></script>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="fonts.css" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="features/workbench/daily.css" />
+  <!-- 「模型与方案」页专用样式：左列表 / 右详情 / 高级抽屉。只复用 styles.css 的 token。 -->
+  <link rel="stylesheet" href="features/models/models.css" />
+  <link rel="stylesheet" href="features/workspace/workspace-features.css" />
+  <!-- 桌面壳桥接：必须先于 app.js 覆写 window.fetch（无端口，走 WebView2 WebMessage） -->
+  <script src="bridge.js" defer></script>
+  <script src="app.js" defer></script>
+  <script src="features/workbench/workbench.js" defer></script>
+  <script src="features/subscriptions/subscription_monitor.js" defer></script>
+  <script src="features/subscriptions/codex_subscription.js" defer></script>
+  <script src="features/subscriptions/zcode_subscription.js" defer></script>
+  <script src="features/workspace/workspace-features.js" defer></script>
+  <script src="features/capabilities/skills-bulk.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#content">跳至主要内容</a>
@@ -22,21 +32,22 @@
       </a>
       <div class="nav-caption">工作空间</div>
       <nav>
-        <a href="#agents" class="nav-item" data-page="agents"><span data-icon="hub"></span>Agent<span class="nav-count">4</span></a>
+        <a href="#agents" class="nav-item" data-page="agents"><span data-icon="agents"></span>Agent<span class="nav-count" id="nav-agent-count"></span></a>
+        <a href="#sessions" class="nav-item" data-page="sessions"><span data-icon="clock"></span>继续工作</a>
+        <a href="#library" class="nav-item" data-page="library"><span data-icon="grid"></span>技能与指令</a>
         <a href="#observe" class="nav-item" data-page="observe"><span data-icon="eye"></span>观测</a>
-        <a href="#settings" class="nav-item" data-page="settings"><span data-icon="layers"></span>设置<span class="nav-dot" id="nav-sync-dot" hidden></span></a>
+        <a href="#settings" class="nav-item" data-page="settings"><span data-icon="layers"></span>设置<span class="nav-dot" id="nav-sync-dot" title="本地配置有未同步变更" aria-label="本地配置有未同步变更" hidden></span></a>
       </nav>
       <nav id="settings-nav" class="settings-nav" hidden>
         <a href="#providers" class="nav-item" data-page="providers">供应商与连接<span class="nav-count" id="nav-provider-count"></span></a>
-        <a href="#models" class="nav-item" data-page="models">模型库<span class="nav-count" id="nav-model-count"></span></a>
-        <a href="#sync" class="nav-item" data-page="sync">方案与高级同步</a>
+        <a href="#models" class="nav-item" data-page="models">模型与方案<span class="nav-count" id="nav-model-count"></span></a>
       </nav>
       <div class="sidebar-note"><span data-icon="shield"></span><strong>本机管理 · 有据可查</strong><p>配置写入前自动备份。<br />观测来源与未知项始终可见。</p></div>
       <div class="sidebar-footer"><span class="online-dot"></span><div>本地运行<small>密钥仅保存在本机配置中</small></div><span data-icon="shield"></span></div>
     </aside>
     <div class="workspace">
       <header class="topbar">
-        <div class="breadcrumb">工作空间<span>/</span><strong id="breadcrumb-current">平台同步</strong></div>
+        <div class="breadcrumb">工作空间<span>/</span><strong id="breadcrumb-current">模型与方案</strong></div>
         <div class="topbar-actions"><span class="save-state" id="save-state">连接中…</span><button class="icon-button" id="refresh" title="刷新配置" aria-label="刷新配置"><span data-icon="refresh"></span></button></div>
       </header>
       <main id="content" tabindex="-1">

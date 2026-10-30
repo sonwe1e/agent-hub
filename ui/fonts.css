@@ -1,0 +1,66 @@
+/* ============================================================
+   字体层 —— 「本机台账」方向（规范见 docs/design/visual-direction.md §3）
+   ------------------------------------------------------------
+   三件套均为 SIL OFL 1.1，随 exe 本地分发，禁止外链 CDN
+   （桌面端离线运行，外链必然 FOIT）。
+
+   拉丁随包（116 KB），中文分档回落：优先本机已注册的
+   Noto Sans SC / Noto Serif SC 可变字体（体积代价 0），
+   再退 Windows 常备黑体/宋体。**不退回 Inter / Arial / system-ui。**
+
+   逐字形回落：拉丁族列在前，中文字族列在后。
+   ============================================================ */
+
+@font-face {
+  font-family: "Newsreader";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/newsreader-latin-400.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074,
+                 U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Newsreader";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("./fonts/newsreader-latin-600.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074,
+                 U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url("./fonts/plexsans-latin-wght.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074,
+                 U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("./fonts/plexmono-latin-400.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2074,
+                 U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  /* 展示：拉丁 Newsreader（编辑衬线，对标 Anthropic 的 Tiempos），
+     中文回落宋/明体。Windows 上 SimSun 立即可用。 */
+  --font-display: "Newsreader", "Noto Serif SC", "Source Han Serif SC",
+                  "Songti SC", "STSong", SimSun, NSimSun, serif;
+  /* 正文：拉丁 IBM Plex Sans（1970s 工程标牌传统，与"技术台账"同源），
+     中文 YaHei 显式点名，不用 system-ui 兜底。 */
+  --font-sans: "IBM Plex Sans", "Noto Sans SC", "Source Han Sans SC",
+               "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
+               "Microsoft YaHei", "DengXian", sans-serif;
+  /* 等宽：Plex Mono 保证跨机一致；末段补 YaHei，路径可能含中文 */
+  --font-mono: "IBM Plex Mono", "Cascadia Mono", "Cascadia Code",
+               "Sarasa Mono SC", "Microsoft YaHei", monospace;
+  /* 数字对齐：表格与指标统一开启 */
+  --fs-num: "tnum" 1, "lnum" 1;
+}

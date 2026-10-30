@@ -33,14 +33,30 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     const submit = dialog.locator('button[type=submit]');
     const waitSaved = async () => { await dialog.waitFor({ state: 'hidden' }); await page.waitForFunction(() => !document.body.classList.contains('busy')); };
     const config = async () => (await (await page.request.get(`${url}/api/providers`)).json()).providers;
-    const go = async hash => { await page.evaluate(hash => location.hash=hash,hash); await main.locator('h1').filter({ hasText: ({ models: '模型库', providers: '供应商', sync: '平台同步' })[hash] }).waitFor(); };
+    // 旧「模型库」与「平台同步」已合并为「模型与方案」一页：#sync 只是 #models 的别名。
+    const TITLES = { models: '模型与方案', sync: '模型与方案', providers: '供应商' };
+    // 同步区块（平台勾选 / 精细覆盖 / 切换方案 / 结果 / 诊断）现在收在 <details> 里，默认收起。
+    // 打开它是「用户展开高级」的等价动作；state.advancedOpen 会跨重绘保留，所以调一次即可。
+    const openAdvanced = async () => {
+      const drawer = main.locator('#models-advanced');
+      await drawer.waitFor({ state: 'attached' });
+      await drawer.evaluate(el => { el.open = true; });
+    };
+    const go = async hash => {
+      await page.evaluate(hash => location.hash = hash, hash);
+      await main.locator('h1').filter({ hasText: TITLES[hash] }).waitFor();
+      if (hash === 'models' || hash === 'sync') await openAdvanced();
+    };
     const confirm = async label => { await page.locator('#confirm-dialog').waitFor({ state: 'visible' }); await page.locator('#confirm-ok').click(); await page.waitForFunction(() => !document.body.classList.contains('busy')); };
 
     await step('initial sync workspace and model library layout', async () => {
       await page.goto(url);
+      // main 有 150ms 延迟 + 200ms 的 settle-in 入场动画（styles.css:569，fill-mode: both），
+      // 延迟窗口内 main 的 opacity 为 0，会让截图拍到空白页。先等它结束再断言与截图。
+      await page.waitForFunction(() => { const m = document.querySelector('main'); return !!m && m.getAnimations().every(a => a.playState !== 'running'); }).catch(() => {});
       await main.locator('h1').filter({ hasText: 'Agent' }).waitFor();
       await go('models');
-      await main.locator('h1').filter({ hasText: '模型库' }).waitFor();
+      await main.locator('h1').filter({ hasText: '模型与方案' }).waitFor();
       assert.equal(await page.locator('#nav-model-count').textContent(), '28');
       assert.equal(await page.locator('#model-rows tr').count(), 20);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
@@ -58,6 +74,9 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     });
     await step('add model with provider selection', async () => {
       await main.locator('[data-action="add-model"]').first().click();
+      assert.equal(await dialog.locator('[name=contextWindow]').inputValue(), '');
+      assert.equal(await dialog.locator('[name=maxTokens]').inputValue(), '');
+      assert.equal(await dialog.locator('[name=reasoning]').inputValue(), '');
       await dialog.locator('[name=id]').fill('vendor/my-new-model');
       await dialog.locator('[name=name]').fill('My New Model');
       await dialog.locator('[name=contextWindow]').fill('256000');
@@ -77,6 +96,50 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       assert.equal(model.cost.input, 0.5);
       assert.equal(model.compat.custom, true);
     });
+    await step('reference prices are editable without treating unknown as free', async () => {
+      await main.locator('[data-action="open-model-detail"][data-mid="deepseek/model-1"]').click();
+      await main.locator('#model-detail summary').filter({hasText:'参考单价'}).click();
+      await main.locator('#detail-cost-input').fill('0.75');
+      await main.locator('#detail-cost-output').fill('0');
+      await page.setViewportSize({width:390,height:844});
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+      await page.screenshot({ path: path.join(artifacts, 'model-price-mobile.png'), fullPage: true });
+      await page.setViewportSize({width:1440,height:1040});
+      await main.locator('[data-action="save-model-detail"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      const model = (await config()).deepseek.models.find(m => m.id === 'deepseek/model-1');
+      assert.equal(model.cost.input, 0.75);
+      assert.equal(model.cost.output, 0);
+      assert.equal(model.cost.cacheRead, undefined);
+      assert.equal(model.compat.custom, true);
+      await main.locator('#model-detail [data-action="close-detail"]').click();
+    });
+    await step('editing price and full form preserve unknown capabilities', async () => {
+      const row = main.locator('[data-action="open-model-detail"][data-mid="deepseek/model-7"]');
+      assert.match(await row.textContent(), /未知/);
+      await row.click();
+      assert.equal(await main.locator('#detail-context').inputValue(), '');
+      assert.equal(await main.locator('#detail-maxtokens').inputValue(), '');
+      assert.equal(await main.locator('#detail-reasoning').inputValue(), '');
+      assert.equal(await main.locator('.detail-input:checked').count(), 0);
+      await main.locator('#model-detail summary').filter({hasText:'参考单价'}).click();
+      await main.locator('#detail-cost-output').fill('0.2');
+      await main.locator('[data-action="save-model-detail"]').click();
+      await page.waitForFunction(() => !document.body.classList.contains('busy'));
+      let model = (await config()).deepseek.models.find(m => m.id === 'deepseek/model-7');
+      assert.equal(model.cost.output, 0.2);
+      for (const field of ['contextWindow', 'maxTokens', 'input', 'reasoning']) assert.equal(model[field], undefined);
+      await main.locator('#model-detail [data-action="close-detail"]').click();
+      await main.locator('[data-action="edit-model"][data-mid="deepseek/model-7"]').click();
+      assert.equal(await dialog.locator('[name=contextWindow]').inputValue(), '');
+      assert.equal(await dialog.locator('[name=maxTokens]').inputValue(), '');
+      assert.equal(await dialog.locator('[name=reasoning]').inputValue(), '');
+      await dialog.locator('[name=name]').fill('Unknown capabilities');
+      await submit.click();
+      await waitSaved();
+      model = (await config()).deepseek.models.find(m => m.id === 'deepseek/model-7');
+      for (const field of ['contextWindow', 'maxTokens', 'input', 'reasoning']) assert.equal(model[field], undefined);
+    });
     await step('duplicate validation and unsaved-change confirmation', async () => {
       await main.locator('[data-action="edit-model"][data-mid="deepseek/model-1"]').click();
       await dialog.locator('[name=id]').fill('deepseek/model-2');
@@ -93,7 +156,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
     });
     await step('add and configure supplier without changing its models', async () => {
       await main.locator('[data-action="add-provider"]').click();
-      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['claude', 'codex', 'pi', 'dsh']);
+      assert.deepEqual(await dialog.locator('[name=targets]:checked').evaluateAll(inputs => inputs.map(input => input.value)), ['claude', 'codex', 'pi', 'dsh', 'opencode']);
       assert.equal(await dialog.locator('[name=allTargets]').isChecked(), false);
       await dialog.locator('[name=id]').fill('new-provider');
       await dialog.locator('[name=displayName]').fill('New Provider');
@@ -102,7 +165,7 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await submit.click();
       await waitSaved();
       assert.equal(Object.keys(await config()).length, 5);
-      assert.deepEqual((await config())['new-provider'].targets, ['claude', 'codex', 'pi', 'dsh']);
+      assert.deepEqual((await config())['new-provider'].targets, ['claude', 'codex', 'pi', 'dsh', 'opencode']);
       await go('providers');
       await main.locator('[data-action="edit-provider"][data-pid="deepseek"]').click();
       await dialog.locator('[name=displayName]').fill('DeepSeek Updated');
@@ -148,6 +211,9 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       assert.equal(models.length, 9);
       assert.equal(models.some(m => m.id === 'vendor/another-new'), false);
       assert.equal(models.find(m => m.id === 'deepseek/model-1').name, 'Updated model');
+      const imported = models.find(m => m.id === 'vendor/new-model');
+      for (const field of ['contextWindow', 'maxTokens', 'reasoning']) assert.equal(imported[field], undefined);
+      assert.deepEqual(imported.input, ['text', 'image']);
     });
     await step('single model deletion confirmation', async () => {
       await main.locator('[data-action="provider-models"][data-pid="deepseek"]').click();
@@ -193,10 +259,17 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await main.locator('.target-check[data-target="pi"]').check();
       await main.locator('.target-check[data-target="dsh"]').check();
       assert.equal(await main.locator('.target-check[data-target="dsh-desktop"]').count(), 0);
+      // #sync 已别名到 #models：同页导航不再「离开」，不该弹确认，草稿要原样留着。
       await page.locator('nav a[href="#models"]').click();
+      assert.equal(await page.locator('#confirm-dialog').isVisible(), false);
+      assert.equal(await main.locator('.target-check[data-target="pi"]').isChecked(), true);
+      // 真正的离开保护：改过 target 后跳到另一个页面必须弹确认；取消后草稿不丢。
+      await page.locator('nav a[href="#agents"]').click();
       await page.locator('#confirm-dialog').waitFor({ state: 'visible' });
       await page.locator('#confirm-cancel').click();
-      assert.equal(await main.locator('h1').textContent(), '平台同步');
+      assert.equal(await main.locator('h1').textContent(), '模型与方案');
+      assert.equal(await main.locator('.target-check[data-target="pi"]').isChecked(), true);
+      assert.equal(await main.locator('.target-check[data-target="dsh"]').isChecked(), true);
       await main.locator('[data-action="save-targets"]').click();
       await page.waitForFunction(() => !document.body.classList.contains('busy'));
       await main.locator('[data-action="run-sync"]').click();
@@ -471,10 +544,31 @@ const step = async (name, task) => { await task(); passed.push(name); console.lo
       await dialog.locator('[name=id]').fill('keyboard/model');
       await page.keyboard.press('Control+s');
       await waitSaved();
+      const minimal = Object.values(await config()).flatMap(p => p.models || []).find(m => m.id === 'keyboard/model');
+      assert.ok(minimal);
+      for (const field of ['contextWindow', 'maxTokens', 'input', 'reasoning']) assert.equal(minimal[field], undefined);
       await main.locator('[data-action="add-model"]').first().click();
       await page.keyboard.press('Escape');
       await dialog.waitFor({ state: 'hidden' });
       assert.deepEqual(errors, []);
+    });
+    await step('full editor keeps an agent-specific model on its connection', async () => {
+      const added = await page.request.post(`${url}/api/providers/deepseek/models`, {data: {
+        id: 'only-claude/model', name: 'Only Claude', agent: 'claude',
+        contextWindow: 32000, maxTokens: 4000, input: ['text'], reasoning: false,
+      }});
+      assert.equal(added.status(), 200);
+      await page.reload();
+      await go('models');
+      await page.locator('#model-search').fill('only-claude/model');
+      const row = main.locator('[data-action="open-model-detail"][data-agent="claude"][data-mid="only-claude/model"]');
+      await row.locator('[data-action="edit-model"]').click();
+      await dialog.locator('[name=name]').fill('Claude connection updated');
+      await submit.click();
+      await waitSaved();
+      const provider = (await config()).deepseek;
+      assert.equal(provider.agents.claude.models.find(m => m.id === 'only-claude/model').name, 'Claude connection updated');
+      assert.equal(provider.models.some(m => m.id === 'only-claude/model'), false);
     });
     console.log(`Browser regression: ${passed.length} passed; screenshots: tests/artifacts/`);
   } catch (error) {

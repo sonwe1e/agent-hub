@@ -2,3 +2,5 @@
 zstandard>=0.23,<1
 # Real-client isolation harness: copy dsh YAML config without loading !!js tags.
 PyYAML>=6,<7
+# Read the current ZCode login's AES-GCM-protected values locally.
+cryptography>=44,<49

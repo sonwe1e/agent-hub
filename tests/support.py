@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -61,7 +62,8 @@ def isolated():
             text = str(path)
             return home / text[2:] if text.startswith("~/") else Path(text)
 
-        with patch.multiple(engine, HOME=home, HUB_DIR=root, HUB_CONFIG=config,
+        with patch.dict(os.environ, {'CODEX_HOME': str(home / '.codex')}), \
+             patch.multiple(engine, HOME=home, HUB_DIR=root, HUB_CONFIG=config,
                             HUB_STATE=root / "state.json", HUB_BACKUP=root / "backups", expand=expand), \
              patch.object(server, "HUB_CONFIG", config), patch.object(server, "expand", expand):
             try:

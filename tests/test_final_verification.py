@@ -19,13 +19,13 @@ class CombinedAdapterVerificationTests(unittest.TestCase):
         self.addCleanup(transaction._PLANS.clear)
         self.codex = self.home / ".codex" / "config.toml"
         self.codex.parent.mkdir()
-        self.codex.write_text('model = "official-original"\nnotify = ["user-hook"]\n')
+        self.codex.write_text('model = "official-original"\nnotify = ["user-hook"]\n', encoding="utf-8")
         self.pi = self.home / ".pi" / "agent"
         self.pi.mkdir(parents=True)
-        (self.pi / "settings.json").write_text(json.dumps({"theme": "user-theme"}))
+        (self.pi / "settings.json").write_text(json.dumps({"theme": "user-theme"}), encoding="utf-8")
         (self.pi / "auth.json").write_text(json.dumps({
-            "unmanaged": {"type": "oauth", "token": "synthetic-unmanaged-token"}}))
-        self.cfg = json.loads(engine.HUB_CONFIG.read_text())
+            "unmanaged": {"type": "oauth", "token": "synthetic-unmanaged-token"}}), encoding="utf-8")
+        self.cfg = json.loads(engine.HUB_CONFIG.read_text(encoding="utf-8"))
         self.cfg["providers"] = {"gateway": {
             "name": "Shared gateway", "enabled": True,
             "baseUrl": "https://default.example/v1", "api": "openai-completions",
@@ -62,7 +62,7 @@ class CombinedAdapterVerificationTests(unittest.TestCase):
                        "synthetic-unmanaged-token"):
             self.assertNotIn(secret, json.dumps(plan))
         self.assertTrue(server.api_apply({"planId": plan["planId"]})["ok"])
-        codex = tomllib.loads(self.codex.read_text())
+        codex = tomllib.loads(self.codex.read_text(encoding="utf-8"))
         self.assertEqual(codex["model"], "claude-through-responses")
         self.assertEqual(codex["model_reasoning_effort"], "ultra")
         self.assertEqual(codex["notify"], ["user-hook"])
@@ -71,24 +71,24 @@ class CombinedAdapterVerificationTests(unittest.TestCase):
         self.assertEqual(route["wire_api"], "responses")
         self.assertEqual(route["experimental_bearer_token"], "synthetic-codex-key")
         self.assertFalse(route["requires_openai_auth"])
-        pi = json.loads((self.pi / "models.json").read_text())["providers"]["gateway"]
+        pi = json.loads((self.pi / "models.json").read_text(encoding="utf-8"))["providers"]["gateway"]
         self.assertEqual(pi["apiKey"], "synthetic-pi-key")
         self.assertEqual(pi["baseUrl"], "https://pi.example/v1")
         self.assertEqual(pi["api"], "openai-completions")
         self.assertEqual([m["id"] for m in pi["models"]], [
             "anthropic/stealth/space-bunny-alpha[1m]", "another-brand/model-two"])
-        settings = json.loads((self.pi / "settings.json").read_text())
+        settings = json.loads((self.pi / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(settings["theme"], "user-theme")
         self.assertEqual(settings["defaultModel"], "anthropic/stealth/space-bunny-alpha[1m]")
         self.assertEqual(settings["enabledModels"], [
             "gateway/anthropic/stealth/space-bunny-alpha[1m]", "gateway/another-brand/model-two"])
-        self.assertEqual(json.loads((self.pi / "auth.json").read_text())["unmanaged"],
+        self.assertEqual(json.loads((self.pi / "auth.json").read_text(encoding="utf-8"))["unmanaged"],
                          {"type": "oauth", "token": "synthetic-unmanaged-token"})
         with self.assertRaisesRegex(transaction.TransactionError, "missing or expired"):
             server.api_apply({"planId": plan["planId"]})
 
     def test_late_pi_scope_failure_does_not_write_staged_codex_output(self):
-        (self.pi / "settings.json").write_text(json.dumps({"enabledModels": "invalid-scope"}))
+        (self.pi / "settings.json").write_text(json.dumps({"enabledModels": "invalid-scope"}), encoding="utf-8")
         before = self.native_bytes()
         with self.assertRaisesRegex(transaction.TransactionError, "pi"):
             server.api_preview({"targets": ["codex", "pi"]})

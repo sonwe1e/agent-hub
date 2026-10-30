@@ -75,13 +75,20 @@ def gateway_url(cfg):
 
 
 def export_connections(cfg):
-    from agent_inventory import AGENTS
+    from agent_hub.agents.inventory import AGENTS
     from hub import agent_connection, agent_connection_ready, provider_targets
     rows, mapping = [], {}
     for pid, provider in (cfg.get('providers') or {}).items():
         if provider.get('enabled', True) is False:
             continue
+        # Retired subscriptions remain in user configuration for history, but
+        # must never be exported as a normal upstream connection.
+        if provider.get('kind') == 'workbuddy-ai':
+            continue
         for agent in AGENTS:
+            # OpenCode uses direct connections, except supported subscriptions.
+            if agent == 'opencode' and provider.get('kind') not in ('codex-chatgpt', 'zcode-subscription'):
+                continue
             if not provider_targets(provider, agent) or not agent_connection_ready(provider, agent):
                 continue
             conn = agent_connection(provider, agent)
@@ -89,15 +96,26 @@ def export_connections(cfg):
             if not secret:
                 continue
             protocol = {'anthropic-messages':'anthropic', 'openai-responses':'responses',
-                        'openai-completions':'chat'}.get(conn['api'])
+                        'openai-completions':'chat', 'openai-chat-completions':'chat'}.get(conn['api'])
             if not protocol:
                 continue
             rid = route_id(agent, pid)
             rows.append({'id':rid, 'name':provider.get('displayName') or provider.get('name') or pid,
                          'key':secret, protocol:conn['baseUrl'],
                          'models':[m['id'] for m in conn['models']], 'fallback':[]})
-            if provider.get('kind') == 'workbuddy-ai':
-                rows[-1]['kind'] = 'workbuddy-ai'
+            if provider.get('kind') in ('codex-chatgpt', 'zcode-subscription'):
+                rows[-1]['kind'] = provider['kind']
+                if provider['kind'] == 'codex-chatgpt':
+                    from codex_subscription import auth_path
+                    rows[-1]['authFile'] = str(auth_path())
+                elif provider['kind'] == 'zcode-subscription':
+                    from zcode_subscription import home
+                    rows[-1]['zcodeHome'] = str(home())
+                    if provider.get('subscriptionBinding') and provider.get('apiKey'):
+                        rows[-1]['subscriptionBinding']=provider['subscriptionBinding']
+                        rows[-1]['bindingKey']=provider['apiKey']
+                    if isinstance(provider.get('subscriptionModels'),list):
+                        rows[-1]['subscriptionModels']=provider['subscriptionModels']
             mapping[rid] = {'agent':agent, 'provider':pid}
     return {'providers':rows}, mapping
 
@@ -126,7 +144,10 @@ def install_compiler_routes(module, h):
             return result
         rid = route_id(agent,pid)
         result['baseUrl'] = url if agent=='claude' else url+'/v1'
-        result['apiKey'], result['apiKeyEnv'] = 'agent-hub-'+agent, ''
+        if provider.get('kind') in ('codex-chatgpt','zcode-subscription'):
+            result['apiKeyEnv'] = ''
+        else:
+            result['apiKey'], result['apiKeyEnv'] = 'agent-hub-'+agent, ''
         result['models'] = [dict(m,id=rid+'/'+m['id']) for m in result['models']]
         if agent == 'pi':
             result['compat'] = {**(result.get('compat') or {}), 'sendSessionAffinityHeaders':True}
@@ -217,8 +238,12 @@ def compile_codex_native(home, cfg):
 
 
 class Runtime:
-    def __init__(self, root, config=lambda: {}, binary_root=None, codex_cache=None):
+    def __init__(self, root, config=lambda: {}, binary_root=None, codex_cache=None, observation_root=None):
         self.root = Path(root).absolute()
+        # The application passes its known data/gateway root. Standalone
+        # runtimes must opt in or use that conventional layout explicitly.
+        self.observation_root = (Path(observation_root).absolute() if observation_root is not None
+                                 else self.root.parent if self.root.name == 'gateway' else None)
         self.config = config
         self.binary_root = Path(binary_root or self.root.parent/'runtime').absolute()
         self.binary = Path(__file__).with_name('gateway_server.py')
@@ -246,13 +271,23 @@ class Runtime:
                 'pending': 'activeEnabled' in (self.config().get('gateway') or {}),
                 'ledger':str(self.directory/'usage.jsonl'),
                 'engine':'agent-hub',
-                'coverage':'Hub 自有网关转发自定义线路、WorkBuddy AI 海外版与 Codex 原生登录；pi 内置 OAuth、dsh 自带账号保持原生直连。'}
+                'coverage':'Hub 自有网关转发自定义线路、Codex／ChatGPT 与 ZCode 订阅；pi 内置 OAuth、dsh 自带账号保持原生直连。'}
 
     def install(self):
+        # 冻结 exe 里 gateway_server 是捆绑模块（无 .py 源文件），经
+        # desktop_app 的 --gateway-worker 隐藏入口启动，不能按源码路径检查。
+        if getattr(sys, 'frozen', False):
+            return
         if not self.binary.is_file():
             raise ValueError('缺少 Hub 网关源文件 gateway_server.py')
 
     def configure(self, content=False, cfg=None):
+        # Configuration and on-demand requests must agree on the same route.
+        # start() already takes this RLock; direct configure callers must too.
+        with self.lock:
+            return self._configure(content, cfg)
+
+    def _configure(self, content=False, cfg=None):
         # Only model metadata is available to an optional offline fallback.
         if self.codex_cache and self.codex_cache.is_file():
             try:
@@ -313,6 +348,13 @@ class Runtime:
                     check.bind(address)
                 env = {k:v for k,v in os.environ.items() if not k.startswith('MAGPIE_') and
                        not any(word in k.upper() for word in ('TOKEN','API_KEY','SECRET','PASSWORD','CODEX_'))}
+                # ZCode permits a custom encryption seed. Forward only this
+                # specific value to the isolated gateway when the user has
+                # enabled ZCode sharing; it never enters configuration files.
+                if os.environ.get('ZCODE_CREDENTIAL_SECRET') and any(
+                        p.get('kind') == 'zcode-subscription' and p.get('enabled', True)
+                        for p in (self.config().get('providers') or {}).values()):
+                    env['ZCODE_CREDENTIAL_SECRET'] = os.environ['ZCODE_CREDENTIAL_SECRET']
                 isolated = str(self.root/'home')
                 Path(isolated).mkdir(parents=True, exist_ok=True)
                 env.update(HOME=isolated, USERPROFILE=isolated, XDG_CONFIG_HOME=str(self.root/'config'),
@@ -328,14 +370,25 @@ class Runtime:
                 if self.log:
                     self.log.close()
                 self.log = (self.root/'gateway.log').open('ab')
-                self.process = subprocess.Popen([sys.executable, str(self.binary),'--directory',str(self.directory),
-                    '--port',str(address[1]),'--control-port',str(self.admin_port)], env=env, cwd=self.root,
+                if getattr(sys, 'frozen', False):
+                    # 冻结后 sys.executable 是 exe 本身，脚本路径会被 argparse
+                    # 拒绝；与 --compile-worker 相同，走 exe 的网关隐藏入口。
+                    argv = [sys.executable, '--gateway-worker',
+                            '--directory', str(self.directory), '--port', str(address[1]),
+                            '--control-port', str(self.admin_port)]
+                else:
+                    argv = [sys.executable, str(self.binary),
+                            '--directory', str(self.directory), '--port', str(address[1]),
+                            '--control-port', str(self.admin_port)]
+                if self.observation_root is not None:
+                    argv += ['--observation-root', str(self.observation_root)]
+                self.process = subprocess.Popen(argv, env=env, cwd=self.root,
                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
                 self.job=own_windows_process(self.process)
                 sensitive=[self.admin_key]+[p['key'] for p in export_connections(self.config())[0]['providers']]
                 def diagnostics(pipe, log):
-                    from observation import redact
+                    from agent_hub.observability.store import redact
                     try:
                         for line in iter(pipe.readline,b''):
                             log.write((redact(line.decode('utf-8',errors='replace').rstrip(),sensitive)+'\n').encode('utf-8'))
@@ -401,9 +454,9 @@ class Runtime:
         def loop():
             while not self.stop_event.is_set():
                 block=self.config().get('gateway') or {}
-                needs_workbuddy=any(p.get('kind')=='workbuddy-ai' and p.get('enabled',True)
+                needs_subscription=any(p.get('kind') in ('codex-chatgpt','zcode-subscription') and p.get('enabled',True)
                                    for p in (self.config().get('providers') or {}).values())
-                if block.get('activeEnabled',block.get('enabled',True)) or needs_workbuddy:
+                if block.get('activeEnabled',block.get('enabled',True)) or needs_subscription:
                     try:
                         self.start(settings().get('enabled',True) and settings().get('content',False))
                     except ValueError:

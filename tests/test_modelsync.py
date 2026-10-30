@@ -676,5 +676,116 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertTrue(all("✗" not in line for line in results), results)
 
 
+class DshSelectionGuardTests(unittest.TestCase):
+    """dsh 模型选择的外部修改保护与协议翻译。
+
+    与 ZCode/Codex 一致：接管期间 dsh 端被外部改过选择时 fail-closed，
+    legacy push 不覆盖；显式 reconcile（工作台切换模型）才重新接管。
+    """
+
+    def setUp(self):
+        self.context = isolated()
+        self.home = self.context.__enter__()
+        self.addCleanup(self.context.__exit__, None, None, None)
+        dsh_fixture(self.home)
+        self.dsh = self.home / ".dsh"
+        self.patch = self.dsh / "profiles" / "desktop" / "cordis.patch.yml"
+        self.state = self.dsh / ".agent-hub-state.json"
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["modelSync"] = {"default": entry("stepfun", "stepfun/model-2", "high")}
+        engine.save_json(server.HUB_CONFIG, cfg)
+
+    def blocks(self) -> list:
+        return engine.parse_yaml(self.patch.read_text(encoding="utf-8"))
+
+    def find(self, block_id: str) -> dict | None:
+        return next((b for b in self.blocks()
+                     if isinstance(b, dict) and b.get("id") == block_id), None)
+
+    def rewrite_selection(self, provider: str, model: str) -> None:
+        items = self.blocks()
+        block = next(b for b in items if b["id"] == "agent-default-model")
+        block["config"].update(provider=provider, model=model)
+        self.patch.write_text(engine.dump_yaml(items) + "\n", encoding="utf-8")
+
+    def test_chat_completions_api_is_translated_for_dsh(self):
+        cfg = json.loads(server.HUB_CONFIG.read_text(encoding="utf-8"))
+        cfg["providers"]["xunfri-like"] = {
+            "name": "Xunfri", "displayName": "Xunfri",
+            "baseUrl": "https://maas.example.com/v2", "apiKey": "test-not-a-real-key",
+            "api": "openai-chat-completions", "enabled": True,
+            "models": [{"id": "spark-x", "name": "Spark X"}]}
+        engine.save_json(server.HUB_CONFIG, cfg)
+        engine.Hub().push_dsh()
+        data = engine.parse_yaml((self.dsh / "settings.yaml").read_text(encoding="utf-8"))
+        self.assertEqual(data["llm-pi-ai"]["providers"]["xunfri-like"]["api"],
+                         "openai-completions")
+        block = next(b for b in self.blocks() if b["id"] == "llm-pi-ai")
+        self.assertEqual(block["config"]["providers"]["xunfri-like"]["api"],
+                         "openai-completions")
+
+    def test_first_takeover_records_managed_state_and_is_idempotent(self):
+        engine.Hub().push_dsh()
+        block = self.find("agent-default-model")
+        self.assertEqual(block["config"]["provider"], "stepfun")
+        saved = engine.load_json(self.state)
+        self.assertTrue(saved["managed"])
+        self.assertEqual(saved["selectionHash"],
+                         engine._dsh_selection_fingerprint(self.blocks()))
+        engine.Hub().push_dsh()
+        self.assertEqual(saved, engine.load_json(self.state))
+
+    def test_external_selection_change_fails_closed(self):
+        engine.Hub().push_dsh()
+        self.rewrite_selection("deepseek-account", "deepseek-flash")
+        with self.assertRaises(ValueError) as caught:
+            engine.Hub().push_dsh()
+        self.assertIn("外部更改", str(caught.exception))
+        block = self.find("agent-default-model")
+        self.assertEqual(block["config"]["provider"], "deepseek-account")
+        # legacy push / 网关开关走的预览路径同样拒绝，不会悄悄打回
+        with self.assertRaises(Exception) as preview_error:
+            engine.Hub().preview_push(["dsh"])
+        self.assertIn("外部更改", str(preview_error.exception))
+
+    def test_explicit_reconcile_overwrites_external_edit(self):
+        engine.Hub().push_dsh()
+        self.rewrite_selection("deepseek-account", "deepseek-flash")
+        plan = engine.Hub().preview_push(["dsh"], reconcile=True)
+        self.assertTrue(any("外部更改" in w for w in plan["warnings"]), plan["warnings"])
+        engine.Hub().apply_preview(plan["planId"])
+        block = self.find("agent-default-model")
+        self.assertEqual(block["config"]["provider"], "stepfun")
+        self.assertEqual(block["config"]["model"], "stepfun/model-2")
+        saved = engine.load_json(self.state)
+        self.assertTrue(saved["managed"])
+        self.assertEqual(saved["selectionHash"],
+                         engine._dsh_selection_fingerprint(self.blocks()))
+        # 重新接管后普通推送恢复幂等
+        engine.Hub().push_dsh()
+
+    def test_unmanaged_state_is_written_when_modelsync_absent(self):
+        engine.save_json(server.HUB_CONFIG, config_without_modelsync())
+        engine.Hub().push_dsh()
+        block = self.find("agent-default-model")
+        self.assertEqual(block["config"]["provider"], "deepseek-account")
+        self.assertEqual(engine.load_json(self.state),
+                         {"version": 1, "managed": False})
+
+    def test_patch_llm_pi_ai_block_is_recreated_after_profile_reset(self):
+        engine.Hub().push_dsh()
+        # 模拟桌面应用重建 profile：补丁被重写，llm-pi-ai 块消失，选择块保留
+        items = [b for b in self.blocks()
+                 if not (isinstance(b, dict) and b.get("id") == "llm-pi-ai")]
+        self.patch.write_text(engine.dump_yaml(items) + "\n", encoding="utf-8")
+        engine.Hub().push_dsh()
+        block = self.find("llm-pi-ai")
+        self.assertEqual(block["name"], "@deepseek-ai/dsh-llm-pi-ai")
+        self.assertIn("stepfun", block["config"]["providers"])
+        self.assertIn("deepseek", block["config"]["providers"])
+        data = engine.parse_yaml((self.dsh / "settings.yaml").read_text(encoding="utf-8"))
+        self.assertIn("stepfun", data["llm-pi-ai"]["providers"])
+
+
 if __name__ == "__main__":
     unittest.main()

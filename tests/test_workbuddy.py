@@ -3,6 +3,7 @@ import concurrent.futures
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -16,9 +17,12 @@ import workbuddy
 from gateway_runtime import export_connections, route_id
 from gateway_server import State, Server, Handler, packed
 from gateway_observation import read_requests
-from workbuddy_protocol import to_chat, conversation_headers
+from workbuddy_protocol import conversation_headers
+from proxy_fixture import SocksFixture
+from test_proxy_transport import PROXY_ENV
 
 
+@unittest.skip("WorkBuddy 订阅反代已取消；保留历史协议用例，当前行为由停用回归覆盖")
 class WorkBuddyTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -50,6 +54,11 @@ class WorkBuddyTests(unittest.TestCase):
                     return self.reply({'code':0,'data':{'accessToken':'rotated-access-secret','refreshToken':'rotated-refresh-secret','expiresIn':3600}})
                 owner.calls.append((self.path,dict(self.headers),value))
                 if value['model']=='fail': return self.reply({'code':11140,'msg':'restricted access-secret refresh-secret'},403)
+                if value['model']=='refuse400': return self.reply({'code':99999,'msg':'unrelated'},400)
+                if value['model']=='refuse':
+                    for a,b in zip(value['messages'],value['messages'][1:]):
+                        if a.get('role')=='tool' and b.get('role')=='user':
+                            return self.reply({'code':11153,'msg':'error: the conversation must end with a user message after tool results'},400)
                 self.send_response(200);self.send_header('Content-Type','text/event-stream');self.end_headers()
                 def emit(v):self.wfile.write(b'data: '+packed(v)+b'\n\n');self.wfile.flush()
                 if value['model']=='slow':owner.entered.set();owner.release.wait(5)
@@ -80,7 +89,7 @@ class WorkBuddyTests(unittest.TestCase):
         self.state=State(self.directory,'fixture-control-secret')
         self.http=Server(('127.0.0.1',0),Handler);self.http.state=self.state
         self.cfg={'gateway':{'enabled':False,'port':self.http.server_port},'providers':{}}
-        self.cfg['providers']['workbuddy-ai']=workbuddy.provider_config(self.cfg,[{'id':m} for m in ('ok','tools','fail','cut','slow','quiet')])
+        self.cfg['providers']['workbuddy-ai']=workbuddy.provider_config(self.cfg,[{'id':m} for m in ('ok','tools','fail','cut','slow','quiet','refuse','refuse400')])
         providers,mapping=export_connections(self.cfg)
         (self.directory/'providers.json').write_bytes(packed(providers));(self.directory/'hub-connections.json').write_bytes(packed(mapping))
         threading.Thread(target=self.http.serve_forever,daemon=True).start()
@@ -119,6 +128,19 @@ class WorkBuddyTests(unittest.TestCase):
             self.assertNotIn('secret',json.dumps(public)+json.dumps(login.status())+json.dumps(self.accounts.status()))
             self.assertGreater(auth['expires'],time.time()+3500)
         finally:login.cancel()
+
+    def test_catalog_and_streamed_inference_both_use_the_configured_socks_proxy(self):
+        proxy = SocksFixture(self.vendor.server_address)
+        self.addCleanup(proxy.close)
+        env = {**PROXY_ENV, 'HTTP_PROXY': f'socks5h://127.0.0.1:{proxy.port}'}
+        with patch.dict(os.environ, env), patch.object(workbuddy, 'ENDPOINT', f'http://workbuddy.invalid:{self.vendor.server_port}'):
+            catalog = workbuddy.call('/v3/config')
+            self.assertIn('models', catalog)
+            conn, response = self.request('chat')
+            self.assertEqual(response.status, 200)
+            self.assertIn(b'world', response.read())
+            conn.close()
+        self.assertEqual(proxy.targets, [('workbuddy.invalid', self.vendor.server_port)] * 2)
 
     def test_refresh_is_serialized_and_persisted_across_concurrent_callers(self):
         auth=self.accounts.read();auth['expires']=time.time()+5
@@ -160,6 +182,29 @@ class WorkBuddyTests(unittest.TestCase):
                 self.assertEqual(upstream[0],'/v2/chat/completions');self.assertTrue(upstream[2]['stream'])
                 self.assertEqual(upstream[1]['X-Agent-Type'],'main')
                 self.assertEqual(upstream[1]['X-Tenant-Id'],'fixture-team')
+
+    def test_opencode_workbuddy_endpoint_streams_with_its_own_identity(self):
+        conn,res=self.request('chat',agent='opencode')
+        wire=res.read();conn.close()
+        self.assertEqual(res.status,200)
+        self.assertIn(b'[DONE]',wire)
+        row=self.ledger()
+        self.assertEqual(row['agent'],'opencode')
+        self.assertEqual(row['stop'],'completed')
+
+    def test_opencode_workbuddy_tool_round_trip(self):
+        tools=[{'type':'function','function':{'name':'read_file','parameters':{'type':'object'}}}]
+        conn,res=self.request('chat',model='tools',agent='opencode',stream=False,tools=tools)
+        value=json.loads(res.read());conn.close()
+        call=value['choices'][0]['message']['tool_calls'][0]
+        self.assertEqual(call['function']['name'],'read_file')
+        messages=[{'role':'user','content':'hello'},value['choices'][0]['message'],
+                  {'role':'tool','tool_call_id':call['id'],'content':'file contents'}]
+        conn,res=self.request('chat',model='tools',agent='opencode',stream=False,tools=tools,messages=messages)
+        self.assertEqual(res.status,200)
+        self.assertEqual(json.loads(res.read())['choices'][0]['message']['content'],'你好 world')
+        conn.close()
+        self.assertEqual(self.calls[-1][2]['messages'][-1]['role'],'tool')
 
     def test_nonstream_responses_and_anthropic_are_valid_complete_objects(self):
         for protocol in ('chat','anthropic','responses'):
@@ -249,6 +294,48 @@ class WorkBuddyTests(unittest.TestCase):
         self.assertNotIn('access-secret',wire.decode()+json.dumps(row));self.assertNotIn('refresh-secret',json.dumps(row))
         self.assertTrue(self.accounts.status()['signedIn'])
 
+    def test_after_tools_refusal_retries_once_then_prefers_separator_upfront(self):
+        messages=[{'role':'user','content':'hello'},
+                  {'role':'assistant','content':'','tool_calls':[{'id':'call_exact','type':'function','function':{'name':'view','arguments':'{}'}}]},
+                  {'role':'tool','tool_call_id':'call_exact','content':'file contents'},
+                  {'role':'user','content':'now answer'}]
+        conn,res=self.request(model='refuse',messages=messages);wire=res.read();conn.close()
+        self.assertEqual(res.status,200);self.assertIn(b'world',wire)
+        self.assertEqual(len(self.calls),2)
+        sent=self.calls[1][2]['messages']
+        tool_at=next(i for i,m in enumerate(sent) if m.get('role')=='tool')
+        self.assertEqual(sent[tool_at+1],{'role':'assistant','content':''})
+        # The retry is the same user send: one conversation request id for both.
+        self.assertEqual(self.calls[0][1]['X-Conversation-Request-ID'],self.calls[1][1]['X-Conversation-Request-ID'])
+        row=self.ledger();self.assertEqual((row['tries'],row['retry']),(2,'after-tools'))
+        # A model that refused once goes separated at once from then on.
+        conn,res=self.request(model='refuse',messages=messages);res.read();conn.close()
+        self.assertEqual(len(self.calls),3)
+        self.assertTrue(any(m.get('role')=='assistant' and m.get('content')=='' for m in self.calls[-1][2]['messages']))
+
+    def test_unrelated_upstream_400_is_surfaced_without_retry(self):
+        conn,res=self.request(model='refuse400');wire=res.read();conn.close()
+        self.assertEqual(res.status,400);self.assertIn(b'99999',wire)
+        self.assertEqual(len(self.calls),1)
+        row=self.ledger();self.assertEqual(row['tries'],1);self.assertNotIn('retry',row)
+
+    def test_replies_name_the_requested_model_not_the_upstream_spelling(self):
+        conn,res=self.request('chat',stream=False);value=json.loads(res.read());conn.close()
+        self.assertEqual(value['model'],'ok')
+        conn,res=self.request('anthropic',stream=False);value=json.loads(res.read());conn.close()
+        self.assertEqual(value['model'],'ok')
+        row=self.ledger(2);self.assertEqual(row['served'],'served-fixture')
+
+    def test_nonportable_responses_history_is_rejected_with_guidance(self):
+        for item in ({'type':'compaction','encrypted_content':'x'},
+                     {'type':'item_reference','id':'item_1'},
+                     {'type':'function_call','call_id':'c','name':'f','arguments':'{}','encrypted_content':'x'}):
+            with self.subTest(item=item['type']):
+                conn,res=self.request('responses',input=[{'role':'user','content':'hi'},item])
+                wire=res.read();conn.close()
+                self.assertEqual(res.status,400);self.assertIn('文字摘要'.encode(),wire)
+        self.assertEqual(len(self.calls),0)
+
     def test_incomplete_stream_has_error_and_no_success_marker(self):
         conn,res=self.request('responses',model='cut');wire=res.read();conn.close()
         self.assertIn(b'response.failed',wire);self.assertNotIn(b'response.completed',wire)
@@ -286,7 +373,7 @@ class WorkBuddyTests(unittest.TestCase):
                 cfg=json.loads(engine.HUB_CONFIG.read_text(encoding='utf-8'))
                 self.assertEqual(cfg['providers']['workbuddy-ai']['kind'],'workbuddy-ai')
                 self.assertNotIn('access-secret',json.dumps(cfg));self.assertNotIn('refresh-secret',json.dumps(result))
-                for agent in ('claude','codex','pi','dsh'):
+                for agent in ('claude','codex','pi','dsh','opencode'):
                     self.assertTrue(engine.agent_connection_ready(cfg['providers']['workbuddy-ai'],agent))
                 self.assertFalse((home/'.codex/config.toml').exists());self.assertFalse((home/'.claude/settings.json').exists())
                 result=server.api_workbuddy_logout()
@@ -295,8 +382,8 @@ class WorkBuddyTests(unittest.TestCase):
 
     def test_connection_export_never_contains_oauth_and_all_agents_remain_selectable(self):
         providers,mapping=export_connections(self.cfg)
-        self.assertEqual(len(providers['providers']),4)
-        self.assertEqual({r['agent'] for r in mapping.values()},{'claude','codex','pi','dsh'})
+        self.assertEqual(len(providers['providers']),5)
+        self.assertEqual({r['agent'] for r in mapping.values()},{'claude','codex','pi','dsh','opencode'})
         self.assertTrue(all(r['kind']=='workbuddy-ai' for r in providers['providers']))
         self.assertNotIn('access-secret',json.dumps(providers))
 
@@ -318,19 +405,23 @@ class WorkBuddyTests(unittest.TestCase):
                 h.cfg['gateway']={'enabled':global_gateway}
                 h.cfg['providers']['workbuddy-ai']=workbuddy.provider_config(h.cfg,[{'id':'ok','name':'Fixture','contextWindow':128000,'maxTokens':8192}])
                 h.cfg['sync']['targets']['codex'].update(enabled=True,mode='third-party')
+                h.cfg['sync']['targets']['opencode']={'enabled':True}
                 h.cfg['modelSync']={'default':{'provider':'workbuddy-ai','model':'ok'}}
                 engine.save_json(engine.HUB_CONFIG,h.cfg)
                 (home/'.codex').mkdir(exist_ok=True)
                 (home/'.codex/config.toml').write_text('model = "official-model"\n',encoding='utf-8')
-                plan=h.preview_push(['claude','codex','pi','dsh']);h.apply_preview(plan['planId'])
+                plan=h.preview_push(['claude','codex','pi','dsh','opencode']);h.apply_preview(plan['planId'])
                 claude=json.loads((home/'.claude/settings.json').read_text(encoding='utf-8'))
                 self.assertIn('127.0.0.1:8789',claude['env']['ANTHROPIC_BASE_URL'])
                 self.assertEqual(claude['env']['ANTHROPIC_MODEL'],route_id('claude','workbuddy-ai')+'/ok' if global_gateway else 'ok')
                 codex=(home/'.codex/config.toml').read_text(encoding='utf-8')
                 self.assertIn('responses',codex);self.assertIn('127.0.0.1:8789',codex)
                 pi=(home/'.pi/agent/models.json').read_text(encoding='utf-8');self.assertIn('workbuddy-ai',pi)
+                opencode=json.loads((home/'.config/opencode/opencode.json').read_text(encoding='utf-8'))
+                self.assertEqual(opencode['model'],'workbuddy-ai/ok')
+                self.assertIn('/workbuddy/opencode/v1',opencode['provider']['workbuddy-ai']['options']['baseURL'])
                 from sync_transaction import TARGET_FILES
-                for agent in ('claude','codex','pi','dsh'):
+                for agent in ('claude','codex','pi','dsh','opencode'):
                     for rel in TARGET_FILES[agent]:
                         p=home/rel
                         if p.is_file():self.assertNotIn('access-secret',p.read_text(encoding='utf-8'))
@@ -338,41 +429,9 @@ class WorkBuddyTests(unittest.TestCase):
 
 
 class ConversionTests(unittest.TestCase):
-    def test_client_metadata_is_normalized_on_a_copy_and_tool_results_stay_exact(self):
-        billing='x-anthropic-billing-header: cc_version=1.0; secretless_test=1;\n'
-        body={'model':'m','messages':[{'role':'system','content':billing},
-            {'role':'system','content':"You are Claude Code, Anthropic's official CLI for Claude"},
-            {'role':'user','content':'Read the requested file.'},
-            {'role':'tool','tool_call_id':'c','content':billing}]}
-        original=json.dumps(body)
-        chat,_=to_chat(body,'chat')
-        self.assertEqual(len(chat['messages']),3)
-        self.assertEqual(chat['messages'][0]['content'],"You are Claude Code, Anthropic's CLI for Claude")
-        self.assertEqual(chat['messages'][-1]['content'],billing)
-        self.assertEqual(json.dumps(body),original)
-
-    def test_tool_result_images_are_kept_and_do_not_create_an_extra_user_turn(self):
-        tool={'name':'view','input_schema':{'type':'object'}}
-        messages=[{'role':'user','content':'see image'},{'role':'assistant','content':[{'type':'tool_use','id':'c','name':'view','input':{}}]}]
-        first,_=to_chat({'model':'m','messages':messages,'tools':[tool]},'anthropic')
-        messages.append({'role':'user','content':[{'type':'tool_result','tool_use_id':'c','content':[{'type':'text','text':'image result'},{'type':'image','source':{'type':'base64','media_type':'image/png','data':'AAAA'}}]}]})
-        next_chat,_=to_chat({'model':'m','messages':messages,'tools':[tool]},'anthropic')
-        self.assertEqual(next_chat['messages'][-2]['content'],'image result')
-        self.assertEqual(next_chat['messages'][-1]['content'][-1]['image_url']['url'],'data:image/png;base64,AAAA')
-        self.assertEqual(conversation_headers(first,'s','salt')['X-Conversation-Request-ID'],conversation_headers(next_chat,'s','salt')['X-Conversation-Request-ID'])
-
-    def test_responses_messages_images_tools_and_developer_are_preserved(self):
-        body={'model':'m','instructions':'system','max_output_tokens':200,'reasoning':{'effort':'high'},
-              'input':[{'role':'developer','content':[{'type':'input_text','text':'policy'}]},
-                       {'role':'user','content':[{'type':'input_image','image_url':'data:image/png;base64,AAAA'}]}],
-              'tools':[{'type':'function','name':'mcp.read','parameters':{'anyOf':[{'properties':{'path':{'enum':['a','b']}}}]}}],
-              'tool_choice':{'type':'function','name':'mcp.read'}}
-        chat,names=to_chat(body,'responses')
-        self.assertEqual(chat['messages'][1]['role'],'system');self.assertEqual(chat['messages'][2]['content'][0]['type'],'image_url')
-        self.assertEqual(chat['max_tokens'],200);self.assertEqual(chat['reasoning_effort'],'high')
-        self.assertEqual(chat['tool_choice'],'mcp_read');self.assertEqual(names['mcp_read'],'mcp.read')
-        self.assertEqual(chat['tools'][0]['function']['parameters']['type'],'object')
-        self.assertNotIn('stream',body)
+    """Protocol conversion cases live in workbuddy_cases.json, driven by
+    tests/test_workbuddy_cases.py; what stays here needs live conversation
+    identity, not a fixed conversion."""
 
     def test_conversation_ids_stable_across_tool_steps_change_for_next_user(self):
         chat={'messages':[{'role':'user','content':'hello'}]}

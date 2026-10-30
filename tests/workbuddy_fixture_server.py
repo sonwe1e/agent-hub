@@ -3,7 +3,7 @@ from contextlib import ExitStack
 from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
-from support import isolated, server
+from support import isolated, server, engine
 from test_workbuddy import WorkBuddyTests
 
 
@@ -12,8 +12,11 @@ case.setUp()
 case.authReady=False
 try:
     with isolated() as home,ExitStack() as stack:
+        cfg=engine.Hub().cfg
+        cfg['sync']['targets']['opencode']={'enabled':True}
+        engine.save_json(engine.HUB_CONFIG,cfg)
         inventory=server.Inventory(home)
-        for agent in ('claude','codex','pi','dsh'):
+        for agent in ('claude','codex','pi','dsh','opencode'):
             entry=inventory._entry(agent,home/f'Programs/{agent}.exe',source='npm',kind='cli',version='1.2.3',activePath=True)
             inventory.instances[entry['id']]=entry
         inventory.checked_at=1

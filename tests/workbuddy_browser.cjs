@@ -33,10 +33,13 @@ const step=async(name,fn)=>{await fn();passed.push(name);console.log('PASS '+nam
    assert.equal(providers.providers['workbuddy-ai'].kind,'workbuddy-ai');assert.doesNotMatch(JSON.stringify(providers),/new-access-secret|new-refresh-secret/);
    await page.screenshot({path:path.join(out,'connected.png'),fullPage:true});
  });
- await step('all four agent model selectors offer WorkBuddy and the discovered models',async()=>{
+ await step('all five agent model selectors offer WorkBuddy and the discovered models',async()=>{
    await page.locator('nav a[href="#agents"]').click();
-   for(const agent of ['claude','codex','pi','dsh']){
-     await page.locator(`[data-daily="switch"][data-agent="${agent}"]`).click();
+   for(const agent of ['claude','codex','pi','dsh','opencode']){
+     // Agent 页重构后「切换模型」在详情抽屉里（agentDetailBody），先开详情再切。
+     await page.locator(`[data-daily="agent-detail"][data-agent="${agent}"]`).click();
+     await page.locator('#editor-dialog').waitFor({state:'visible'});
+     await page.locator(`#editor-body [data-daily="switch"][data-agent="${agent}"]`).click();
      await page.locator('#quick-provider').selectOption('workbuddy-ai');await page.locator('#quick-model').selectOption('ok');
      assert.equal(await page.locator('#quick-model option').count(),7);
      assert.equal(await page.locator('#quick-model').inputValue(),'ok');

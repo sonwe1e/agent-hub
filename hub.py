@@ -38,12 +38,16 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 HOME = Path.home()
-ACTIVE_AGENTS = ("claude", "codex", "pi", "dsh")
+ACTIVE_AGENTS = ("claude", "codex", "pi", "dsh", "opencode")
 # Hub 自身（代码 + providers.json + state.json + backups）不再绑定用户主目录，
 # 按本文件位置定位，整个目录可任意搬迁（如 ~/.agent-hub -> G:\workspaces\agent-hub）。
 # 注意 HOME 仍指向用户主目录，各 agent 的配置文件（~/.pi、~/.dsh 等）不受影响。
-HUB_DIR = Path(__file__).resolve().parent
-HUB_CONFIG = HUB_DIR / "providers.json"
+# PyInstaller 打包后 __file__ 指向解包临时目录（sys._MEIPASS），配置、状态与
+# 备份必须留在 exe 所在目录，否则每次运行都读不到用户的 providers.json。
+HUB_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+# 桌面版首次运行会让用户选一次 providers.json，选中路径经环境变量注入，
+# 之后同一进程内所有模块都读这一份（避免把含密钥的配置硬编码进 exe）。
+HUB_CONFIG = Path(os.environ["AGENTHUB_CONFIG"]) if os.environ.get("AGENTHUB_CONFIG") else HUB_DIR / "providers.json"
 HUB_STATE = HUB_DIR / "state.json"
 HUB_BACKUP = HUB_DIR / "backups"
 
@@ -100,6 +104,8 @@ def target_files(name: str, config: dict) -> list[str]:
                 str(HOME / ".codex" / ".agent-hub-state.json")]
     if name == "claude":
         return [str(HOME / ".claude" / "settings.json")]
+    if name == "opencode":
+        return [str(HOME / ".config" / "opencode" / "opencode.json")]
     return list(config.get("files", []))
 
 
@@ -238,6 +244,8 @@ AGENT_MODEL_TIERS: dict[str, tuple[str, ...]] = {
     "claude": ("model", "opus", "sonnet", "haiku", "fable", "subagent"),
     # Codex 只有一个顶层 model；codex-auto-review 之类子代理不在本工具管理范围。
     "codex": ("agent",),
+    # OpenCode 只有一个顶层 model 字段（形如 provider/model），无档位概念。
+    "opencode": ("agent",),
 }
 
 REASONING_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
@@ -246,7 +254,7 @@ CODEX_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", 
 # Claude Code 连接默认只走 Anthropic Messages；Codex 第三方只走 Responses。
 AGENT_DEFAULT_API = {"claude": "anthropic-messages", "codex": "openai-responses"}
 # 每个供应商在这几个 Agent 上的连接会被界面与状态展示（含未声明天认的默认连接）。
-AGENT_CONNECTION_TARGETS = ("pi", "dsh", "zcode", "claude", "codex")
+AGENT_CONNECTION_TARGETS = ("pi", "dsh", "zcode", "claude", "codex", "opencode")
 ZCODE_API_TYPES = {
     "openai-completions": "openai-chat-completions",
     "openai-chat-completions": "openai-chat-completions",
@@ -261,6 +269,15 @@ ZCODE_API_REVERSE = {
 }
 KNOWN_API_TYPES = ("openai-completions", "openai-chat-completions",
                    "openai-responses", "anthropic-messages")
+# dsh llm-pi-ai 的协议词表里 openai-completions 就是 Chat Completions 协议；
+# Hub 的 openai-chat-completions 没有同名值，直接透传会让 llm-pi-ai 整个
+# 激活失败（该供应商之外的所有自定义模型也从选择器消失），必须先翻译。
+DSH_API_TYPES = {
+    "openai-completions": "openai-completions",
+    "openai-chat-completions": "openai-completions",
+    "openai-responses": "openai-responses",
+    "anthropic-messages": "anthropic-messages",
+}
 
 
 def _import_api(value: Any) -> str:
@@ -301,9 +318,18 @@ def agent_connection(provider: dict, target: str) -> dict:
     api_key_env = pick("apiKeyEnv", provider.get("apiKeyEnv") or "")
     models = pick("models", provider.get("models") or [])
     models = models if isinstance(models, list) else []
+    # Keep old catalogue entries in Hub, but do not offer them to clients when
+    # the selected ZCode subscription did not return those models.
+    if provider.get('kind')=='zcode-subscription' and isinstance(provider.get('subscriptionModels'),list):
+        available=set(provider['subscriptionModels'])
+        models=[m for m in models if isinstance(m,dict) and m.get('id') in available]
     compat = pick("compat", provider.get("compat"))
     env = pick("env", {}) if isinstance(pick("env"), dict) else {}
     settings = pick("settings", {}) if isinstance(pick("settings"), dict) else {}
+    # 少数 OpenAI 兼容网关要求额外请求头（例如 opencode Go 的 x-opencode-session
+    # 用于路由亲和）。provider 可声明 headers，适配器按自身能力透传。
+    headers = pick("headers", provider.get("headers") or {})
+    headers = headers if isinstance(headers, dict) else {}
 
     if canonical == "claude":
         # Claude Code 只认 Anthropic Messages 端点，且必须显式声明：
@@ -341,7 +367,8 @@ def agent_connection(provider: dict, target: str) -> dict:
             "apiKey": api_key if isinstance(api_key, str) else "",
             "apiKeyEnv": api_key_env if isinstance(api_key_env, str) else "",
             "api": api if isinstance(api, str) else "openai-completions",
-            "models": models, "compat": compat, "env": env, "settings": settings}
+            "models": models, "compat": compat, "env": env, "settings": settings,
+            "headers": headers}
 
 
 def agent_connection_ready(provider: dict, target: str) -> bool:
@@ -350,6 +377,10 @@ def agent_connection_ready(provider: dict, target: str) -> bool:
     Claude Code 需要显式声明的 Anthropic Messages 端点；Codex 第三方线路只接受
     Responses。没有对应连接的供应商不会进入该平台的同步。
     """
+    # Legacy WorkBuddy subscriptions remain in the user's configuration for
+    # inspection, but their removed adapter cannot serve any agent.
+    if provider.get("kind") == "workbuddy-ai":
+        return False
     canonical = canonical_target(target)
     conn = agent_connection(provider, canonical)
     if not conn["baseUrl"].strip():
@@ -394,7 +425,71 @@ def claude_providers(providers: dict) -> dict:
             and p.get("enabled", True) and agent_connection_ready(p, "claude")}
 
 
-def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
+# Hub 的 api 字段 → OpenCode 兼容配置中的 ai-sdk 包。
+# model.provider.api 是端点 URL，而不是 Hub 的协议名；端点继承自 options.baseURL。
+OPENCODE_SDK = {
+    "openai-completions": ("openai-completions", "@ai-sdk/openai-compatible"),
+    "openai-chat-completions": ("openai-chat-completions", "@ai-sdk/openai-compatible"),
+    "openai-responses": ("openai-responses", "@ai-sdk/openai"),
+    "anthropic-messages": ("anthropic-messages", "@ai-sdk/anthropic"),
+}
+
+
+def opencode_providers(providers: dict) -> dict:
+    """Hub 供应商 → OpenCode v2 的 ``provider`` 段（单数键）。
+
+    沿用 OpenCode 接受的 V1 兼容 ``provider`` 写法，便于保留已有配置。
+    模型的 ``provider.npm`` 指定协议实现，端点由供应商 options.baseURL 提供。
+
+    缺端点或缺密钥的供应商整条跳过，不写半条记录；模型列表按 opencode 的
+    ``models.<id>`` 结构展开，``limit.context`` / ``limit.output`` 直接映射
+    contextWindow / maxTokens。
+    """
+    out: dict[str, dict] = {}
+    for pid, p in (providers or {}).items():
+        if not isinstance(p, dict) or not p.get("enabled", True):
+            continue
+        if not provider_targets(p, "opencode"):
+            continue
+        conn = agent_connection(p, "opencode")
+        base = str(conn.get("baseUrl") or "").strip()
+        key = str(conn.get("apiKey") or "").strip()
+        if not base or not key:
+            continue
+        _api, npm = OPENCODE_SDK.get(str(conn.get("api") or ""), OPENCODE_SDK["openai-completions"])
+        models: dict[str, dict] = {}
+        for m in conn.get("models") or []:
+            if not isinstance(m, dict):
+                continue
+            mid = str(m.get("id") or "").strip()
+            if not mid:
+                continue
+            entry: dict[str, object] = {"name": str(m.get("name") or mid)}
+            # OpenCode v2 要求 limit 同时含 context 与 output；只给 context 会让
+            # 它把这个模型整条丢弃（实测：缺 output 时该 model 不出现在
+            # `opencode models` 里）。所以两者都可用才写 limit，缺一则留给客户端默认值。
+            ctx, out_tokens = m.get("contextWindow"), m.get("maxTokens")
+            has_ctx = isinstance(ctx, (int, float)) and ctx > 0
+            has_out = isinstance(out_tokens, (int, float)) and out_tokens > 0
+            if has_ctx and has_out:
+                entry["limit"] = {"context": int(ctx), "output": int(out_tokens)}
+            modalities = [x for x in (m.get("input") or [])
+                          if x in ("text", "audio", "image", "video", "pdf")]
+            if modalities and modalities != ["text"]:
+                entry["modalities"] = {"input": modalities}
+            entry["provider"] = {"npm": npm}
+            models[mid] = entry
+        if not models:
+            continue
+        out[pid] = {
+            "name": str(p.get("displayName") or p.get("name") or pid),
+            "options": {"baseURL": base, "apiKey": key},
+            "models": models,
+        }
+    return out
+
+
+def _agent_model_tiers_resolution(cfg: Any, target: str) -> tuple[dict[str, dict], dict[str, str]]:
     """解析某平台每个档位实际要用的模型，不做写入。
 
     取值优先级（从高到低）：
@@ -418,7 +513,7 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
     canonical = canonical_target(target)
     tier_names = AGENT_MODEL_TIERS.get(canonical, ())
     if not tier_names:
-        return {}
+        return {}, {}
     providers = _cfg_providers(cfg)
     sync = (cfg or {}).get("modelSync")
     sync = sync if isinstance(sync, dict) else {}
@@ -466,40 +561,87 @@ def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
             return {"provider": pid, "model": first[0], "reasoningEffort": None}
         return None
 
+    def retired_provider(candidate: Any) -> str | None:
+        if not isinstance(candidate, dict):
+            return None
+        pid = candidate.get("provider")
+        if not isinstance(pid, str) or not pid.strip():
+            return None
+        pid = pid.strip()
+        provider = providers.get(pid)
+        return pid if isinstance(provider, dict) and provider.get("kind") == "workbuddy-ai" else None
+
     # 平台级覆盖：overrides.<target> 可带 tiers 子对象（每个档位单独指定）
-    override_pid = override.get("provider")
-    base = (pick_available(override)
-            or (fallback_for(override_pid) if isinstance(override_pid, str) else None)
-            or pick_available(default)
-            or (fallback_for(default["provider"]) if isinstance(default.get("provider"), str) else None))
+    # An explicit retired selection stops resolution at its precedence level;
+    # it must not silently fall through to a different provider.
+    base = None
+    base_retired = None
+    for candidate in (override, default):
+        base_retired = retired_provider(candidate)
+        if base_retired:
+            break
+        pid = candidate.get("provider")
+        base = pick_available(candidate) or (fallback_for(pid) if isinstance(pid, str) else None)
+        if base:
+            break
 
     out: dict[str, dict] = {}
+    retired: dict[str, str] = {}
     for tier in tier_names:
         resolved = None
+        blocked_pid = None
         if canonical == "claude":
             # 1) 该档位被界面显式指定（供应商必须具备 Claude 连接）
-            resolved = pick_available(override_tiers.get(tier))
-            if resolved is None and tier == "model":
+            tier_choice = override_tiers.get(tier)
+            blocked_pid = retired_provider(tier_choice)
+            if not blocked_pid:
+                resolved = pick_available(tier_choice)
+            if resolved is None and not blocked_pid and tier == "model":
                 # 2) 主模型档位：平台级覆盖 / 全局主模型。baseUrl 与 apiKey 必须
                 #    配套，所以只认「该供应商确实有 Claude 连接」的选择。
                 for candidate in (override, default):
-                    picked = pick(candidate)
-                    if picked and picked["provider"] in available:
-                        resolved = picked
+                    blocked_pid = retired_provider(candidate)
+                    if blocked_pid:
+                        break
+                    resolved = pick_available(candidate)
+                    if resolved:
                         break
             # 3) 别名档位（opus/sonnet/haiku/fable/subagent）没有兜底：未显式
             #    指定的档位不写，避免替用户改掉 Claude Code 的配置。
         else:
             # pi 的 agent 档、dsh 的 agent/subagent 档、Codex 的 agent 档
             # 都跟随同一个主模型
-            resolved = base
+            resolved, blocked_pid = base, base_retired
+        if blocked_pid:
+            retired[tier] = blocked_pid
+            continue
         if resolved is None:
             continue
         entry_out = dict(resolved)
         entry_out["tier"] = tier
         entry_out["known"] = entry_out["model"] in provider_models(entry_out["provider"])
         out[tier] = entry_out
-    return out
+    return out, retired
+
+
+def agent_model_tiers(cfg: Any, target: str) -> dict[str, dict]:
+    """Return resolved tiers without writing or silently replacing retired selections."""
+    return _agent_model_tiers_resolution(cfg, target)[0]
+
+
+def assert_no_retired_workbuddy_selection(cfg: Any, target: str) -> None:
+    """Reject a selected retired connection before preparing or writing native config."""
+    canonical = canonical_target(target)
+    sync = (cfg or {}).get("sync") or {}
+    targets = sync.get("targets") or {}
+    target_config = targets.get(canonical) or {}
+    # Official modes use their own native account rather than modelSync.
+    if canonical in ("codex", "zcode") and target_config.get("mode", "official") != "third-party":
+        return
+    retired = _agent_model_tiers_resolution(cfg, canonical)[1]
+    if retired:
+        tier = next(iter(retired))
+        raise ValueError(f"{canonical} 的 {tier} 模型选择使用已停用的 WorkBuddy 订阅；请先选择其他可用线路，未改写客户端配置")
 
 
 def agent_model_tiers_public(cfg: Any, target: str) -> dict[str, dict]:
@@ -1313,6 +1455,15 @@ class DshModelPlan:
             rid for rid in (hub.cfg.get("removedProviders") or {})
             if isinstance(rid, str)
         }
+        # Hub 里存在、但对 dsh 已不可用的供应商（targets 不含 dsh / 已停用 /
+        # 连接不合格）也要清掉。push 只做增量 merge，不清理这类条目；改过
+        # targets 之后旧路由会一直留着，用户仍能在 dsh 里选中一个本不该给他的
+        # 模型（例如只服务 opencode 的 opencode-paid，选中后调用必然失败）。
+        self.stale_routes = {
+            pid for pid, p in hub.providers.items()
+            if not (provider_targets(p, "dsh") and p.get("enabled", True)
+                    and agent_connection_ready(p, "dsh"))
+        }
         self.routes: dict[str, str] = {}
         for pid, p in self.providers.items():
             if not p.get("enabled", True) or pid in self.empty_routes:
@@ -1330,6 +1481,9 @@ class DshModelPlan:
     def block(self, pid: str) -> dict:
         p = self.providers[pid]
         conn = agent_connection(p, "dsh")
+        api = DSH_API_TYPES.get(conn["api"])
+        if api is None:
+            raise ValueError(f"dsh 不支持 {pid} 的协议 {conn['api']}")
         models = [
             {
                 "id": m["id"],
@@ -1344,9 +1498,10 @@ class DshModelPlan:
         return {
             "displayName": p.get("displayName") or p.get("name"),
             "apiKeyEnv": self.env_name(pid),
-            "api": conn["api"],
+            "api": api,
             "baseURL": conn["baseUrl"],
             **({"compat": conn["compat"]} if conn.get("compat") else {}),
+            **({"headers": conn["headers"]} if conn.get("headers") else {}),
             "models": models,
         }
 
@@ -1395,6 +1550,31 @@ def _dsh_ensure_block(items: list, block_id: str, name: str, config: dict) -> di
             return block
     items.append(block)
     return block
+
+
+def _dsh_selection_fingerprint(items: list) -> str:
+    """Hub 接管的 dsh 模型选择（主模型 + 子代理可选模型）的语义指纹。
+
+    只取协议声明的字段，dsh 侧重排条目或增补无关字段不会误报外部修改；
+    allowedModels 先按内容排序，顺序差异同样不算改动。
+    """
+    state: dict = {"agent": None, "subagent": None}
+    block = _dsh_find_block(items, "agent-default-model")
+    if isinstance(block, dict) and isinstance(block.get("config"), dict):
+        config = block["config"]
+        state["agent"] = {key: config.get(key)
+                          for key in ("provider", "model", "reasoningEffort")}
+    block = _dsh_find_block(items, "subagent-model-selection-settings")
+    if isinstance(block, dict) and isinstance(block.get("config"), dict):
+        config = block["config"]
+        allowed = [entry for entry in (config.get("allowedModels") or [])
+                   if isinstance(entry, dict)]
+        state["subagent"] = {
+            "enabled": config.get("enabled"),
+            "allowedModels": sorted(
+                allowed, key=lambda entry: json.dumps(entry, sort_keys=True, ensure_ascii=False)),
+        }
+    return fingerprint(state)
 
 
 def _pi_model_reference(provider: str, model: str) -> str:
@@ -1484,9 +1664,9 @@ class Hub:
         }
 
     # -- push adapters --
-    def preview_push(self, only: list[str] | None = None, *, reconcile=False) -> dict:
+    def preview_push(self, only: list[str] | None = None, *, reconcile=False, model_sync=None) -> dict:
         from sync_transaction import preview
-        return preview(self, only, reconcile=reconcile)
+        return preview(self, only, reconcile=reconcile, model_sync=model_sync)
 
     def apply_preview(self, plan_id: str) -> dict:
         from sync_transaction import apply
@@ -1508,6 +1688,7 @@ class Hub:
 
     # ---- pi ----
     def push_pi(self, *, warnings=None) -> None:
+        assert_no_retired_workbuddy_selection(self.cfg, "pi")
         models_path = HOME / ".pi" / "agent" / "models.json"
         auth_path = HOME / ".pi" / "agent" / "auth.json"
         settings_path = HOME / ".pi" / "agent" / "settings.json"
@@ -1521,15 +1702,9 @@ class Hub:
 
         models.setdefault("providers", {})
         providers = models["providers"]
-        # 移除已删除 provider 与历史别名 (firework 取代 volcano, stepfun 取代 cc-switch-step-fun)
+        # Only explicit Hub removals authorize deleting existing pi entries.
         removed = self.cfg.get("removedProviders", {})
-        legacy = list(removed.keys()) + [
-            "qwen-token-plan-cn",
-            "volcano",
-            "cc-switch-step-fun",
-            "provider-0b8770",
-        ]
-        for rid in legacy:
+        for rid in removed:
             providers.pop(rid, None)
             auth.pop(rid, None)
 
@@ -1603,7 +1778,7 @@ class Hub:
         # credentials, or user scopes for providers outside Hub's Pi ownership.
         managed = {pid.casefold() for pid, p in self.providers.items()
                    if provider_targets(p, "pi") and agent_connection_ready(p, "pi")}
-        managed.update(rid.casefold() for rid in legacy)
+        managed.update(rid.casefold() for rid in removed)
         old_scope = settings.get("enabledModels", [])
         if not isinstance(old_scope, list) or not all(isinstance(item, str) for item in old_scope):
             raise ValueError("pi enabledModels 必须是字符串数组；请先修复原配置")
@@ -1705,6 +1880,7 @@ class Hub:
 
     # ---- zcode ----
     def push_zcode(self, *, reconcile: bool = False, warnings: list | None = None) -> None:
+        assert_no_retired_workbuddy_selection(self.cfg, "zcode")
         path = HOME / ".zcode" / "v2" / "provider_config.json"
         if not path.exists():
             raise FileNotFoundError(path)
@@ -2121,7 +2297,8 @@ class Hub:
                  "api": "anthropic-messages", "models": []}]
 
     # ---- dsh ----
-    def push_dsh(self) -> None:
+    def push_dsh(self, *, reconcile: bool = False, warnings: list | None = None) -> None:
+        assert_no_retired_workbuddy_selection(self.cfg, "dsh")
         plan = DshModelPlan(self)
         selection = plan.selection()
 
@@ -2151,7 +2328,7 @@ class Hub:
             data = parse_yaml(imported.read_text(encoding="utf-8")) or {}
             llm = data.setdefault("llm-pi-ai", {}).setdefault("providers", {})
             for rid in list(llm.keys()):
-                if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
+                if rid in plan.empty_routes or rid in plan.removed_routes or rid in plan.stale_routes:
                     llm.pop(rid)
             llm.update(copy.deepcopy(blocks))
             data["llm-pi-ai"]["providers"] = llm
@@ -2159,25 +2336,52 @@ class Hub:
 
         # 3) cordis.patch.yml — llm-pi-ai.providers + agent-default-model + 子代理可选模型
         patch = HOME / ".dsh" / "profiles" / "desktop" / "cordis.patch.yml"
+        state_path = HOME / ".dsh" / ".agent-hub-state.json"
         if patch.exists():
             backup_file(patch)
+            saved = load_json(state_path)
+            if isinstance(saved, dict) and (
+                    saved.get("version") != 1 or not isinstance(saved.get("managed"), bool)
+                    or (saved.get("managed")
+                        and not re.fullmatch(r"[0-9a-f]{64}", str(saved.get("selectionHash") or "")))):
+                raise ValueError("dsh 托管记录无效，请先检查备份")
             try:
                 items = parse_yaml(patch.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001
                 items = None
             if isinstance(items, list):
+                # 桌面应用重置/重建 profile 时会把补丁重写回模板，llm-pi-ai 块
+                # 可能随之消失；块不存在时要补建，否则供应商只会停留在
+                # settings.yaml（导入一次的旧层），模型选择器里不会再出现任何
+                # Hub 模型，默认选择还指向一条已不存在的路由。
+                _dsh_ensure_block(items, "llm-pi-ai", "@deepseek-ai/dsh-llm-pi-ai",
+                                  {"providers": {}})
                 for item in items:
                     if isinstance(item, dict) and item.get("id") == "llm-pi-ai":
                         cfg = item.setdefault("config", {})
                         providers = cfg.setdefault("providers", {})
                         for rid in list(providers.keys()):
-                            if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
+                            if rid in plan.empty_routes or rid in plan.removed_routes or rid in plan.stale_routes:
                                 providers.pop(rid)
                         providers.update(copy.deepcopy(blocks))
                         cfg["providers"] = providers
 
-                # 主 agent 默认模型：只有配置了 modelSync 才接管，否则保持用户当前选择
+                # 主 agent 默认模型：只有 modelSync 解析出主模型才接管，否则保持
+                # 用户当前选择。接管期间把写入的选择指纹记进 state 文件；下次同步
+                # 发现选择被外部改过时 fail-closed，只有显式 reconcile 才重新接管
+                # （与 ZCode/Codex 的外部修改保护一致，legacy push 不再悄悄打回）。
+                next_state = {"version": 1, "managed": False}
                 if selection:
+                    if isinstance(saved, dict) and saved.get("managed") \
+                            and saved.get("selectionHash") != _dsh_selection_fingerprint(items):
+                        if not reconcile:
+                            raise ValueError(
+                                "dsh 默认模型选择已在外部更改；请在工作台为 dsh 重新切换模型并"
+                                "确认应用，自动同步不会覆盖外部编辑")
+                        if warnings is not None:
+                            warnings.append(
+                                "dsh: 检测到默认模型选择被外部更改。"
+                                "本次预览将按 Hub 选择重新设置；确认应用前不会写入。")
                     block = _dsh_ensure_block(
                         items, "agent-default-model", "@deepseek-ai/dsh-agent-default-model",
                         {"provider": selection["provider"], "model": selection["model"]},
@@ -2198,8 +2402,12 @@ class Hub:
                     sync_config["allowedModels"] = [
                         {"provider": selection["provider"], "model": selection["model"]}
                     ]
+                    next_state = {"version": 1, "managed": True,
+                                  "selectionHash": _dsh_selection_fingerprint(items)}
 
                 patch.write_text(_dump_yaml_list(items) + "\n", encoding="utf-8")
+                if next_state != saved:
+                    save_json(state_path, next_state)
 
         # 4) settings.yaml — 桌面 Models 页用户层 (dsh 桌面版会合并此层)
         user_settings = HOME / ".dsh" / "settings.yaml"
@@ -2209,7 +2417,7 @@ class Hub:
             if isinstance(existing, dict):
                 merged_providers = (existing.get("llm-pi-ai") or {}).get("providers") or {}
                 for rid in list(merged_providers.keys()):
-                    if "qwen-token" in rid or rid in plan.empty_routes or rid in plan.removed_routes:
+                    if rid in plan.empty_routes or rid in plan.removed_routes or rid in plan.stale_routes:
                         merged_providers.pop(rid)
                 merged_providers.update(copy.deepcopy(blocks))
                 existing.setdefault("llm-pi-ai", {})["providers"] = merged_providers
@@ -2218,6 +2426,7 @@ class Hub:
                 user_settings.write_text(dump_yaml({"llm-pi-ai": {"providers": blocks}}) + "\n",
                                          encoding="utf-8")
         else:
+            user_settings.parent.mkdir(parents=True, exist_ok=True)
             user_settings.write_text(dump_yaml({"llm-pi-ai": {"providers": blocks}}) + "\n",
                                      encoding="utf-8")
 
@@ -2233,6 +2442,7 @@ class Hub:
         平台级特性开关（featureEnv）属于 Claude Code 本身，即使没有选定模型也会
         写入，否则「切到别的供应商后特性丢失」的事故会重演。
         """
+        assert_no_retired_workbuddy_selection(self.cfg, "claude")
         settings_path = HOME / ".claude" / "settings.json"
         tiers = agent_model_tiers(self.cfg, "claude")
         main = tiers.get("model")
@@ -2361,6 +2571,7 @@ class Hub:
     # ---- codex (Codex 桌面版 / CLI) ----
     def push_codex(self, *, reconcile=False, warnings=None) -> None:
         """Compile base config only; native auth and named profiles are never opened."""
+        assert_no_retired_workbuddy_selection(self.cfg, "codex")
         from codex_config import compile_config
         config_path = HOME / ".codex" / "config.toml"
         state_path = HOME / ".codex" / ".agent-hub-state.json"
@@ -2389,6 +2600,14 @@ class Hub:
                             apiKeyEnv=conn["apiKeyEnv"], apiKey=conn["apiKey"], openaiApiKey=conn["apiKey"],
                             codexWireApi="responses")
         text = config_path.read_text(encoding="utf-8")
+        if provider and provider.get('kind') == 'zcode-subscription' and warnings is not None:
+            import tomllib
+            try:
+                web_search = tomllib.loads(text).get('web_search')
+            except tomllib.TOMLDecodeError:
+                web_search = None  # compile_config supplies the full configuration error below.
+            if web_search != 'disabled':
+                warnings.append('Codex: ZCode 不支持服务端网页搜索；请在 Codex config.toml 中设置 web_search = "disabled"。Hub 不会自动更改该设置。')
         saved = load_json(state_path)
         rendered, next_state = compile_config(text, saved, mode, provider, tier, reconcile=reconcile, warnings=warnings)
         # All compilation and validation above is write-free. The transaction
@@ -2493,6 +2712,53 @@ class Hub:
                 "cc-switch 以下 claude 预设缺少特性开关，切换过去会丢失: "
                 + "; ".join(missing)
             )
+
+    # ---- opencode ----
+    def push_opencode(self) -> None:
+        """直接配置 OpenCode v2（~/.config/opencode/opencode.json）。
+
+        只接管两处：``provider`` 段与顶层 ``model``。用户的 mcp / skills /
+        agent / plugin / lsp 等配置原样保留——这些不属于本工具的管理范围。
+
+        ``provider`` 段按「完全接管」策略整体替换：Hub 是供应商清单的唯一
+        来源，避免 opencode.json 里的手写条目与 Hub 两套数据互相漂移。
+        需要提醒的是，OpenCode 内置的 opencode / opencode-go / deepseek 供应商
+        来自客户端本身（以及 auth 凭证库），不由这个文件控制，因此仍会出现在
+        `opencode models` 里。
+
+        没有可写内容时直接返回，不创建空文件。
+        """
+        assert_no_retired_workbuddy_selection(self.cfg, "opencode")
+        path = HOME / ".config" / "opencode" / "opencode.json"
+        entries = opencode_providers(self.providers)
+        tiers = agent_model_tiers(self.cfg, "opencode")
+        main = tiers.get("agent")
+        if not entries and not main:
+            return
+        if path.exists():
+            backup_file(path)
+            data = load_json(path, default={}) or {}
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("opencode.json 根节点不是对象，拒绝改写")
+        data.setdefault("$schema", "https://opencode.ai/config.json")
+        if entries:
+            data["provider"] = entries
+        if main:
+            pid = str(main.get("provider") or "").strip()
+            model = str(main.get("model") or "").strip()
+            if pid not in entries:
+                raise ValueError(
+                    f"OpenCode 供应商 {pid} 没有可用连接（缺端点或 apiKey）；未改写 opencode.json"
+                )
+            if model not in entries[pid]["models"]:
+                raise ValueError(
+                    f"OpenCode 供应商 {pid} 的模型库里没有 {model}；未改写 opencode.json"
+                )
+            data["model"] = f"{pid}/{model}"
+        save_json(path, data)
 
     def push_cc_switch(self) -> None:
         db_path = HOME / ".cc-switch" / "cc-switch.db"
@@ -2748,12 +3014,10 @@ class Hub:
         if imported.exists():
             data = parse_yaml(imported.read_text(encoding="utf-8")) or {}
             llm = (data.get("llm-pi-ai") or {}).get("providers") or {}
-            if pid in llm or any("qwen-token" in k for k in llm):
+            if pid in llm:
                 backup_file(imported)
-                for rid in list(llm.keys()):
-                    if rid == pid or "qwen-token" in rid:
-                        llm.pop(rid)
-                        msgs.append(f"  dsh providers.{rid} 已清除")
+                llm.pop(pid)
+                msgs.append(f"  dsh providers.{pid} 已清除")
                 data["llm-pi-ai"]["providers"] = llm
                 imported.write_text(dump_yaml(data) + "\n", encoding="utf-8")
 

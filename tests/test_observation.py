@@ -2,6 +2,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,7 +20,7 @@ class ObservationTests(unittest.TestCase):
         self.paths=seed(self.home)
         self.store=Store(self.home/'data',self.home)
         self.addCleanup(self.store.close)
-        self.store.settings_path.write_text(json.dumps({'enabled':False,'content':False,'retentionDays':30,'clearedBefore':0}))
+        self.store.settings_path.write_text(json.dumps({'enabled':False,'content':False,'retentionDays':30,'clearedBefore':0}), encoding="utf-8")
         # Direct ingest is used deliberately, so the collector cannot race test mutations.
         self.settings={'enabled':True,'content':False,'retentionDays':30,'clearedBefore':0}
 
@@ -140,6 +141,28 @@ class ObservationTests(unittest.TestCase):
         self.assertEqual(self.store.query({'days':30})['total'],1)
         self.store.set_settings({'retentionDays':7})
         self.assertEqual(self.store.query({'days':30})['total'],0)
+
+    def test_trend_weekly_downsampling_beyond_120_days(self):
+        # 性能审计：长范围逐日 trend 会让概览页每次轮询重建数千节点。
+        # 依据：范围超过 120 天按 ISO 周聚合到周首（周一），calls 等合计不变；
+        # trendGranularity 随响应如实标注，前端轴标同步写「按周」，不得冒充逐日。
+        p=Parsed('pi',Path('native'));p.sid='span'
+        p.request('early',time.time()-150*86400,{'input':10,'output':1})
+        p.request('late',time.time()-10*86400,{'input':10,'output':2})
+        # 150 天前的请求在 ingest 内也按传入 settings 的保留期过滤（observation.ingest 的 cutoff），
+        # 0 = 不自动过期：set_settings 与 ingest 都要放开，否则 early 根本进不了库。
+        relaxed={**self.settings,'retentionDays':0}
+        # 这里只做手动 ingest，保持采集器关闭，避免异步扫描夹具干扰统计。
+        self.store.set_settings({'retentionDays':0,'enabled':False})
+        self.store.ingest(p,relaxed)
+        data=self.store.query({'days':'all'})
+        self.assertEqual(data['trendGranularity'],'week')
+        self.assertEqual(sum(t['calls'] for t in data['trend']),2)
+        dates=[t['date'] for t in data['trend']]
+        self.assertEqual(len(dates),len(set(dates)))  # 每周恰好一个桶
+        for d in dates:
+            self.assertEqual(datetime.strptime(d,'%Y-%m-%d').weekday(),0)  # 桶键都是周首（周一）
+        self.assertEqual(self.store.query({'days':30})['trendGranularity'],'day')
 
     def test_real_collector_toggle_and_repeated_refresh(self):
         with patch.dict('os.environ',{'CODEX_HOME':'','CLAUDE_CONFIG_DIR':'','PI_CODING_AGENT_DIR':'','DSH_HOME':''}):

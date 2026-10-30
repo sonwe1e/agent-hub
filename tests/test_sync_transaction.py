@@ -320,13 +320,13 @@ class SafeSyncTransactionTests(unittest.TestCase):
         plan = transaction.preview(engine.Hub(), ["pi"])
         result = transaction.apply(engine.Hub(), plan["planId"])
         self.assertEqual(result["results"], ["  ✓ pi"])
-        self.assertEqual(outsider.read_text(), "not even JSON")
+        self.assertEqual(outsider.read_text(encoding="utf-8"), "not even JSON")
         self.assertFalse((self.home / ".claude").exists())
         manifest_path, manifest = self.manifest(result)
         self.assertEqual(manifest["status"], "committed")
         settings = next(item for item in manifest["files"] if item["path"].endswith("settings.json"))
         self.assertEqual((manifest_path.parent / settings["backup"]).read_bytes(), self.original_settings)
-        self.assertNotIn("test-not-a-real-key", manifest_path.read_text())
+        self.assertNotIn("test-not-a-real-key", manifest_path.read_text(encoding="utf-8"))
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
             self.assertEqual(stat.S_IMODE(manifest_path.parent.stat().st_mode), 0o700)
@@ -409,7 +409,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
         self.assertEqual(before, self.native_files())
         manifests = list(engine.HUB_BACKUP.glob("transactions/*/manifest.json"))
         self.assertEqual(len(manifests), 1)
-        self.assertEqual(json.loads(manifests[0].read_text())["status"], "rolled_back")
+        self.assertEqual(json.loads(manifests[0].read_text(encoding="utf-8"))["status"], "rolled_back")
 
     def test_failure_after_replace_also_rolls_back(self):
         plan = transaction.preview(engine.Hub(), ["pi"])
@@ -431,7 +431,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
 
     def test_changed_native_file_rejects_stale_preview(self):
         plan = transaction.preview(engine.Hub(), ["pi"])
-        self.settings.write_text('{"theme":"external"}')
+        self.settings.write_text('{"theme":"external"}', encoding="utf-8")
         before = self.native_files()
         with self.assertRaisesRegex(transaction.TransactionError, "stale"):
             transaction.apply(engine.Hub(), plan["planId"])
@@ -459,14 +459,14 @@ class SafeSyncTransactionTests(unittest.TestCase):
 
     def test_jsonc_comments_inside_strings_survive_and_restore_exactly(self):
         original = '// real comment\n{"theme":"keep /* literal text */", "url":"https://example.test/a//b"}\n'
-        self.settings.write_text(original)
+        self.settings.write_text(original, encoding="utf-8")
         plan = transaction.preview(engine.Hub(), ["pi"])
         applied = transaction.apply(engine.Hub(), plan["planId"])
-        parsed = json.loads(self.settings.read_text())
+        parsed = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertEqual(parsed["theme"], "keep /* literal text */")
         self.assertEqual(parsed["url"], "https://example.test/a//b")
         transaction.restore(engine.Hub(), applied["transactionId"])
-        self.assertEqual(self.settings.read_text(), original)
+        self.assertEqual(self.settings.read_text(encoding="utf-8"), original)
 
     def test_failed_backup_does_not_start_native_writes(self):
         plan = transaction.preview(engine.Hub(), ["pi"])
@@ -532,7 +532,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
     def test_restore_rejects_external_changes_without_overwrite(self):
         plan = transaction.preview(engine.Hub(), ["pi"])
         applied = transaction.apply(engine.Hub(), plan["planId"])
-        self.settings.write_text('{"theme":"new-external-change"}')
+        self.settings.write_text('{"theme":"new-external-change"}', encoding="utf-8")
         before = self.native_files()
         with self.assertRaisesRegex(transaction.TransactionError, "changed after apply"):
             transaction.restore(engine.Hub(), applied["transactionId"])
@@ -543,7 +543,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
         applied = transaction.apply(engine.Hub(), plan["planId"])
         path, manifest = self.manifest(applied)
         entry = next(file for file in manifest["files"] if file["backup"])
-        (path.parent / entry["backup"]).write_text("tampered")
+        (path.parent / entry["backup"]).write_text("tampered", encoding="utf-8")
         before = self.native_files()
         with self.assertRaisesRegex(transaction.TransactionError, "integrity"):
             transaction.restore(engine.Hub(), applied["transactionId"])
@@ -551,9 +551,9 @@ class SafeSyncTransactionTests(unittest.TestCase):
 
     def test_codex_preview_never_opens_native_auth_or_keyring(self):
         root = self.codex_fixture()
-        (root / "auth.json").write_text("unparseable fake auth sentinel")
+        (root / "auth.json").write_text("unparseable fake auth sentinel", encoding="utf-8")
         (root / "keyring").mkdir()
-        (root / "keyring" / "secret").write_text("fake sentinel")
+        (root / "keyring" / "secret").write_text("fake sentinel", encoding="utf-8")
         original = transaction._snapshot
         read = []
 
@@ -568,20 +568,20 @@ class SafeSyncTransactionTests(unittest.TestCase):
             applied = transaction.apply(engine.Hub(), plan["planId"])
             transaction.restore(engine.Hub(), applied["transactionId"])
         self.assertTrue(read)
-        self.assertEqual((root / "auth.json").read_text(), "unparseable fake auth sentinel")
+        self.assertEqual((root / "auth.json").read_text(encoding="utf-8"), "unparseable fake auth sentinel")
         self.assertEqual({Path(file["path"]).name for file in plan["files"]}, {"config.toml", ".agent-hub-state.json"})
 
     def test_symlink_target_rejected_before_reads_or_writes(self):
         self.settings.unlink()
         elsewhere = self.home / "other.json"
-        elsewhere.write_text('{"do":"not modify"}')
+        elsewhere.write_text('{"do":"not modify"}', encoding="utf-8")
         try:
             self.settings.symlink_to(elsewhere)
         except (OSError, NotImplementedError):
             self.skipTest("Symlinks unavailable")
         with self.assertRaisesRegex(transaction.TransactionError, "symlink"):
             transaction.preview(engine.Hub(), ["pi"])
-        self.assertEqual(elsewhere.read_text(), '{"do":"not modify"}')
+        self.assertEqual(elsewhere.read_text(encoding="utf-8"), '{"do":"not modify"}')
 
     def test_cc_switch_rejected_without_opening_database(self):
         database = self.home / ".cc-switch" / "cc-switch.db"
@@ -611,7 +611,7 @@ class SafeSyncTransactionTests(unittest.TestCase):
         path.parent.mkdir()
         for text in ("first: 1\nfirst: 2\n", "prompt: |\n  important text\n", "base: &base\n  key: value\n", "invalid:\n   wrong: indentation\n"):
             with self.subTest(text=text):
-                path.write_text(text)
+                path.write_text(text, encoding="utf-8")
                 before = self.native_files()
                 with self.assertRaises(transaction.TransactionError):
                     transaction.preview(engine.Hub(), ["pi", "dsh"])

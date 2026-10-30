@@ -114,6 +114,35 @@ class APITests(unittest.TestCase):
         self.assertEqual(model["compat"], {"custom": True})
         self.assertFalse(model["reasoning"])
 
+    def test_reference_prices_accept_zero_and_reject_invalid_values_atomically(self):
+        server.api_update_model("deepseek", "deepseek/model-1",
+                                {"cost": {"input": 0.75, "output": 0, "cacheRead": 0.1}})
+        model = self.config()["providers"]["deepseek"]["models"][0]
+        self.assertEqual(model["cost"], {"input": 0.75, "output": 0, "cacheRead": 0.1})
+        self.assertEqual(model["compat"], {"custom": True})
+        before = server.HUB_CONFIG.read_bytes()
+        for invalid in (-1, True, "free", float('inf')):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                server.api_update_model("deepseek", "deepseek/model-1", {"cost": {"input": invalid}})
+            self.assertEqual(server.HUB_CONFIG.read_bytes(), before)
+
+    def test_editing_price_does_not_invent_unknown_model_capabilities(self):
+        config = self.config()
+        model = config["providers"]["deepseek"]["models"][0]
+        for field in ("contextWindow", "maxTokens", "input", "reasoning"):
+            model.pop(field)
+        engine.save_json(server.HUB_CONFIG, config)
+        server.api_update_model("deepseek", "deepseek/model-1", {"cost": {"input": 1.25}})
+        model = self.config()["providers"]["deepseek"]["models"][0]
+        self.assertEqual(model["cost"], {"input": 1.25})
+        for field in ("contextWindow", "maxTokens", "input", "reasoning"):
+            self.assertNotIn(field, model)
+        server.api_update_model("deepseek", "deepseek/model-2",
+                                {field: None for field in ("contextWindow", "maxTokens", "input", "reasoning")})
+        cleared = self.config()["providers"]["deepseek"]["models"][1]
+        for field in ("contextWindow", "maxTokens", "input", "reasoning"):
+            self.assertNotIn(field, cleared)
+
     def test_model_rename_collision_is_atomic(self):
         before = server.HUB_CONFIG.read_bytes()
         with self.assertRaises(ValueError):
@@ -148,6 +177,21 @@ class APITests(unittest.TestCase):
         result = server.api_import_models("deepseek", {"models": [self.model("deepseek/model-1", contextWindow=999), self.model()]})
         self.assertEqual(result["added"], 1)
         self.assertEqual(self.config()["providers"]["deepseek"]["models"][0], original)
+
+    def test_import_and_add_keep_unknown_capabilities_unknown(self):
+        server.api_import_models('deepseek', {'models': [{'id': 'discovered-minimal'}]})
+        server.api_add_model('deepseek', {'id': 'manually-minimal'})
+        models = {m['id']: m for m in self.config()['providers']['deepseek']['models']}
+        for mid in ('discovered-minimal', 'manually-minimal'):
+            for field in ('contextWindow', 'maxTokens', 'input', 'reasoning'):
+                self.assertNotIn(field, models[mid])
+
+    def test_import_update_does_not_replace_known_values_with_defaults(self):
+        before = self.config()['providers']['deepseek']['models'][0]
+        server.api_import_models('deepseek', {'models': [{'id': before['id']}], 'updateExisting': True})
+        after = self.config()['providers']['deepseek']['models'][0]
+        for field in ('contextWindow', 'maxTokens', 'input', 'reasoning'):
+            self.assertEqual(after[field], before[field])
 
     def test_empty_or_duplicate_import_rejected(self):
         for models in ([], [self.model(), self.model()]):

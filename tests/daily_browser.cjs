@@ -14,20 +14,39 @@ const step=async(name,fn)=>{await fn();results.push(name);console.log('PASS '+na
  browser=await chromium.launch({headless:true,...(process.env.BROWSER_EXECUTABLE?{executablePath:process.env.BROWSER_EXECUTABLE}:{})});
  const page=await browser.newPage({viewport:{width:1440,height:1000},deviceScaleFactor:1});
  const errors=[];page.on('pageerror',e=>errors.push(e.message));
- const screenshot=async name=>page.screenshot({path:path.join(out,name+'.png'),fullPage:true});
+ // main 有一条 150ms 延迟 + 200ms 的入场动画（styles.css settle-in，fill-mode: both），
+ // 延迟期间 main 的 opacity 是 0。截图必须等它结束，否则会拍到一张「内容全白」的图，
+ // 无法作为验收证据。只等 main 自身的动画，不影响子元素里的无限动画（spinner 等）。dialog（#editor-dialog 详情视图等）与 ::backdrop 的 180ms 落位动画（dialog-settle / scrim-in）在 main 子树之外，必须一并等待，否则拍到半透明「鬼影」弹窗（2026-10-25 审查发现）；弹窗内没有无限动画，等待必然收敛。
+ const settle=async()=>{await page.waitForFunction(()=>{const els=[document.querySelector('main'),...document.querySelectorAll('dialog[open]')];return els.every(el=>!!el&&el.getAnimations().every(a=>a.playState!=='running'));}).catch(()=>{});};
+ const screenshot=async name=>{await settle();await page.screenshot({path:path.join(out,name+'.png'),fullPage:true});};
  const noOverflow=async()=>assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
- await step('home has four aligned agents and distinct desktop instances',async()=>{
+ await step('home has five aligned agents and distinct desktop instances',async()=>{
   await page.goto(url);await page.locator('.agent-table tbody tr').first().waitFor();await page.waitForFunction(()=>!!document.querySelector('.instance-picker'));
-  assert.equal(await page.locator('.agent-table tbody tr').count(),4);
-  assert.equal(await page.locator('nav:not(#settings-nav) a').count(),3);
+  // inventory 现在含 opencode（agent_inventory.AGENTS 共 5 项），表格与侧栏徽标同源。
+  assert.equal(await page.locator('.agent-table tbody tr').count(),5);
+  // 行数与侧栏徽标必须一致：这里显式对账，防止两边再次漂移。
+  assert.equal((await page.locator('#nav-agent-count').textContent()).trim(),String(await page.locator('.agent-table tbody tr').count()));
+  assert.equal(await page.locator('nav:not(#settings-nav) a').count(),5);
   assert.doesNotMatch(await page.locator('main').innerText(),/ZCode|mcode|omp|cc-switch/);
   await noOverflow();await screenshot('agents-desktop');
  });
  await step('quick model switch reuses preview and exact preview apply receipt',async()=>{
+  // 「切换模型」已移入详情抽屉：先开详情，再从抽屉里点切换。
+  await page.locator('[data-daily="agent-detail"][data-agent="pi"]').click();
   await page.locator('[data-daily="switch"][data-agent="pi"]').click();
   await page.locator('#quick-provider').selectOption('deepseek');await page.locator('#quick-model').selectOption('deepseek/model-1');
   await page.locator('#editor-form button[type="submit"]').click();await page.locator('[data-daily="quick-apply"]').waitFor();
   await screenshot('switch-preview');await page.locator('[data-daily="quick-apply"]').click();await page.locator('#editor-dialog').waitFor({state:'hidden'});
+ });
+ await step('OpenCode quick preview explains provider replacement',async()=>{
+  await page.locator('[data-daily="agent-detail"][data-agent="opencode"]').click();
+  await page.locator('[data-daily="switch"][data-agent="opencode"]').click();
+  await page.locator('#quick-provider').selectOption('deepseek');await page.locator('#quick-model').selectOption('deepseek/model-1');
+  await page.locator('#editor-form button[type="submit"]').click();await page.locator('[data-daily="quick-apply"]').waitFor();
+  assert.match(await page.locator('#quick-result').innerText(),/替换.*provider/);
+  await page.locator('#editor-footer [data-action="close-editor"]').click();
+  await page.locator('#confirm-ok').click();
+  await page.locator('#editor-dialog').waitFor({state:'hidden'});
  });
  await step('overview uses parsed native fixtures and can filter to a failed call',async()=>{
   await page.locator('nav a[href="#observe"]').click();await page.locator('.metric').first().waitFor();

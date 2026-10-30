@@ -71,9 +71,9 @@ class ModelSyncAPITests(unittest.TestCase):
         result = server.api_modelsync()
         self.assertEqual(result["modelSync"], self.config()["modelSync"])
         self.assertTrue(result["configured"])
-        # 六个目标都必须出现，顺序与界面展示顺序一致
+        # 七个目标都必须出现，顺序与界面展示顺序一致（opencode 为 2026-10-20 新增）
         self.assertEqual(list(result["resolved"]),
-                         ["pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"])
+                         ["pi", "dsh", "dsh-desktop", "zcode", "claude", "codex", "opencode"])
         # pi 的 agent 档拿到全局主模型
         self.assertEqual(result["resolved"]["pi"]["model"], "deepseek/model-1")
         self.assertEqual(result["resolved"]["pi"]["provider"], "deepseek")
@@ -88,12 +88,15 @@ class ModelSyncAPITests(unittest.TestCase):
         self.assertEqual(result["resolved"]["claude"],
                          engine.agent_model_tiers(self.config(), "claude").get("model"))
         # 档位明细使用 hub.py 的界面视图（claude 不含内部 agent 档与历史 fable 档）
-        self.assertEqual(set(result["tiers"]), {"pi", "dsh", "dsh-desktop", "zcode", "claude", "codex"})
+        self.assertEqual(set(result["tiers"]),
+                         {"pi", "dsh", "dsh-desktop", "zcode", "claude", "codex", "opencode"})
         self.assertEqual(result["tiers"]["pi"], {"agent": result["resolved"]["pi"]})
         self.assertEqual(result["tiers"]["dsh"], engine.agent_model_tiers_public(self.config(), "dsh"))
         self.assertEqual(result["tiers"]["dsh-desktop"], result["tiers"]["dsh"])
         self.assertEqual(result["tiers"]["zcode"], engine.agent_model_tiers_public(self.config(), "zcode"))
         self.assertEqual(result["tiers"]["codex"], engine.agent_model_tiers_public(self.config(), "codex"))
+        # opencode 与 codex 一样只有单一主模型档位（顶层 model 字段）
+        self.assertEqual(result["tiers"]["opencode"], {"agent": result["resolved"]["opencode"]})
         self.assertEqual(result["tiers"]["claude"],
                          engine.agent_model_tiers_public(self.config(), "claude"))
         self.assertTrue(result["tiers"]["dsh"]["agent"]["known"])

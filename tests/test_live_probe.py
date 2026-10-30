@@ -12,6 +12,7 @@ spec.loader.exec_module(probe)
 
 
 class LiveProbeTests(unittest.TestCase):
+    @unittest.skip("WorkBuddy 订阅反代已取消；旧真实调用探针保留为历史材料")
     def test_workbuddy_prepare_uses_only_private_config_and_no_oauth_copy(self):
         from workbuddy import provider_config
         import yaml

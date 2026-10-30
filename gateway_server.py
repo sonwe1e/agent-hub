@@ -1,7 +1,7 @@
 """Agent Hub's own loopback gateway. No external engine or account discovery.
 
 Wire bytes are forwarded as they arrive. Observation is a bounded side reader;
-ordinary connections keep their wire protocol. WorkBuddy has an explicit adapter.
+ordinary connections keep their wire protocol. Supported subscriptions have explicit adapters.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from agent_hub.gateway.transport import ProxyError, connection_for
 
 MAX_BODY = 32 * 1024 * 1024
 MAX_DECODED = 128 * 1024 * 1024
@@ -35,14 +36,37 @@ def packed(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()
 
 
+def subscription_failure(name, status):
+    advice={400:'请检查模型、消息和工具参数',401:'登录已失效，请在原应用重新登录',
+            403:'账号无权使用该模型或套餐',404:'上游模型或接口不存在，请刷新模型目录',
+            408:'请求超时，请检查网络后重试',429:'上游额度或速率受限，请查看账号用量后重试',
+            502:'上游响应异常，请稍后重试',503:'上游暂不可用，请稍后重试',504:'上游超时，请稍后重试'}
+    return f'{name}上游拒绝请求（HTTP {status}）；{advice.get(status,"请检查网络与订阅状态")}'
+
+
+class SubscriptionStreamError(ValueError):
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status=status
+
+
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
 def decoded(body, encoding):
     if encoding == 'zstd':
-        import zstandard
-        body = zstandard.ZstdDecompressor().decompress(body, max_output_size=MAX_DECODED)
+        try:
+            import zstandard
+        except ImportError:
+            # codex/dsh 的请求体默认 zstd 压缩；缺库时给出可定位的错误，
+            # 而不是让 ModuleNotFoundError 在请求线程里炸掉连接。
+            raise ValueError('缺少 zstandard 依赖，无法解码 zstd 压缩请求体；请安装 zstandard 并重启网关')
+        try:
+            body = zstandard.ZstdDecompressor().decompress(body, max_output_size=MAX_DECODED)
+        except Exception:
+            # ZstdError 不在处理器捕获的异常类型里，统一转成可回复的 ValueError。
+            raise ValueError('zstd 请求体解压失败') from None
     elif encoding == 'gzip':
         import io
         with gzip.GzipFile(fileobj=io.BytesIO(body)) as stream:
@@ -254,8 +278,9 @@ class Observation:
 
 
 class State:
-    def __init__(self, directory, key, codex_base='https://chatgpt.com/backend-api/codex', codex_api='https://api.openai.com/v1'):
+    def __init__(self, directory, key, codex_base='https://chatgpt.com/backend-api/codex', codex_api='https://api.openai.com/v1', observation_root=None):
         self.directory = Path(directory)
+        self.observation_root = Path(observation_root) if observation_root is not None else None
         self.key = key
         self.codex_base,self.codex_api=codex_base,codex_api
         self.lock=threading.RLock()
@@ -264,8 +289,6 @@ class State:
         self.last_prune=0
         self.active=0
         self.draining=False
-        self.workbuddy_salt=secrets.token_hex(16)
-        self.workbuddy_history={}
 
     def providers(self):
         return json.loads((self.directory/'providers.json').read_text(encoding='utf-8')).get('providers',[])
@@ -294,11 +317,11 @@ class State:
                     size-=p.stat().st_size
                     p.unlink(missing_ok=True)
 
-    def save(self, row, parts, capture, generation, sensitive=()):
-        from observation import redact
+    def save(self, row, parts, capture, generation, sensitive=(), title_epoch=None, title_body=None):
+        from agent_hub.observability.store import redact
         # Headers/account identities are never written. Known keys are removed
         # from provider error bodies and optional content before append.
-        keys=[p['key'] for p in self.providers()]+[self.key]+list(sensitive)
+        keys=[p['key'] for p in self.providers()]+[p.get('bindingKey','') for p in self.providers()]+[self.key]+list(sensitive)
         def clean(value):
             if isinstance(value,str):
                 return redact(value,keys)
@@ -333,6 +356,17 @@ class State:
                 append(self.directory/'gateway-conversations'/row['t'][:10]/digest/'turns.jsonl',
                        clean(dict(capture,agent=row['agent'],session=row['session'],time=row['t'],model=row.get('req'),status=row['status'])))
             self.prune(force=True)
+        if title_epoch is not None:
+            # Text is kept out of the append-only usage and routing ledgers.
+            from agent_hub.sessions.gateway_titles import save as save_title
+            from agent_hub.observability.store import stamp
+            started = stamp(row.get('t'))
+            if started is not None:
+                sid = row.get('session')
+                if sid and row.get('agent') == 'claude' and row.get('subagent'):
+                    sid += '/agent-' + row['subagent']
+                save_title(self.observation_root, row.get('agent'), sid,
+                           title_body, started, title_epoch, keys)
 
 
 class Server(ThreadingHTTPServer):
@@ -389,14 +423,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(503,{'error':{'message':'Hub 网关正在退出'}})
         path=urllib.parse.urlsplit(self.path)
         segments=path.path.strip('/').split('/')
-        wb_agent=segments[1] if len(segments)>2 and segments[0]=='workbuddy' and segments[1] in ('claude','codex','pi','dsh') else None
-        if wb_agent:
+        if segments[0]=='workbuddy':
+            return self.reply(410,{'error':{'message':'WorkBuddy 订阅反代已取消；请在 Hub 中切换其他连接'}})
+        special_kinds={'codex-subscription':'codex-chatgpt','zcode-subscription':'zcode-subscription'}
+        special_kind=special_kinds.get(segments[0]) if len(segments)>2 else None
+        special_agent=segments[1] if special_kind and segments[1] in ('claude','codex','pi','dsh','opencode') else None
+        if special_agent:
             path=path._replace(path='/'+('/'.join(segments[2:])))
         native=path.path.startswith('/backend-api/codex/')
         if self.command=='GET' and path.path in ('/v1/models','/models'):
-            mapping=json.loads((state.directory/'hub-connections.json').read_text(encoding='utf-8')) if wb_agent else {}
-            rows=[{'id':m if wb_agent else p['id']+'/'+m,'object':'model'} for p in state.providers()
-                  if not wb_agent or p.get('kind')=='workbuddy-ai' and mapping.get(p['id'],{}).get('agent')==wb_agent for m in p['models']]
+            mapping=json.loads((state.directory/'hub-connections.json').read_text(encoding='utf-8')) if special_agent else {}
+            rows=[{'id':m if special_agent else p['id']+'/'+m,'object':'model'} for p in state.providers()
+                  if p.get('kind')!='workbuddy-ai' and (not special_agent or p.get('kind')==special_kind and mapping.get(p['id'],{}).get('agent')==special_agent) for m in p['models']]
             return self.reply(200,{'object':'list','data':rows})
         if self.command not in ('GET','POST') or not native and path.path not in ('/v1/messages','/v1/chat/completions','/v1/responses','/v1/responses/compact'):
             return self.reply(404,{'error':{'message':'unknown gateway endpoint'}})
@@ -407,14 +445,16 @@ class Handler(BaseHTTPRequestHandler):
             wire=self.rfile.read(length)
             body=json.loads(decoded(wire,self.headers.get('Content-Encoding',''))) if wire else {}
             if not isinstance(body,dict):raise ValueError('expected object')
-        except (ValueError,OSError):
-            return self.reply(400,{'error':{'message':'invalid JSON or compressed body'}})
+        except (ValueError,OSError) as exc:
+            return self.reply(400,{'error':{'message':str(exc) or 'invalid JSON or compressed body'}})
         model=body.get('model','')
         providers=state.providers()
         provider=next((p for p in providers if isinstance(model,str) and model.startswith(p['id']+'/')),None)
-        if wb_agent:
+        if special_agent:
             mapping=json.loads((state.directory/'hub-connections.json').read_text(encoding='utf-8'))
-            provider=next((p for p in providers if p.get('kind')=='workbuddy-ai' and mapping.get(p['id'],{}).get('agent')==wb_agent),None)
+            provider=next((p for p in providers if p.get('kind')==special_kind and mapping.get(p['id'],{}).get('agent')==special_agent),None)
+        if provider and provider.get('kind')=='workbuddy-ai':
+            return self.reply(410,{'error':{'message':'WorkBuddy 订阅反代已取消；请在 Hub 中切换其他连接'}})
         headers={k:v for k,v in self.headers.items() if k.lower() not in HOP and k.lower() not in ('accept-encoding',)}
         headers['Accept-Encoding']='identity'
         protocol='responses' if native or '/responses' in path.path else 'anthropic' if path.path.endswith('/messages') else 'chat'
@@ -422,15 +462,22 @@ class Handler(BaseHTTPRequestHandler):
             mapping=json.loads((state.directory/'hub-connections.json').read_text(encoding='utf-8'))
             agent=mapping[provider['id']]['agent']
             token=self.headers.get('x-api-key') or self.headers.get('Authorization','').removeprefix('Bearer ')
-            if not any(secrets.compare_digest(token,allowed) for allowed in ('agent-hub-'+agent,'magpie-'+agent,provider['key'])):
+            allowed_tokens = (provider['key'],) if provider.get('kind') in ('codex-chatgpt','zcode-subscription') else ('agent-hub-'+agent,'magpie-'+agent,provider['key'])
+            if not any(secrets.compare_digest(token,allowed) for allowed in allowed_tokens):
                 return self.reply(401,{'error':{'message':'invalid local agent token'}})
-            upstream_model=model if wb_agent else model[len(provider['id'])+1:]
+            upstream_model=model if special_agent else model[len(provider['id'])+1:]
+            if provider.get('kind')=='zcode-subscription' and isinstance(provider.get('subscriptionModels'),list) and upstream_model not in provider['subscriptionModels']:
+                return self.reply(400,{'error':{'message':'该模型不在当前 ZCode 套餐目录中，请刷新模型或选择其他模型'}})
             if upstream_model not in provider['models']:
                 return self.reply(400,{'error':{'message':'model not configured on this connection'}})
-            if provider.get('kind')=='workbuddy-ai':
+            if provider.get('kind')=='codex-chatgpt':
                 if self.command!='POST' or path.path.endswith('/compact'):
-                    return self.reply(400,{'error':{'message':'WorkBuddy AI 不支持此端点；请发送完整消息进行推理'}})
-                return self.forward_workbuddy(body,agent,provider['id'],model,upstream_model,protocol)
+                    return self.reply(400,{'error':{'message':'Codex 订阅不支持此端点；请发送完整消息进行推理'}})
+                return self.forward_codex_subscription(body,agent,provider,model,upstream_model,protocol)
+            if provider.get('kind')=='zcode-subscription':
+                if self.command!='POST' or path.path.endswith('/compact'):
+                    return self.reply(400,{'error':{'message':'ZCode 订阅不支持此端点；请发送完整消息进行推理'}})
+                return self.forward_zcode_subscription(body,agent,provider,model,upstream_model,protocol)
             if protocol not in provider:
                 return self.reply(400,{'error':{'message':'connection protocol mismatch'}})
             suffix={'anthropic':'/messages','responses':'/responses/compact' if path.path.endswith('/compact') else '/responses','chat':'/chat/completions'}[protocol]
@@ -461,115 +508,103 @@ class Handler(BaseHTTPRequestHandler):
             upstream+='?'+path.query
         self.forward(upstream,headers,wire,body,agent,route_provider,model,protocol)
 
-    def forward_workbuddy(self, body, agent, provider, model, upstream_model, protocol):
-        from workbuddy import Accounts, ENDPOINT, WorkBuddyError, headers_for
-        from workbuddy_protocol import Reply, conversation_headers, encode_event, sse_events, to_chat
+    def forward_codex_subscription(self, body, agent, provider, model, upstream_model, protocol):
+        from codex_subscription import (CodexSubscriptionError, ResponsesToChat, client_version, stream_error, stream_status,
+                                        headers as codex_headers, read_auth, request_body)
+        from agent_hub.gateway.protocol import Reply, encode_event, sse_events
+        import queue
+        import select
+        import socket
         state=self.server.state
         start=time.monotonic();sid=session_id(self.headers,body)
         row={'engine':'agent-hub','schema':1,'t':now(),'agent':agent,'session':sid,
-             'provider':provider,'req':model,'model':model,'route_id':uuid.uuid4().hex,'tries':1}
+             'provider':provider['id'],'req':model,'model':model,'route_id':uuid.uuid4().hex,'tries':1}
+        from agent_hub.sessions.gateway_titles import begin as begin_title
+        title_epoch=begin_title(state.observation_root) if sid else None
         with state.lock:
             generation=state.generation;capture_on=state.recording;state.active+=1
         observer=Observation(protocol);parts=context_parts(body)
-        sent=False;conn=None;captured=bytearray();sensitive=[];reply=None
-        done=threading.Event();cancelled=threading.Event()
-        socket_holder=[]
         streaming=body.get('stream',False) is True
-        scope=(provider,sid)
+        sent=False;validated=False;captured=bytearray();sensitive=[];reply=None
+        done=threading.Event();cancelled=threading.Event();sockets=[]
         try:
-            auth=Accounts(state.directory).fresh()
-            sensitive=[auth.get('access',''),auth.get('refresh','')]
-            scope=(provider,sid,auth.get('uid'),auth.get('enterpriseId'),hashlib.sha256(auth.get('account','').encode()).hexdigest())
-            previous=None
-            previous_id=body.get('previous_response_id')
-            if previous_id:
-                if protocol!='responses': raise ValueError('previous_response_id 仅用于 Responses')
-                with state.lock:
-                    cached=state.workbuddy_history.get(previous_id)
-                    if not cached or cached['scope']!=scope or cached['expires']<time.time():
-                        raise ValueError('前序响应不可用，请在新会话中重发完整历史')
-                    previous=cached['messages']
-            chat,names=to_chat(dict(body,model=upstream_model),protocol,previous)
-            headers=headers_for(auth)
-            headers.update(conversation_headers(chat,sid,state.workbuddy_salt))
-            url=urllib.parse.urlsplit(ENDPOINT)
-            conn=(http.client.HTTPSConnection if url.scheme=='https' else http.client.HTTPConnection)(url.hostname,url.port,timeout=180)
-            import queue
+            request,names=request_body(body,protocol,upstream_model)
+            auth=read_auth(provider.get('authFile'))
+            sensitive=[auth['access'],auth['account']]
+            version=client_version(Path(provider['authFile']).parent)
+            headers={**codex_headers(auth,version),'Content-Type':'application/json',
+                     'Accept':'text/event-stream','Accept-Encoding':'identity'}
+            validated=True
             incoming=queue.Queue(maxsize=16)
             def publish(kind,value=None):
                 while not done.is_set():
                     try:incoming.put((kind,value),timeout=.1);return
                     except queue.Full:pass
             def read_upstream():
+                connection=None
                 try:
-                    conn.connect()
-                    socket_holder.append(conn.sock)
-                    if done.is_set() or cancelled.is_set():return
-                    conn.request('POST','/v2/chat/completions',packed(chat),headers)
-                    response=conn.getresponse()
-                    code=None
-                    if response.status>=400:
-                        raw=response.read(1024*1024)
-                        try:code=json.loads(raw).get('code')
-                        except (ValueError,AttributeError):pass
-                    publish('headers',(response.status,response.getheader('Content-Type',''),code))
+                    connection,target,proxy_headers=connection_for(state.codex_base+'/responses',timeout=180)
+                    connection.connect();sockets.append(connection.sock)
+                    if cancelled.is_set():raise CodexSubscriptionError('客户端已取消 Codex 订阅请求')
+                    connection.request('POST',target,packed(request),{**headers,**proxy_headers})
+                    response=connection.getresponse()
+                    publish('headers',(response.status,response.getheader('Content-Type','')))
                     if response.status<400:
-                        for chunk in sse_events(response):
+                        for event in sse_events(response,'Codex 订阅',allow_errors=True):
                             if done.is_set():break
-                            publish('chunk',chunk)
+                            publish('event',event)
+                    else:
+                        response.read(1024*1024) # never expose the vendor body or credentials
                     publish('done')
                 except Exception as exc:publish('error',exc)
-                finally:conn.close()
+                finally:
+                    if connection is not None:
+                        try:connection.close()
+                        except OSError:pass
             def watch_client():
-                import select
-                import socket
                 while not done.wait(.1):
                     try:
                         readable,_,_=select.select([self.connection],[],[],0)
                         if readable and not self.connection.recv(1,socket.MSG_PEEK):
                             cancelled.set()
-                            for sock in socket_holder:
+                            for sock in sockets:
                                 try:sock.shutdown(socket.SHUT_RDWR)
                                 except OSError:pass
                             break
                     except OSError:
-                        # Windows reports a peer closing with unread bytes as
-                        # WSAECONNRESET rather than a readable zero-byte recv.
                         cancelled.set()
-                        for sock in socket_holder:
+                        for sock in sockets:
                             try:sock.shutdown(socket.SHUT_RDWR)
                             except OSError:pass
                         break
             threading.Thread(target=watch_client,daemon=True).start()
             threading.Thread(target=read_upstream,daemon=True).start()
             def next_upstream():
-                # Winsock shutdown can leave a synchronous recv waiting. Keep
-                # the request handler interruptible even in that case; the
-                # network worker owns and closes its upstream socket.
                 while True:
-                    if cancelled.is_set():raise WorkBuddyError('客户端已取消 WorkBuddy AI 请求',status=499)
+                    if cancelled.is_set():raise CodexSubscriptionError('客户端已取消 Codex 订阅请求')
                     try:kind,value=incoming.get(timeout=.1)
                     except queue.Empty:continue
                     if kind=='error':raise value
                     return kind,value
             kind,meta=next_upstream()
-            if kind!='headers':raise WorkBuddyError('WorkBuddy AI 未返回响应头')
-            status,content_type,code=meta
-            row['status']=status
+            if kind!='headers':raise CodexSubscriptionError('Codex 订阅未返回响应头')
+            status,content_type=meta;row['status']=status
             if status>=400:
-                # Preserve status and a safe vendor code, never raw auth-bearing text.
-                row['err']='WorkBuddy AI HTTP '+str(status)+(f'（code {code}）' if isinstance(code,(int,float)) else '')
-                if code==11140:row['err']+='；账号受限，请在 WorkBuddy 中提交反馈'
+                row['err']=subscription_failure('Codex 订阅',status)
                 self.reply(status,{'error':{'message':row['err'],'type':'upstream_error'}})
                 return
-            if 'text/event-stream' not in content_type.lower():
-                raise WorkBuddyError('WorkBuddy AI 未返回流式响应')
-            reply=Reply(protocol,upstream_model,names,[t['name'] for t in body.get('tools',[]) if t.get('type')=='custom'])
+            # The Codex backend can deliver a valid SSE stream without a MIME
+            # header; an explicitly different content type is still rejected.
+            if content_type and 'text/event-stream' not in content_type.lower():
+                raise CodexSubscriptionError('Codex 订阅未返回流式响应')
             observer.sse=streaming
-            def send_events(values):
+            bridge=ResponsesToChat() if protocol!='responses' else None
+            reply=Reply(protocol,model,names) if bridge else None
+            final_response=None;items={}
+            def send(values):
                 nonlocal sent
                 if not streaming:return
-                if not sent:
+                if values and not sent:
                     self.send_response(200);self.send_header('Content-Type','text/event-stream; charset=utf-8')
                     self.send_header('Cache-Control','no-cache');self.send_header('Connection','close')
                     self.end_headers();self.close_connection=True;sent=True
@@ -579,47 +614,66 @@ class Handler(BaseHTTPRequestHandler):
                     observer.feed(wire,round((time.monotonic()-start)*1000,2))
                     if capture_on:captured.extend(wire[:max(0,MAX_CAPTURE-len(captured))])
             while True:
-                kind,chunk=next_upstream()
+                kind,event=next_upstream()
                 if kind=='done':break
-                if kind=='chunk':send_events(reply.feed(chunk))
-            ending=reply.end()
-            if protocol=='responses':
-                messages=chat['messages']+[reply.assistant()]
-                size=len(packed(messages))
-                with state.lock:
-                    state.workbuddy_history={k:v for k,v in state.workbuddy_history.items() if v['expires']>time.time()}
-                    while state.workbuddy_history and (len(state.workbuddy_history)>=64 or sum(v['size'] for v in state.workbuddy_history.values())+size>MAX_BODY):
-                        state.workbuddy_history.pop(next(iter(state.workbuddy_history)))
-                    if size<=MAX_BODY:state.workbuddy_history[reply.id]={'scope':scope,'messages':messages,'size':size,'expires':time.time()+900}
-            send_events(ending)
-            if streaming:
-                if protocol=='chat':self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush();observer.feed(b'data: [DONE]\n\n',round((time.monotonic()-start)*1000,2))
+                if kind!='event':continue
+                if not isinstance(event,dict):raise ValueError('Codex 订阅流格式无效')
+                if event.get('type') in ('response.failed','error') or event.get('error'):
+                    raise SubscriptionStreamError(stream_error(event),stream_status(event))
+                if bridge:
+                    for chunk in bridge.feed(event):
+                        # An Anthropic thinking block needs a provider signature;
+                        # a Codex reasoning summary cannot be used as one.
+                        if protocol=='anthropic' and any('reasoning_content' in (choice.get('delta') or {}) for choice in chunk.get('choices') or []):
+                            continue
+                        send(reply.feed(chunk))
+                else:
+                    typ=event.get('type')
+                    if typ=='response.output_item.done':items[event.get('output_index',len(items))]=event.get('item')
+                    if typ in ('response.completed','response.incomplete'):
+                        final_response=event.get('response') or {}
+                        if typ=='response.incomplete' and (final_response.get('incomplete_details') or {}).get('reason')!='max_output_tokens':
+                            raise ValueError('Codex 订阅上游响应未完成')
+                        if not final_response.get('output') and items:
+                            final_response={**final_response,'output':[items[i] for i in sorted(items)]}
+                        event={**event,'response':final_response}
+                    if isinstance(event.get('response'),dict):
+                        event={**event,'response':{**event['response'],'model':model}}
+                    send([event])
+            if bridge:
+                if not bridge.finished:raise ValueError('Codex 订阅流提前结束，未收到完成标记')
+                send(reply.end())
+                if streaming and protocol=='chat':
+                    self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
+                    observer.feed(b'data: [DONE]\n\n',round((time.monotonic()-start)*1000,2))
+                result=reply.complete()
             else:
-                result=reply.complete();wire=packed(result)
-                self.reply(200,result);sent=True;observer.feed(wire,round((time.monotonic()-start)*1000,2))
+                if final_response is None:raise ValueError('Codex 订阅流提前结束，未收到完成标记')
+                result={**final_response,'model':model}
+            if not streaming:
+                wire=packed(result);self.reply(200,result);sent=True
+                observer.feed(wire,round((time.monotonic()-start)*1000,2))
                 if capture_on:captured.extend(wire[:MAX_CAPTURE])
             observer.finish(round((time.monotonic()-start)*1000,2))
-            row['served']=reply.model
+            row['served']=upstream_model
         except (BrokenPipeError,ConnectionResetError):
-            row.update(status=499,stop='aborted',err='客户端连接中断；已取消 WorkBuddy AI 请求')
+            row.update(status=499,stop='aborted',err='客户端连接中断；已取消 Codex 订阅请求')
         except (ValueError,OSError,http.client.HTTPException,TypeError,KeyError,AttributeError) as exc:
-            status=499 if cancelled.is_set() else exc.status if isinstance(exc,WorkBuddyError) else 400 if isinstance(exc,ValueError) and reply is None and conn is None else 502
-            if isinstance(exc,(TypeError,KeyError,AttributeError)) and conn is None:status=400
-            message=str(exc) if isinstance(exc,ValueError) else 'WorkBuddy AI 请求格式无效' if status==400 else 'WorkBuddy AI 上游连接或响应读取失败'
+            status=499 if cancelled.is_set() else exc.status if isinstance(exc,SubscriptionStreamError) else 401 if isinstance(exc,CodexSubscriptionError) and not validated else 502 if validated or isinstance(exc,ProxyError) else 400
+            message=str(exc) if isinstance(exc,ValueError) else 'Codex 订阅上游连接或响应读取失败'
             row.update(status=status,stop='aborted' if status==499 else 'error',err=message)
             try:
                 if not sent and status!=499:self.reply(status,{'error':{'message':message}})
                 elif sent and streaming and status!=499:
-                    typ='error' if protocol=='anthropic' else 'response.failed' if protocol=='responses' else None
-                    value={'type':typ,'error':{'type':'upstream_error','message':message}} if typ else {'error':{'message':message}}
-                    if protocol=='responses':value={'type':'response.failed','response':{**reply.base('failed'),'error':{'code':'upstream_error','message':message}}}
+                    value={'type':'error','error':{'type':'upstream_error','message':message}}
+                    if protocol=='responses':value={'type':'response.failed','response':{'status':'failed','error':{'code':'upstream_error','message':message}}}
+                    elif protocol=='chat':value={'error':{'message':message}}
                     self.wfile.write(encode_event(protocol,value));self.wfile.flush()
             except OSError:pass
         finally:
             done.set()
             if row.get('status',200)>=400:
-                import socket
-                for sock in socket_holder:
+                for sock in sockets:
                     try:sock.shutdown(socket.SHUT_RDWR)
                     except OSError:pass
             row={**observer.fields,**row};row['ms']=round((time.monotonic()-start)*1000,2)
@@ -629,9 +683,193 @@ class Handler(BaseHTTPRequestHandler):
                 if 'completion_tokens' not in reply.usage:row.pop('out',None)
                 if 'reasoning_tokens' not in (reply.usage.get('completion_tokens_details') or {}):row.pop('reasoning',None)
             capture={'input':body,'output':captured.decode('utf-8',errors='replace'),'cut':len(captured)>=MAX_CAPTURE} if capture_on and sid else None
-            try:state.save(row,parts,capture,generation,sensitive)
+            try:state.save(row,parts,capture,generation,sensitive,title_epoch,body)
             except Exception:print('gateway observation write failed',flush=True)
             with state.lock:state.active-=1
+
+    def forward_zcode_subscription(self, body, agent, provider, model, upstream_model, protocol):
+        from zcode_subscription import (ZCodeSubscriptionError, AnthropicToChat, AnthropicCollector,
+                                        binding, read_auth, resolve_auth, request_body, start_request, _current_identity,
+                                        stream_error, stream_status)
+        from agent_hub.gateway.protocol import Reply, encode_event, sse_events
+        import queue
+        import select
+        import socket
+        state=self.server.state
+        start=time.monotonic();sid=session_id(self.headers,body)
+        row={'engine':'agent-hub','schema':1,'t':now(),'agent':agent,'session':sid,
+             'provider':provider['id'],'req':model,'model':model,'route_id':uuid.uuid4().hex,'tries':1}
+        from agent_hub.sessions.gateway_titles import begin as begin_title
+        title_epoch=begin_title(state.observation_root) if sid else None
+        with state.lock:
+            generation=state.generation;capture_on=state.recording;state.active+=1
+        observer=Observation(protocol);parts=context_parts(body)
+        streaming=body.get('stream',False) is True
+        sent=False;validated=False;captured=bytearray();sensitive=[];reply=None
+        done=threading.Event();cancelled=threading.Event();sockets=[]
+        try:
+            request,names=request_body(body,protocol,upstream_model)
+            auth=read_auth(provider.get('zcodeHome'))
+            if provider.get('subscriptionBinding') and not secrets.compare_digest(provider['subscriptionBinding'],binding(auth,provider.get('bindingKey',''))):
+                raise ZCodeSubscriptionError('ZCode 账号或套餐已切换；请在设置中刷新模型并恢复服务')
+            resolved=resolve_auth(auth)
+            if _current_identity(auth)!=_current_identity(read_auth(provider.get('zcodeHome'))):
+                raise ZCodeSubscriptionError('读取套餐期间 ZCode 账号已切换；请刷新后重试')
+            auth=resolved
+            sensitive=[auth.get('key',''),auth.get('token',''),auth.get('jwt',''),auth['account']]
+            if auth.get('kind')=='start-plan':
+                request,headers=start_request(auth,request,sid)
+            else:
+                headers={'x-api-key':auth['key'],'Authorization':'Bearer '+auth['key'],
+                         'anthropic-version':'2023-06-01'}
+                if sid:headers['x-session-id']=sid
+            headers.update({'Content-Type':'application/json','Accept':'text/event-stream','Accept-Encoding':'identity'})
+            validated=True
+            incoming=queue.Queue(maxsize=16)
+            def publish(kind,value=None):
+                while not done.is_set():
+                    try:incoming.put((kind,value),timeout=.1);return
+                    except queue.Full:pass
+            def read_upstream():
+                connection=None
+                try:
+                    connection,target,proxy_headers=connection_for(auth['base']+'/v1/messages',timeout=180)
+                    connection.connect();sockets.append(connection.sock)
+                    if cancelled.is_set():raise ZCodeSubscriptionError('客户端已取消 ZCode 订阅请求')
+                    connection.request('POST',target,packed(request),{**headers,**proxy_headers})
+                    response=connection.getresponse()
+                    content_type=response.getheader('Content-Type','')
+                    status=response.status
+                    if status>=400 or 'application/json' in content_type.lower():
+                        raw=response.read(1024*1024)
+                        if status<400:
+                            try:
+                                value=json.loads(raw);code=str(value.get('code') or (value.get('error') or {}).get('code') or '')
+                            except (ValueError,TypeError,AttributeError):code=''
+                            status=429 if code in ('1005','1113','1302','1303') else 502
+                        publish('headers',(status,content_type));publish('done');return
+                    publish('headers',(status,content_type))
+                    if status<400:
+                        for event in sse_events(response,'ZCode 订阅',allow_errors=True):
+                            if done.is_set():break
+                            publish('event',event)
+                    publish('done')
+                except Exception as exc:publish('error',exc)
+                finally:
+                    if connection is not None:
+                        try:connection.close()
+                        except OSError:pass
+            def watch_client():
+                while not done.wait(.1):
+                    try:
+                        readable,_,_=select.select([self.connection],[],[],0)
+                        if readable and not self.connection.recv(1,socket.MSG_PEEK):
+                            cancelled.set()
+                            for sock in sockets:
+                                try:sock.shutdown(socket.SHUT_RDWR)
+                                except OSError:pass
+                            break
+                    except OSError:
+                        cancelled.set()
+                        for sock in sockets:
+                            try:sock.shutdown(socket.SHUT_RDWR)
+                            except OSError:pass
+                        break
+            threading.Thread(target=watch_client,daemon=True).start()
+            threading.Thread(target=read_upstream,daemon=True).start()
+            def next_upstream():
+                while True:
+                    if cancelled.is_set():raise ZCodeSubscriptionError('客户端已取消 ZCode 订阅请求')
+                    try:kind,value=incoming.get(timeout=.1)
+                    except queue.Empty:continue
+                    if kind=='error':raise value
+                    return kind,value
+            kind,meta=next_upstream()
+            if kind!='headers':raise ZCodeSubscriptionError('ZCode 订阅未返回响应头')
+            status,content_type=meta;row['status']=status
+            if status>=400:
+                row['err']=subscription_failure('ZCode 订阅',status)
+                self.reply(status,{'error':{'message':row['err'],'type':'upstream_error'}})
+                return
+            if content_type and 'text/event-stream' not in content_type.lower():
+                raise ZCodeSubscriptionError('ZCode 订阅未返回流式响应')
+            observer.sse=streaming
+            bridge=AnthropicToChat() if protocol!='anthropic' else None
+            reply=Reply(protocol,model,names) if bridge else None
+            collector=AnthropicCollector(model) if not bridge else None
+            def send(values):
+                nonlocal sent
+                if not streaming:return
+                if values and not sent:
+                    self.send_response(200);self.send_header('Content-Type','text/event-stream; charset=utf-8')
+                    self.send_header('Cache-Control','no-cache');self.send_header('Connection','close')
+                    self.end_headers();self.close_connection=True;sent=True
+                for value in values:
+                    wire=encode_event(protocol,value)
+                    self.wfile.write(wire);self.wfile.flush()
+                    observer.feed(wire,round((time.monotonic()-start)*1000,2))
+                    if capture_on:captured.extend(wire[:max(0,MAX_CAPTURE-len(captured))])
+            while True:
+                kind,event=next_upstream()
+                if kind=='done':break
+                if kind!='event':continue
+                if not isinstance(event,dict):raise ValueError('ZCode 订阅流格式无效')
+                if event.get('type')=='error' or event.get('error') or event.get('code'):
+                    raise SubscriptionStreamError(stream_error(event),stream_status(event))
+                if bridge:
+                    for chunk in bridge.feed(event):send(reply.feed(chunk))
+                else:
+                    collector.feed(event)
+                    if isinstance(event.get('message'),dict):
+                        event={**event,'message':{**event['message'],'model':model}}
+                    send([event])
+            if bridge:
+                if not bridge.finished:raise ValueError('ZCode 订阅流提前结束，未收到完成标记')
+                send(reply.end())
+                if streaming and protocol=='chat':
+                    self.wfile.write(b'data: [DONE]\n\n');self.wfile.flush()
+                    observer.feed(b'data: [DONE]\n\n',round((time.monotonic()-start)*1000,2))
+                result=reply.complete()
+            else:
+                if not collector.finished:raise ValueError('ZCode 订阅流提前结束，未收到完成标记')
+                result=collector.value
+            if not streaming:
+                wire=packed(result);self.reply(200,result);sent=True
+                observer.feed(wire,round((time.monotonic()-start)*1000,2))
+                if capture_on:captured.extend(wire[:MAX_CAPTURE])
+            observer.finish(round((time.monotonic()-start)*1000,2))
+            row['served']=upstream_model
+        except (BrokenPipeError,ConnectionResetError):
+            row.update(status=499,stop='aborted',err='客户端连接中断；已取消 ZCode 订阅请求')
+        except (ValueError,OSError,http.client.HTTPException,TypeError,KeyError,AttributeError) as exc:
+            status=499 if cancelled.is_set() else exc.status if isinstance(exc,SubscriptionStreamError) else 401 if isinstance(exc,ZCodeSubscriptionError) and not validated else 502 if validated or isinstance(exc,ProxyError) else 400
+            message=str(exc) if isinstance(exc,ValueError) else 'ZCode 订阅上游连接或响应读取失败'
+            row.update(status=status,stop='aborted' if status==499 else 'error',err=message)
+            try:
+                if not sent and status!=499:self.reply(status,{'error':{'message':message}})
+                elif sent and streaming and status!=499:
+                    value={'type':'error','error':{'type':'upstream_error','message':message}}
+                    if protocol=='responses':value={'type':'response.failed','response':{'status':'failed','error':{'code':'upstream_error','message':message}}}
+                    elif protocol=='chat':value={'error':{'message':message}}
+                    self.wfile.write(encode_event(protocol,value));self.wfile.flush()
+            except OSError:pass
+        finally:
+            done.set()
+            if row.get('status',200)>=400:
+                for sock in sockets:
+                    try:sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:pass
+            row={**observer.fields,**row};row['ms']=round((time.monotonic()-start)*1000,2)
+            if reply:
+                if 'prompt_tokens' not in reply.usage:
+                    for key in ('in','cache_read','cache_write'):row.pop(key,None)
+                if 'completion_tokens' not in reply.usage:row.pop('out',None)
+                if 'reasoning_tokens' not in (reply.usage.get('completion_tokens_details') or {}):row.pop('reasoning',None)
+            capture={'input':body,'output':captured.decode('utf-8',errors='replace'),'cut':len(captured)>=MAX_CAPTURE} if capture_on and sid else None
+            try:state.save(row,parts,capture,generation,sensitive,title_epoch,body)
+            except Exception:print('gateway observation write failed',flush=True)
+            with state.lock:state.active-=1
+
 
     def forward(self, upstream, headers, wire, body, agent, provider, model, protocol):
         state=self.server.state
@@ -644,6 +882,8 @@ class Handler(BaseHTTPRequestHandler):
         sid=session_id(self.headers,body)
         row={'engine':'agent-hub','schema':1,'t':now(),'agent':agent,'session':sid,
              'provider':provider,'req':model,'model':model,'route_id':uuid.uuid4().hex,'tries':1}
+        from agent_hub.sessions.gateway_titles import begin as begin_title
+        title_epoch=begin_title(state.observation_root) if sid else None
         if agent=='claude' and self.headers.get('x-claude-code-agent-id'):
             row['subagent']=self.headers['x-claude-code-agent-id'][:128]
             row['parent_subagent']=self.headers.get('x-claude-code-parent-agent-id','')[:128] or None
@@ -659,9 +899,8 @@ class Handler(BaseHTTPRequestHandler):
             url=urllib.parse.urlsplit(upstream)
             if url.scheme not in ('http','https') or not url.hostname or url.username or url.password:
                 raise ValueError('invalid upstream URL')
-            cls=http.client.HTTPSConnection if url.scheme=='https' else http.client.HTTPConnection
-            conn=cls(url.hostname,url.port,timeout=180)
-            conn.request(self.command,urllib.parse.urlunsplit(('', '',url.path,url.query,'')),body=wire if self.command=='POST' else None,headers=headers)
+            conn,target,proxy_headers=connection_for(url,timeout=180)
+            conn.request(self.command,target,body=wire if self.command=='POST' else None,headers={**headers,**proxy_headers})
             response=conn.getresponse()
             if self.command=='GET' and self.path.split('?',1)[0]=='/backend-api/codex/models':
                 content=response.read(MAX_BODY)
@@ -732,7 +971,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError,ConnectionResetError):
             row.update(status=499,stop='aborted',err='客户端或上游连接中断；已停止本次转发')
         except (OSError,ValueError,http.client.HTTPException) as exc:
-            row.update(status=502,stop='error',err='上游连接、TLS 或响应读取失败（'+type(exc).__name__+'）')
+            row.update(status=502,stop='error',err=str(exc) if isinstance(exc,ProxyError) else '上游连接、TLS 或响应读取失败（'+type(exc).__name__+'）')
             if not sent:
                 try:self.reply(502,{'error':{'message':row['err']}})
                 except OSError:pass
@@ -746,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
                 if capture_on and sid:
                     capture={'input':body,'output':response_bytes.decode('utf-8',errors='replace'),'cut':cut}
                 sensitive=[self.headers.get('Authorization','').removeprefix('Bearer '),self.headers.get('x-api-key',''),self.headers.get('chatgpt-account-id','')]
-                try:state.save(row,parts,capture,generation,sensitive)
+                try:state.save(row,parts,capture,generation,sensitive,title_epoch,body)
                 except Exception:
                     # Never leak headers/body to stderr or break a successful stream
                     # because observation storage is unavailable.
@@ -759,8 +998,9 @@ def main():
     parser.add_argument('--directory',type=Path,required=True)
     parser.add_argument('--port',type=int,required=True)
     parser.add_argument('--control-port',type=int,required=True)
+    parser.add_argument('--observation-root',type=Path)
     args=parser.parse_args()
-    state=State(args.directory,os.environ.pop('AGENT_HUB_GATEWAY_CONTROL_KEY'))
+    state=State(args.directory,os.environ.pop('AGENT_HUB_GATEWAY_CONTROL_KEY'),observation_root=args.observation_root)
     server=Server(('127.0.0.1',args.port),Handler)
     control=Server(('127.0.0.1',args.control_port),Handler)
     server.state=control.state=state

@@ -24,7 +24,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from observation import redact, native_files, parse_native
+from agent_hub.observability.store import redact, native_files, parse_native
 
 REAL = Path.home()
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
@@ -510,7 +510,7 @@ def probe(agent, scenario, timeout, out, transport='exec', stream_only=False, ga
         for a, path in sources:
             if a != agent:
                 continue
-            from observation import open_lines
+            from agent_hub.observability.store import open_lines
             dest = output / 'native' / path.relative_to(home)
             dest = dest.with_suffix('') if dest.suffix in ('.zstd','.zst') else dest
             dest.parent.mkdir(parents=True, exist_ok=True)
